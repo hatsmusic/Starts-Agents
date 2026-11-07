@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starts-Agents</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="roster">
+    <header class="r-head">
+      <div class="logo">🤖 Starts&#8202;·&#8202;Agents</div>
+      <button id="addBotBtn" class="icon-btn" title="New bot">＋</button>
+    </header>
+    <div id="botList" class="bot-list"></div>
+    <footer class="r-foot">
+      <button id="importBtn" class="mini-btn">Import team</button>
+      <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md">Export team</a>
+      <input type="file" id="importFile" accept=".md,text/markdown,text/plain" hidden>
+    </footer>
+  </aside>
+
+  <main id="chatPane">
+    <header id="chatHead">
+      <div>
+        <div id="botName" class="bot-name">Pick a bot</div>
+        <div id="botMeta" class="bot-meta"></div>
+      </div>
+      <button id="editBotBtn" class="icon-btn" title="Edit bot">✎</button>
+    </header>
+    <div id="messages" class="messages"></div>
+    <form id="composer">
+      <textarea id="input" rows="1" placeholder="Message…  (try: list files · read x.txt · note hello · run ls)"></textarea>
+      <button id="sendBtn" type="submit">Send</button>
+    </form>
+  </main>
+</div>
+
+<dialog id="botDialog">
+  <form method="dialog" id="botForm">
+    <h3 id="dialogTitle">New bot</h3>
+    <label>Name <input id="fName" required maxlength="60"></label>
+    <label>Engine <select id="fEngine"></select></label>
+    <label>Model <input id="fModel" placeholder="(engine default)"></label>
+    <label>Persona <textarea id="fPersona" rows="5" placeholder="Who is this bot? How should it behave?"></textarea></label>
+    <div class="dialog-actions">
+      <button type="button" id="deleteBotBtn" class="danger" hidden>Delete</button>
+      <span class="spacer"></span>
+      <button type="button" id="cancelBtn">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
