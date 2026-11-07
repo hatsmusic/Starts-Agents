@@ -60,6 +60,35 @@ function openaiTools() {
   }));
 }
 
+/* Small models frequently print a tool call as plain JSON text instead
+ * of using the structured tool_calls channel. Recognize exactly that
+ * shape — {"name": <a real tool>, "arguments": {...}} — and nothing
+ * else, so ordinary JSON in a reply is still shown as text. */
+function parseTextToolCall(text) {
+  if (!text) return null;
+  const s = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false, end = -1;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end < 0) return null;
+  let obj;
+  try { obj = JSON.parse(s.slice(start, end + 1)); } catch { return null; }
+  const name = obj.name || obj.function || obj.tool;
+  let args = obj.arguments ?? obj.args ?? obj.parameters ?? {};
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+  if (!name || typeof name !== 'string') return null;
+  if (!TOOLS.some((tool) => tool.name === name)) return null;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+  return { name, args };
+}
+
 async function* openaiRun({ bot, history, userText, provider }) {
   const baseUrl = provider?.baseUrl || config.ai.baseUrl;
   const apiKey = provider?.apiKey || config.ai.apiKey;
@@ -81,6 +110,12 @@ async function* openaiRun({ bot, history, userText, provider }) {
     if (!res.ok || !res.body) throw new Error('AI endpoint returned ' + res.status);
     const calls = new Map();
     let content = '';
+    // Small/local models often skip the structured tool_calls channel
+    // and print the call as plain JSON text instead. Hold back content
+    // that still looks like it could be such a call; flush it as normal
+    // text the moment it clearly is prose (or at round end).
+    let pending = '';
+    let decided = false;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -96,7 +131,20 @@ async function* openaiRun({ bot, history, userText, provider }) {
         if (data === '[DONE]') break;
         let json; try { json = JSON.parse(data); } catch { continue; }
         const delta = json.choices?.[0]?.delta || {};
-        if (delta.content) { content += delta.content; yield { type: 'token', text: delta.content }; }
+        if (delta.content) {
+          content += delta.content;
+          if (calls.size || decided) {
+            yield { type: 'token', text: delta.content };
+          } else {
+            pending += delta.content;
+            const probe = pending.trimStart();
+            if ((probe && !probe.startsWith('{') && !probe.startsWith('`')) || pending.length > 4000) {
+              decided = true;
+              yield { type: 'token', text: pending };
+              pending = '';
+            }
+          }
+        }
         for (const tc of delta.tool_calls || []) {
           const slot = calls.get(tc.index) || { name: '', args: '' };
           if (tc.function?.name) slot.name = tc.function.name;
@@ -105,7 +153,20 @@ async function* openaiRun({ bot, history, userText, provider }) {
         }
       }
     }
-    if (!calls.size) return;
+    if (!calls.size) {
+      // No structured calls: was the text itself a tool call in disguise?
+      const call = parseTextToolCall(content);
+      if (call) {
+        messages.push({ role: 'assistant', content: null,
+          tool_calls: [{ id: 'call_0', type: 'function', function: { name: call.name, arguments: JSON.stringify(call.args) } }] });
+        const result = yield { type: 'tool', name: call.name, args: call.args };
+        messages.push({ role: 'tool', tool_call_id: 'call_0', content: String(result).slice(0, 16000) });
+        continue;
+      }
+      if (pending) yield { type: 'token', text: pending };
+      return;
+    }
+    if (pending) { yield { type: 'token', text: pending }; pending = ''; }
     messages.push({ role: 'assistant', content: content || null,
       tool_calls: [...calls.values()].map((c, i) => ({ id: 'call_' + i, type: 'function', function: { name: c.name, arguments: c.args || '{}' } })) });
     let idx = 0;

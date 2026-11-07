@@ -44,6 +44,7 @@ function seed() {
       '- 改完必须验证：跑测试或把程序跑起来，认真读输出。',
       '- 写文件和跑命令需要人类批准——提议时要具体、有把握。',
       '- 如实汇报：改了什么、验证了什么、还有什么没验证。',
+      '- 闲聊和打招呼直接用文字回复，不要调用工具；只有用户明确要你看文件、写代码或跑命令时才调用工具。',
     ].join('\n'),
     createdAt: new Date().toISOString(),
   });
@@ -155,7 +156,16 @@ async function chatTurn(bot, userText, emit, lang) {
       next = await gen.next();
     }
   }
-  if (assistant.trim()) store.pushMessage(bot.id, { role: 'assistant', text: assistant, at: new Date().toISOString() });
+  if (!assistant.trim()) {
+    // A small local model sometimes returns a completely empty turn.
+    // Never leave the user staring at silence — say so, in their language.
+    const zh = lang === 'zh' || lang === 'tw';
+    assistant = zh
+      ? '（我这轮没想出回复——本地小模型偶尔会这样。换个说法再问我，或者直接给我派个具体的活，比如「列出文件」「写一个 hello.html 放到工作区」。）'
+      : '(I came back empty-handed that time — small local models do that occasionally. Ask me again in different words, or give me a concrete task, like "list files" or "write a hello.html".)';
+    emit('token', { text: assistant });
+  }
+  store.pushMessage(bot.id, { role: 'assistant', text: assistant, at: new Date().toISOString() });
   return assistant;
 }
 
