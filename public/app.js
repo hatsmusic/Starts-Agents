@@ -1,7 +1,7 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
 // UI language: 15 languages via ./i18n.js, choice saved on this device.
-import { LANGS, getLang, makeT } from './i18n.js?v=70';
+import { LANGS, getLang, makeT } from './i18n.js?v=72';
 
 const $ = (s) => document.querySelector(s);
 const state = {
@@ -24,6 +24,25 @@ async function api(method, path, body) {
   return data;
 }
 
+/* Hand-drawn style SVG icons — the UI uses no emoji icons anywhere
+ * (house rule, same as the main site). One stroke family, 24 grid. */
+const ICON_PATHS = {
+  file: '<path d="M14 3.5H7A1.5 1.5 0 0 0 5.5 5v14A1.5 1.5 0 0 0 7 20.5h10A1.5 1.5 0 0 0 18.5 19V8Z"/><path d="M14 3.5V8h4.5"/>',
+  folder: '<path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9.5v8A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5Z"/>',
+  tool: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  term: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="m7 9.5 3 3-3 3M12.5 15.5H17"/>',
+  list: '<path d="M9 6.5h10.5M9 12h10.5M9 17.5h10.5"/><path d="m3.8 6.3.9.9 1.8-1.9M3.8 11.8l.9.9 1.8-1.9M3.8 17.3l.9.9 1.8-1.9"/>',
+  dl: '<path d="M12 4v10"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M4.5 19.5h15"/>',
+  heart: '<path d="M12 20s-7.2-4.6-7.2-10A4.3 4.3 0 0 1 12 7.4 4.3 4.3 0 0 1 19.2 10c0 5.4-7.2 10-7.2 10Z"/>',
+  warn: '<path d="M12 4 2.8 19.5h18.4Z"/><path d="M12 10v4M12 16.8v.4"/>',
+};
+function icon(name, size = 15) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ic">${ICON_PATHS[name] || ''}</svg>`;
+}
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -33,7 +52,7 @@ function el(tag, cls, text) {
 
 function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
-  img.src = '/complay-c.svg?v=70';
+  img.src = '/complay-c.svg?v=72';
   img.alt = '';
   // Dimension attributes are a hard floor: even if a stale cached
   // stylesheet (old PWA version) has no .bot-av rule, the SVG can
@@ -150,7 +169,10 @@ function renderRoster() {
     meta.append(top, el('span', 'role', roleLine),
       el('span', 'p', preview),
       el('span', 'tm', fmtDay(bot.lastActiveAt || bot.lastMessage?.at)));
-    main.append(meta, el('span', 'chev', '›'));
+    const menuBtn = el('button', 'card-menu', '⋯');
+    menuBtn.setAttribute('aria-label', 'menu');
+    menuBtn.onclick = (e) => { e.stopPropagation(); openCardMenu(bot, menuBtn); };
+    main.append(meta, menuBtn);
     item.append(actions, main);
     list.append(item);
 
@@ -192,6 +214,48 @@ function renderRoster() {
   renderWsCard();
 }
 
+/* Per-card action menu (v0.7.2): Edit / Delete behind a VISIBLE ⋯
+ * button on every card. Delete used to live only behind the swipe
+ * gesture and deep inside the edit dialog — users could not find it,
+ * and the redesign spec explicitly forbids hiding important actions
+ * behind gestures alone. Swipe stays as a shortcut, not the only way. */
+let closeCardMenu = () => {};
+function openCardMenu(bot, anchor) {
+  closeCardMenu();
+  const pop = el('div', 'card-pop');
+  const edit = el('button', 'pop-item', t('editAct'));
+  edit.onclick = () => { closeCardMenu(); openDialog(bot); };
+  const del = el('button', 'pop-item pop-del', t('del'));
+  let armTimer = null;
+  del.onclick = async () => {
+    if (!del.classList.contains('arm')) {
+      del.classList.add('arm');
+      del.textContent = t('delConfirm');
+      armTimer = setTimeout(() => { del.classList.remove('arm'); del.textContent = t('del'); }, 2600);
+      return;
+    }
+    clearTimeout(armTimer);
+    closeCardMenu();
+    await api('DELETE', `/api/bots/${bot.id}`);
+    if (state.current === bot.id) state.current = null;
+    await loadBots();
+    if (state.current) selectBot(state.current, false);
+    else { $('#messages').innerHTML = ''; renderHead(); document.body.classList.remove('in-chat'); }
+  };
+  pop.append(edit, del);
+  document.body.append(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = (r.bottom + 6) + 'px';
+  pop.style.right = Math.max(8, window.innerWidth - r.right - 8) + 'px';
+  const dismiss = (e) => { if (!pop.contains(e.target)) closeCardMenu(); };
+  closeCardMenu = () => {
+    pop.remove();
+    document.removeEventListener('pointerdown', dismiss, true);
+    closeCardMenu = () => {};
+  };
+  setTimeout(() => document.addEventListener('pointerdown', dismiss, true), 0);
+}
+
 /* The workspace card under the roster: the current bot's project,
  * with real file count / size from the server (cached per bot). */
 async function renderWsCard() {
@@ -218,6 +282,25 @@ async function loadBots() {
 
 function currentBot() { return state.bots.find((b) => b.id === state.current) || null; }
 
+const fmtNum = (n) => Number(n || 0).toLocaleString('en-US');
+function paintUsageLine(turnTotal, botTotal) {
+  const bot = currentBot();
+  const line = $('#usageLine');
+  if (!line || !bot) return;
+  line.textContent = !botTotal ? ''
+    : turnTotal ? t('usageLine', { turn: fmtNum(turnTotal), name: bot.name, total: fmtNum(botTotal) })
+    : t('usageTotalOnly', { name: bot.name, total: fmtNum(botTotal) });
+}
+async function loadUsageLine() {
+  try {
+    const u = await api('GET', '/api/usage');
+    state.usage = u;
+    const mine = u.byBot.find((x) => x.botId === state.current);
+    paintUsageLine(0, mine?.total || 0);
+    if (!mine) $('#usageLine').textContent = '';
+  } catch { /* usage is decorative until it exists */ }
+}
+
 function renderHead() {
   const bot = currentBot();
   $('#botName').textContent = bot ? bot.name : t('pickBot');
@@ -242,6 +325,7 @@ async function selectBot(id, enter = true) {
   }
   if (!messages.length) addMessage('system', t('tryHint'));
   renderTasks(currentBot()?.tasks || []);
+  loadUsageLine();
   scrollDown();
 }
 
@@ -306,7 +390,7 @@ function addMessage(role, text, at, attachments) {
     for (const a of attachments) {
       if (a.mime?.startsWith('image/')) { const img = el('img', 'msg-img'); img.src = a.src; media.append(img); }
       else if (a.mime?.startsWith('video/')) { const v = el('video', 'msg-video'); v.src = a.src; v.controls = true; media.append(v); }
-      else media.append(el('div', 'msg-file', '📄 ' + a.name));
+      else { const f = el('div', 'msg-file'); f.innerHTML = icon('file', 14); f.append(el('span', '', a.name)); media.append(f); }
     }
     bubble.append(media);
   }
@@ -319,7 +403,10 @@ function addMessage(role, text, at, attachments) {
 
 function addToolChip(name, args) {
   const chip = el('div', 'tool-chip');
-  chip.append(el('b', '', '⚙ ' + name + ' '), document.createTextNode(JSON.stringify(args || {})));
+  const b = el('b');
+  b.innerHTML = icon('tool', 13);
+  b.append(document.createTextNode(' ' + name + ' '));
+  chip.append(b, document.createTextNode(JSON.stringify(args || {})));
   $('#messages').append(chip);
   scrollDown();
 }
@@ -361,7 +448,7 @@ function renderAttChips() {
   pendingAtt.forEach((a, i) => {
     const chip = el('span', 'att-chip');
     if (a.mime.startsWith('image/')) { const img = el('img'); img.src = a.dataUrl; chip.append(img); }
-    else chip.append(el('span', '', '📄'));
+    else { const s = el('span', 'att-ic'); s.innerHTML = icon('file', 16); chip.append(s); }
     chip.append(el('span', 'att-name', a.name));
     const x = el('button', 'att-x', '✕');
     x.type = 'button';
@@ -415,6 +502,7 @@ async function sendChat(text) {
         else if (type === 'approval') addApprovalCard(data);
         else if (type === 'package') addPackageCard(data);
         else if (type === 'tasks') renderTasks(data.tasks);
+        else if (type === 'usage') paintUsageLine(data.turn?.total, data.botTotal);
         else if (type === 'done' && data.cancelled) addMessage('system', t('stoppedNote'));
         else if (type === 'error') addErrorCard(data.message);
       }
@@ -436,7 +524,9 @@ async function sendChat(text) {
  * expand. Default folded, per the redesign spec. */
 function addToolLog(data) {
   const d = el('details', 'tool-log' + (data.ok ? '' : ' bad'));
-  const sum = el('summary', '', `🔧 ${data.name} · ${data.ok ? '✓' : '✗'}${data.ms != null ? ' · ' + data.ms + 'ms' : ''}`);
+  const sum = el('summary');
+  sum.innerHTML = icon('term', 14);
+  sum.append(document.createTextNode(` ${data.name} · ${data.ok ? '✓' : '✗'}${data.ms != null ? ' · ' + data.ms + 'ms' : ''}`));
   d.append(sum, el('pre', '', String(data.result || '').slice(0, 2000)));
   $('#messages').append(d);
   scrollDown();
@@ -446,7 +536,10 @@ function addToolLog(data) {
  * the last prompt) and Copy (clipboard) actions. */
 function addErrorCard(message) {
   const box = el('div', 'err-card');
-  box.append(el('div', 'err-text', '⚠ ' + message));
+  const errText = el('div', 'err-text');
+  errText.innerHTML = icon('warn', 14);
+  errText.append(document.createTextNode(' ' + message));
+  box.append(errText);
   const row = el('div', 'row');
   const retry = el('button', 'mini-btn', t('errRetry'));
   retry.onclick = () => { box.remove(); if (state.lastPrompt) sendChat(state.lastPrompt); };
@@ -489,7 +582,7 @@ async function downloadFile(url, name) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(objUrl), 4000);
   } catch (e) {
-    if (e?.name !== 'AbortError') addMessage('system', '⚠ ' + (e.message || e));
+    if (e?.name !== 'AbortError') addMessage('system', String(e.message || e));
   }
 }
 
@@ -498,7 +591,9 @@ function addPackageCard(data) {
   const box = el('div', 'package-card');
   box.append(el('h4', '', t('pkgReady')));
   box.append(el('div', 'pkg-meta', `${data.name} · ${fmtSize(data.size)}${data.files ? ` · ${data.files} ${t('pkgFiles')}` : ''}`));
-  const btn = el('button', 'dl-btn', '⬇ ' + t('pkgDl'));
+  const btn = el('button', 'dl-btn');
+  btn.innerHTML = icon('dl', 15);
+  btn.append(document.createTextNode(' ' + t('pkgDl')));
   btn.onclick = () => downloadFile(data.url, data.name);
   box.append(btn);
   $('#messages').append(box);
@@ -512,7 +607,10 @@ function renderTasks(tasks) {
   strip.innerHTML = '';
   if (!tasks || !tasks.length) { strip.hidden = true; return; }
   strip.hidden = false;
-  strip.append(el('div', 'task-head', `📋 ${tasks.filter((x) => x.done).length}/${tasks.length}`));
+  const head = el('div', 'task-head');
+  head.innerHTML = icon('list', 14);
+  head.append(document.createTextNode(` ${tasks.filter((x) => x.done).length}/${tasks.length}`));
+  strip.append(head);
   for (const task of tasks) {
     const row = el('div', 'task-row' + (task.done ? ' done' : ''));
     row.append(el('span', 'task-box', task.done ? '✓' : '○'), el('span', 'task-text', task.text));
@@ -672,8 +770,28 @@ async function fillSettings() {
   await loadProviders();
   await loadLocalModels().catch(() => {});
   await loadAudit();
+  await loadUsageBox().catch(() => {});
   await loadAccount().catch(() => {});
   await loadVolunteer().catch(() => {});
+}
+
+async function loadUsageBox() {
+  const u = await api('GET', '/api/usage');
+  state.usage = u;
+  const box = $('#usageBox');
+  box.innerHTML = '';
+  const sum = el('div', 'pv-meta', `${t('usageToday')}: ${fmtNum(u.today.total)} · ${t('usageTotalAll')}: ${fmtNum(u.total.total)} (${fmtNum(u.total.turns)} ${t('usageTurns')})`);
+  box.append(sum);
+  for (const b of u.byBot) {
+    const row = el('div', 'provider-row');
+    const info = el('div');
+    info.append(
+      el('div', 'pv-name', b.botName),
+      el('div', 'pv-meta', `${fmtNum(b.total)} tokens · ↑${fmtNum(b.prompt)} ↓${fmtNum(b.completion)} · ${fmtNum(b.turns)} ${t('usageTurns')}`)
+    );
+    row.append(info);
+    box.append(row);
+  }
 }
 
 /* --------------------- account & volunteers --------------------- */
@@ -696,8 +814,10 @@ async function loadAccount() {
   for (const u of users) {
     const row = el('div', 'provider-row');
     const info = el('div');
+    const nameEl = el('div', 'pv-name', u.name);
+    if (u.volunteerSince) { const h = el('span', 'vol-ic'); h.innerHTML = icon('heart', 13); nameEl.append(h); }
     info.append(
-      el('div', 'pv-name', u.name + (u.volunteerSince ? ' 🤝' : '')),
+      nameEl,
       el('div', 'pv-meta', `${t(u.role === 'owner' ? 'roleOwner' : 'roleMember')} · ${new Date(u.createdAt).toLocaleDateString()}${u.volunteerSince ? ' · ' + t('volBadge') : ''}`)
     );
     row.append(info);
@@ -763,7 +883,7 @@ async function loadTaskCenter() {
       const info = el('div', 'taskc-info');
       info.append(
         el('div', 'taskc-title', r.title || '(…)'),
-        el('div', 'pv-meta', `${r.botName} · ${fmtDay(r.startedAt)} · ${fmtDur((r.endedAt || Date.now()) - r.startedAt)}${r.error ? ' · ' + r.error : ''}`)
+        el('div', 'pv-meta', `${r.botName} · ${fmtDay(r.startedAt)} · ${fmtDur((r.endedAt || Date.now()) - r.startedAt)}${r.tokens ? ' · ' + fmtNum(r.tokens) + ' tok' : ''}${r.error ? ' · ' + r.error : ''}`)
       );
       const pillKey = { running: 'st_running', awaiting_approval: 'st_awaiting_approval', succeeded: 'tg_done', failed: 'tg_failed', interrupted: 'tg_failed', cancelled: 'tg_cancelled' }[r.status] || 'st_idle';
       const pillCls = { succeeded: 'ok', failed: 'bad', interrupted: 'bad', cancelled: 'mut' }[r.status] || r.status;
@@ -810,10 +930,14 @@ async function loadWorkspace() {
   if (!ws.items.length) listEl.append(el('p', 'set-hint', t('wsEmpty')));
   for (const it of ws.items) {
     const row = el('div', 'ws-row');
-    row.append(el('span', 'ws-fname', (it.dir ? '📁 ' : '📄 ') + it.path));
+    const fn = el('span', 'ws-fname');
+    fn.innerHTML = icon(it.dir ? 'folder' : 'file', 15);
+    fn.append(el('span', '', ' ' + it.path));
+    row.append(fn);
     if (!it.dir) {
       row.append(el('span', 'pv-meta', fmtSize(it.size)));
-      const dl = el('button', 'mini-btn', '⬇');
+      const dl = el('button', 'mini-btn');
+      dl.innerHTML = icon('dl', 14);
       dl.onclick = () => downloadFile(`/api/bots/${botId}/files/${encodeURI(it.path)}`, it.path.split('/').pop());
       row.append(dl);
     }
@@ -909,8 +1033,8 @@ async function init() {
     const files = [...(ev.target.files || [])];
     ev.target.value = '';
     for (const f of files) {
-      if (pendingAtt.length >= 6) { addMessage('system', '⚠ ' + t('attTooMany')); break; }
-      if (f.size > 10 * 1024 * 1024) { addMessage('system', '⚠ ' + t('attTooBig') + ': ' + f.name); continue; }
+      if (pendingAtt.length >= 6) { addMessage('system', t('attTooMany')); break; }
+      if (f.size > 10 * 1024 * 1024) { addMessage('system', t('attTooBig') + ': ' + f.name); continue; }
       const dataUrl = await new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.readAsDataURL(f); });
       pendingAtt.push({ name: f.name, mime: f.type || 'application/octet-stream', dataUrl });
     }
@@ -932,7 +1056,7 @@ async function init() {
     try {
       const pkg = await api('POST', `/api/bots/${bot.id}/package`, {});
       addPackageCard(pkg);
-    } catch (e) { addMessage('system', '⚠ ' + e.message); }
+    } catch (e) { addMessage('system', e.message); }
   };
   $('#cancelBtn').onclick = () => $('#botDialog').close();
   $('#botForm').addEventListener('submit', async (ev) => {
@@ -985,7 +1109,7 @@ async function init() {
       await api('POST', '/api/auth/password', { oldPassword: $('#pwOld').value, newPassword: $('#pwNew').value });
       $('#pwMsg').textContent = t('pwOk');
       $('#pwOld').value = ''; $('#pwNew').value = '';
-    } catch (e) { $('#pwMsg').textContent = '⚠ ' + e.message; }
+    } catch (e) { $('#pwMsg').textContent = e.message; }
   });
   $('#userForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
@@ -993,7 +1117,7 @@ async function init() {
       await api('POST', '/api/auth/users', { name: $('#uName').value, password: $('#uPass').value, role: $('#uRole').value });
       $('#uName').value = ''; $('#uPass').value = '';
       loadAccount();
-    } catch (e) { addMessage('system', '⚠ ' + e.message); }
+    } catch (e) { addMessage('system', e.message); }
   });
   $('#logoutBtn').onclick = async () => {
     await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
@@ -1033,4 +1157,4 @@ async function init() {
   });
 }
 
-init().catch((e) => { if (e.message !== 'locked') addMessage('system', '⚠ ' + e.message); });
+init().catch((e) => { if (e.message !== 'locked') addMessage('system', e.message); });

@@ -10,8 +10,8 @@
 // files carry a version query (?v=61 — bump it together with CACHE on
 // every release; a new URL is a new cache entry everywhere), and
 // (2) fetches here bypass the HTTP cache entirely.
-const CACHE = 'starts-agents-v6';
-const SHELL = ['/', '/index.html', '/style.css?v=70', '/app.js?v=70', '/i18n.js?v=70', '/manifest.webmanifest', '/icon.png', '/complay-c.svg?v=70'];
+const CACHE = 'starts-agents-v8';
+const SHELL = ['/', '/index.html', '/style.css?v=72', '/app.js?v=72', '/i18n.js?v=72', '/manifest.webmanifest', '/icon.png', '/complay-c.svg?v=72'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

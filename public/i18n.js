@@ -8,7 +8,7 @@ export const LANGS = [
 ];
 
 const en = {
-  newBot: 'New bot', models: '⚙ Models', importTeam: 'Import team', exportTeam: 'Export',
+  newBot: 'New bot', models: 'Models', importTeam: 'Import team', exportTeam: 'Export',
   pickBot: 'Pick a bot', send: 'Send', msgPh: 'Message…',
   tryHint: 'Try: list files · read <file> · note <text> · run <command> (asks first)',
   dNew: 'New bot', dEdit: 'Edit bot', fName: 'Name', fEngine: 'Engine', fProvider: 'Model provider',
@@ -22,14 +22,14 @@ const en = {
   provNone: '(none — env default)', notConf: ' (not configured)',
   lockHint: 'This deployment is protected. Enter the access token once — this device will remember it.',
   lockPh: 'Access token', unlock: 'Unlock', lockErr: 'That token did not work — try again.',
-  apTitle: '🙋 Approval needed — ', allow: 'Allow', allowS: 'Allow all this session', deny: 'Deny',
-  pkgTitle: 'Package this project into a deployment zip', pkgReady: '📦 Deployment package ready', pkgDl: 'Download', pkgFiles: 'files',
+  apTitle: 'Approval needed — ', allow: 'Allow', allowS: 'Allow all this session', deny: 'Deny',
+  pkgTitle: 'Package this project into a deployment zip', pkgReady: 'Deployment package ready', pkgDl: 'Download', pkgFiles: 'files',
   lmTitle: 'Local models (Ollama)', lmHint: 'Open-weight models running on this machine — no API, no key. Two different numbers: disk is the download size; RAM is what it occupies while answering (auto-unloads after 5 idle minutes).',
   lmOff: 'Ollama not detected on this server. Install it with scripts/setup-local-model.sh, then reopen Settings.',
   lmUse: 'Use', lmUsing: 'In use', lmPull: 'Download', lmDel: 'Delete', lmDisk: 'disk', lmRam: 'RAM', lmPulling: 'Downloading…', lmFailed: 'Download failed — tap Download to resume',
   attach: 'Add photo / video / file', editAct: 'Edit', delConfirm: 'Sure?', attTooBig: 'Each file must be under 10 MB', attTooMany: 'Up to 6 files at a time',
   okOnce: '✓ Allowed once', okSession: '✓ Allowed for this session', denied: '✕ Denied',
-  imported: 'Imported team "{name}" — {n} bot(s).', importFail: '⚠ Import failed: ',
+  imported: 'Imported team "{name}" — {n} bot(s).', importFail: 'Import failed: ',
   sessExp: 'Session locked — enter the access token again', noMsg: 'No messages yet',
   lockHintAcct: 'Sign in with your account. First time here? Create the admin account below.',
   lockNamePh: 'Account name', lockPassPh: 'Password (8+ characters)', loginBtn: 'Sign in',
@@ -53,10 +53,14 @@ const en = {
   lmCat_code: 'Coding', lmCat_general: 'General', lmCat_reasoning: 'Reasoning', lmCat_vision: 'Vision',
   stopTitle: 'Stop generating', volBadge: 'Volunteer',
 
+  usageTitle: 'Token usage', usageHint: 'Real usage reported by the model endpoint (input + output), never estimated; models that do not report usage (e.g. small local ones) are not counted.',
+  usageLine: 'This turn {turn} tokens · {name} total {total}', usageToday: 'Today', usageTotalAll: 'All time', usageTurns: 'turns',
+
+  usageTotalOnly: '{name} total {total}',
 };
 
 const zh = {
-  newBot: '新建机器人', models: '⚙ 模型设置', importTeam: '导入团队', exportTeam: '导出',
+  newBot: '新建机器人', models: '模型设置', importTeam: '导入团队', exportTeam: '导出',
   pickBot: '选择一个机器人', send: '发送', msgPh: '输入消息…',
   tryHint: '试试：list files 看工作区 · read 文件名 · note 记一笔 · run 命令（要审批）',
   dNew: '新建机器人', dEdit: '编辑机器人', fName: '名字', fEngine: '引擎', fProvider: '模型供应商',
@@ -70,14 +74,14 @@ const zh = {
   provNone: '（不指定，用环境默认）', notConf: '（未配置）',
   lockHint: '这是一个受保护的部署。输入访问口令一次，这台设备之后免输。',
   lockPh: '访问口令', unlock: '解锁', lockErr: '口令不对，再试一次。',
-  apTitle: '🙋 需要你批准 — ', allow: '允许', allowS: '本会话都允许', deny: '拒绝',
-  pkgTitle: '把当前项目打包成部署包', pkgReady: '📦 部署包已生成', pkgDl: '下载', pkgFiles: '个文件',
+  apTitle: '需要你批准 — ', allow: '允许', allowS: '本会话都允许', deny: '拒绝',
+  pkgTitle: '把当前项目打包成部署包', pkgReady: '部署包已生成', pkgDl: '下载', pkgFiles: '个文件',
   lmTitle: '本地模型（Ollama）', lmHint: '在本机跑的开源模型，不用 API、不用 key。注意两个数：磁盘是下载占的硬盘，内存是回答问题时占的运行内存（闲置 5 分钟自动卸载释放）。',
   lmOff: '这台服务器还没装 Ollama。先在服务器上跑 scripts/setup-local-model.sh，再打开设置。',
   lmUse: '使用', lmUsing: '使用中', lmPull: '下载', lmDel: '删除', lmDisk: '磁盘', lmRam: '内存', lmPulling: '下载中…', lmFailed: '下载失败——点「下载」可以断点续传',
   attach: '添加图片 / 视频 / 文件', editAct: '编辑', delConfirm: '确认删除？', attTooBig: '每个文件要小于 10 MB', attTooMany: '一次最多 6 个文件',
   okOnce: '✓ 已允许（仅这次）', okSession: '✓ 已允许（本会话内同类操作不再问）', denied: '✕ 已拒绝',
-  imported: '已导入团队「{name}」，共 {n} 个机器人。', importFail: '⚠ 导入失败：',
+  imported: '已导入团队「{name}」，共 {n} 个机器人。', importFail: '导入失败：',
   sessExp: '登录已失效，请重新输入访问口令', noMsg: '暂无消息',
   lockHintAcct: '用你的账号登录。第一次使用时，先创建管理员账号。',
   lockNamePh: '账号名', lockPassPh: '密码（至少 8 位）', loginBtn: '登录',
@@ -101,6 +105,10 @@ const zh = {
   lmCat_code: '代码', lmCat_general: '通用', lmCat_reasoning: '推理', lmCat_vision: '视觉',
   stopTitle: '停止生成', volBadge: '志愿者',
 
+  usageTitle: 'Token 用量', usageHint: '由模型服务端上报的真实用量（输入 + 输出），不是估算；不返回用量的模型（如本地小模型）不会计入。',
+  usageLine: '本次 {turn} tokens · {name} 累计 {total}', usageToday: '今日', usageTotalAll: '累计', usageTurns: '轮',
+
+  usageTotalOnly: '{name} 累计 {total}',
 };
 
 const tw = {
@@ -117,9 +125,9 @@ const tw = {
   provNone: '（不指定，用環境預設）', notConf: '（未設定）',
   lockHint: '這是一個受保護的部署。輸入存取口令一次，這台裝置之後免輸。',
   lockPh: '存取口令', unlock: '解鎖', lockErr: '口令不對，再試一次。',
-  apTitle: '🙋 需要你批准 — ', allow: '允許', allowS: '本工作階段都允許', deny: '拒絕',
+  apTitle: '需要你批准 — ', allow: '允許', allowS: '本工作階段都允許', deny: '拒絕',
   okOnce: '✓ 已允許（僅這次）', okSession: '✓ 已允許（本工作階段同類操作不再問）', denied: '✕ 已拒絕',
-  imported: '已匯入團隊「{name}」，共 {n} 個機器人。', importFail: '⚠ 匯入失敗：',
+  imported: '已匯入團隊「{name}」，共 {n} 個機器人。', importFail: '匯入失敗：',
   sessExp: '登入已失效，請重新輸入存取口令', noMsg: '暫無訊息',
   lockHintAcct: '用你的帳號登入。第一次使用時，先建立管理員帳號。',
   lockNamePh: '帳號名', lockPassPh: '密碼（至少 8 位）', loginBtn: '登入',
@@ -143,11 +151,15 @@ const tw = {
   lmCat_code: '程式', lmCat_general: '通用', lmCat_reasoning: '推理', lmCat_vision: '視覺',
   stopTitle: '停止生成', volBadge: '志願者',
 
+  usageTitle: 'Token 用量', usageHint: '由模型服務端回報的真實用量（輸入 + 輸出），不是估算；不回傳用量的模型（如本地小模型）不會計入。',
+  usageLine: '本次 {turn} tokens · {name} 累計 {total}', usageToday: '今日', usageTotalAll: '累計', usageTurns: '輪',
+
+  usageTotalOnly: '{name} 累計 {total}',
 };
 
 const ja = {
   ...en,
-  newBot: '新規ボット', models: '⚙ モデル', importTeam: 'チーム読込', exportTeam: '書出',
+  newBot: '新規ボット', models: 'モデル', importTeam: 'チーム読込', exportTeam: '書出',
   pickBot: 'ボットを選択', send: '送信', msgPh: 'メッセージ…',
   dNew: '新規ボット', dEdit: 'ボット編集', fName: '名前', fEngine: 'エンジン', fProvider: 'モデル提供元',
   fPersona: 'ペルソナ', del: '削除', cancel: 'キャンセル', save: '保存',
@@ -155,12 +167,12 @@ const ja = {
   pKey: 'APIキー', addProv: 'プロバイダ追加', close: '閉じる', audit: '最近の活動', noAudit: 'まだありません。',
   lockPh: 'アクセストークン', unlock: 'ロック解除', allow: '許可', allowS: 'このセッション中すべて許可', deny: '拒否',
   okOnce: '✓ 許可しました（今回のみ）', okSession: '✓ 許可しました（このセッション）', denied: '✕ 拒否しました',
-  apTitle: '🙋 承認が必要です — ', noMsg: 'メッセージはまだありません',
+  apTitle: '承認が必要です — ', noMsg: 'メッセージはまだありません',
 };
 
 const ko = {
   ...en,
-  newBot: '새 봇', models: '⚙ 모델', importTeam: '팀 가져오기', exportTeam: '내보내기',
+  newBot: '새 봇', models: '모델', importTeam: '팀 가져오기', exportTeam: '내보내기',
   pickBot: '봇 선택', send: '전송', msgPh: '메시지…',
   dNew: '새 봇', dEdit: '봇 편집', fName: '이름', fEngine: '엔진', fProvider: '모델 제공자',
   fPersona: '페르소나', del: '삭제', cancel: '취소', save: '저장',
@@ -168,12 +180,12 @@ const ko = {
   pKey: 'API 키', addProv: '제공자 추가', close: '닫기', audit: '최근 활동', noAudit: '아직 없습니다.',
   lockPh: '액세스 토큰', unlock: '잠금 해제', allow: '허용', allowS: '이 세션 동안 모두 허용', deny: '거부',
   okOnce: '✓ 허용됨(이번만)', okSession: '✓ 허용됨(이 세션)', denied: '✕ 거부됨',
-  apTitle: '🙋 승인이 필요합니다 — ', noMsg: '아직 메시지가 없습니다',
+  apTitle: '승인이 필요합니다 — ', noMsg: '아직 메시지가 없습니다',
 };
 
 const es = {
   ...en,
-  newBot: 'Nuevo bot', models: '⚙ Modelos', importTeam: 'Importar equipo', exportTeam: 'Exportar',
+  newBot: 'Nuevo bot', models: 'Modelos', importTeam: 'Importar equipo', exportTeam: 'Exportar',
   pickBot: 'Elige un bot', send: 'Enviar', msgPh: 'Mensaje…',
   dNew: 'Nuevo bot', dEdit: 'Editar bot', fName: 'Nombre', fEngine: 'Motor', fProvider: 'Proveedor de modelo',
   fPersona: 'Personalidad', del: 'Eliminar', cancel: 'Cancelar', save: 'Guardar',
@@ -181,12 +193,12 @@ const es = {
   pKey: 'Clave API', addProv: 'Añadir proveedor', close: 'Cerrar', audit: 'Actividad reciente', noAudit: 'Aún nada.',
   lockPh: 'Token de acceso', unlock: 'Desbloquear', allow: 'Permitir', allowS: 'Permitir toda la sesión', deny: 'Denegar',
   okOnce: '✓ Permitido una vez', okSession: '✓ Permitido esta sesión', denied: '✕ Denegado',
-  apTitle: '🙋 Se necesita aprobación — ', noMsg: 'Sin mensajes todavía',
+  apTitle: 'Se necesita aprobación — ', noMsg: 'Sin mensajes todavía',
 };
 
 const fr = {
   ...en,
-  newBot: 'Nouveau bot', models: '⚙ Modèles', importTeam: 'Importer l’équipe', exportTeam: 'Exporter',
+  newBot: 'Nouveau bot', models: 'Modèles', importTeam: 'Importer l’équipe', exportTeam: 'Exporter',
   pickBot: 'Choisir un bot', send: 'Envoyer', msgPh: 'Message…',
   dNew: 'Nouveau bot', dEdit: 'Modifier le bot', fName: 'Nom', fEngine: 'Moteur', fProvider: 'Fournisseur de modèle',
   fPersona: 'Persona', del: 'Supprimer', cancel: 'Annuler', save: 'Enregistrer',
@@ -194,12 +206,12 @@ const fr = {
   pKey: 'Clé API', addProv: 'Ajouter un fournisseur', close: 'Fermer', audit: 'Activité récente', noAudit: 'Rien pour le moment.',
   lockPh: 'Jeton d’accès', unlock: 'Déverrouiller', allow: 'Autoriser', allowS: 'Tout autoriser (session)', deny: 'Refuser',
   okOnce: '✓ Autorisé une fois', okSession: '✓ Autorisé pour la session', denied: '✕ Refusé',
-  apTitle: '🙋 Approbation requise — ', noMsg: 'Aucun message',
+  apTitle: 'Approbation requise — ', noMsg: 'Aucun message',
 };
 
 const de = {
   ...en,
-  newBot: 'Neuer Bot', models: '⚙ Modelle', importTeam: 'Team importieren', exportTeam: 'Exportieren',
+  newBot: 'Neuer Bot', models: 'Modelle', importTeam: 'Team importieren', exportTeam: 'Exportieren',
   pickBot: 'Bot auswählen', send: 'Senden', msgPh: 'Nachricht…',
   dNew: 'Neuer Bot', dEdit: 'Bot bearbeiten', fName: 'Name', fEngine: 'Engine', fProvider: 'Modellanbieter',
   fPersona: 'Persona', del: 'Löschen', cancel: 'Abbrechen', save: 'Speichern',
@@ -207,12 +219,12 @@ const de = {
   pKey: 'API-Schlüssel', addProv: 'Anbieter hinzufügen', close: 'Schließen', audit: 'Letzte Aktivität', noAudit: 'Noch nichts.',
   lockPh: 'Zugangstoken', unlock: 'Entsperren', allow: 'Erlauben', allowS: 'Für diese Sitzung erlauben', deny: 'Ablehnen',
   okOnce: '✓ Einmal erlaubt', okSession: '✓ Für die Sitzung erlaubt', denied: '✕ Abgelehnt',
-  apTitle: '🙋 Genehmigung nötig — ', noMsg: 'Noch keine Nachrichten',
+  apTitle: 'Genehmigung nötig — ', noMsg: 'Noch keine Nachrichten',
 };
 
 const ru = {
   ...en,
-  newBot: 'Новый бот', models: '⚙ Модели', importTeam: 'Импорт команды', exportTeam: 'Экспорт',
+  newBot: 'Новый бот', models: 'Модели', importTeam: 'Импорт команды', exportTeam: 'Экспорт',
   pickBot: 'Выберите бота', send: 'Отправить', msgPh: 'Сообщение…',
   dNew: 'Новый бот', dEdit: 'Изменить бота', fName: 'Имя', fEngine: 'Движок', fProvider: 'Провайдер модели',
   fPersona: 'Персона', del: 'Удалить', cancel: 'Отмена', save: 'Сохранить',
@@ -220,12 +232,12 @@ const ru = {
   pKey: 'API-ключ', addProv: 'Добавить провайдера', close: 'Закрыть', audit: 'Последняя активность', noAudit: 'Пока пусто.',
   lockPh: 'Токен доступа', unlock: 'Разблокировать', allow: 'Разрешить', allowS: 'Разрешать в этой сессии', deny: 'Запретить',
   okOnce: '✓ Разрешено один раз', okSession: '✓ Разрешено на сессию', denied: '✕ Запрещено',
-  apTitle: '🙋 Нужно разрешение — ', noMsg: 'Сообщений пока нет',
+  apTitle: 'Нужно разрешение — ', noMsg: 'Сообщений пока нет',
 };
 
 const pt = {
   ...en,
-  newBot: 'Novo bot', models: '⚙ Modelos', importTeam: 'Importar equipe', exportTeam: 'Exportar',
+  newBot: 'Novo bot', models: 'Modelos', importTeam: 'Importar equipe', exportTeam: 'Exportar',
   pickBot: 'Escolha um bot', send: 'Enviar', msgPh: 'Mensagem…',
   dNew: 'Novo bot', dEdit: 'Editar bot', fName: 'Nome', fEngine: 'Motor', fProvider: 'Provedor de modelo',
   fPersona: 'Persona', del: 'Excluir', cancel: 'Cancelar', save: 'Salvar',
@@ -233,12 +245,12 @@ const pt = {
   pKey: 'Chave API', addProv: 'Adicionar provedor', close: 'Fechar', audit: 'Atividade recente', noAudit: 'Nada ainda.',
   lockPh: 'Token de acesso', unlock: 'Desbloquear', allow: 'Permitir', allowS: 'Permitir nesta sessão', deny: 'Negar',
   okOnce: '✓ Permitido uma vez', okSession: '✓ Permitido nesta sessão', denied: '✕ Negado',
-  apTitle: '🙋 Aprovação necessária — ', noMsg: 'Sem mensagens ainda',
+  apTitle: 'Aprovação necessária — ', noMsg: 'Sem mensagens ainda',
 };
 
 const vi = {
   ...en,
-  newBot: 'Bot mới', models: '⚙ Mô hình', importTeam: 'Nhập đội', exportTeam: 'Xuất',
+  newBot: 'Bot mới', models: 'Mô hình', importTeam: 'Nhập đội', exportTeam: 'Xuất',
   pickBot: 'Chọn một bot', send: 'Gửi', msgPh: 'Tin nhắn…',
   dNew: 'Bot mới', dEdit: 'Sửa bot', fName: 'Tên', fEngine: 'Engine', fProvider: 'Nhà cung cấp mô hình',
   fPersona: 'Tính cách', del: 'Xoá', cancel: 'Huỷ', save: 'Lưu',
@@ -246,12 +258,12 @@ const vi = {
   pKey: 'API key', addProv: 'Thêm nhà cung cấp', close: 'Đóng', audit: 'Hoạt động gần đây', noAudit: 'Chưa có gì.',
   lockPh: 'Mã truy cập', unlock: 'Mở khoá', allow: 'Cho phép', allowS: 'Cho phép cả phiên này', deny: 'Từ chối',
   okOnce: '✓ Đã cho phép một lần', okSession: '✓ Đã cho phép trong phiên', denied: '✕ Đã từ chối',
-  apTitle: '🙋 Cần bạn phê duyệt — ', noMsg: 'Chưa có tin nhắn',
+  apTitle: 'Cần bạn phê duyệt — ', noMsg: 'Chưa có tin nhắn',
 };
 
 const th = {
   ...en,
-  newBot: 'บอทใหม่', models: '⚙ โมเดล', importTeam: 'นำเข้าทีม', exportTeam: 'ส่งออก',
+  newBot: 'บอทใหม่', models: 'โมเดล', importTeam: 'นำเข้าทีม', exportTeam: 'ส่งออก',
   pickBot: 'เลือกบอท', send: 'ส่ง', msgPh: 'ข้อความ…',
   dNew: 'บอทใหม่', dEdit: 'แก้ไขบอท', fName: 'ชื่อ', fEngine: 'เอนจิน', fProvider: 'ผู้ให้บริการโมเดล',
   fPersona: 'บุคลิก', del: 'ลบ', cancel: 'ยกเลิก', save: 'บันทึก',
@@ -259,12 +271,12 @@ const th = {
   pKey: 'API key', addProv: 'เพิ่มผู้ให้บริการ', close: 'ปิด', audit: 'กิจกรรมล่าสุด', noAudit: 'ยังไม่มีข้อมูล',
   lockPh: 'โทเค็นเข้าใช้', unlock: 'ปลดล็อก', allow: 'อนุญาต', allowS: 'อนุญาตทั้งเซสชันนี้', deny: 'ปฏิเสธ',
   okOnce: '✓ อนุญาตครั้งเดียว', okSession: '✓ อนุญาตในเซสชันนี้', denied: '✕ ปฏิเสธแล้ว',
-  apTitle: '🙋 ต้องการการอนุมัติ — ', noMsg: 'ยังไม่มีข้อความ',
+  apTitle: 'ต้องการการอนุมัติ — ', noMsg: 'ยังไม่มีข้อความ',
 };
 
 const id = {
   ...en,
-  newBot: 'Bot baru', models: '⚙ Model', importTeam: 'Impor tim', exportTeam: 'Ekspor',
+  newBot: 'Bot baru', models: 'Model', importTeam: 'Impor tim', exportTeam: 'Ekspor',
   pickBot: 'Pilih bot', send: 'Kirim', msgPh: 'Pesan…',
   dNew: 'Bot baru', dEdit: 'Edit bot', fName: 'Nama', fEngine: 'Mesin', fProvider: 'Penyedia model',
   fPersona: 'Persona', del: 'Hapus', cancel: 'Batal', save: 'Simpan',
@@ -272,12 +284,12 @@ const id = {
   pKey: 'Kunci API', addProv: 'Tambah penyedia', close: 'Tutup', audit: 'Aktivitas terakhir', noAudit: 'Belum ada.',
   lockPh: 'Token akses', unlock: 'Buka kunci', allow: 'Izinkan', allowS: 'Izinkan sesi ini', deny: 'Tolak',
   okOnce: '✓ Diizinkan sekali', okSession: '✓ Diizinkan sesi ini', denied: '✕ Ditolak',
-  apTitle: '🙋 Perlu persetujuan — ', noMsg: 'Belum ada pesan',
+  apTitle: 'Perlu persetujuan — ', noMsg: 'Belum ada pesan',
 };
 
 const ar = {
   ...en,
-  newBot: 'بوت جديد', models: '⚙ النماذج', importTeam: 'استيراد فريق', exportTeam: 'تصدير',
+  newBot: 'بوت جديد', models: 'النماذج', importTeam: 'استيراد فريق', exportTeam: 'تصدير',
   pickBot: 'اختر بوتًا', send: 'إرسال', msgPh: 'رسالة…',
   dNew: 'بوت جديد', dEdit: 'تعديل البوت', fName: 'الاسم', fEngine: 'المحرك', fProvider: 'مزوّد النموذج',
   fPersona: 'الشخصية', del: 'حذف', cancel: 'إلغاء', save: 'حفظ',
@@ -285,12 +297,12 @@ const ar = {
   pKey: 'مفتاح API', addProv: 'إضافة مزوّد', close: 'إغلاق', audit: 'النشاط الأخير', noAudit: 'لا شيء بعد.',
   lockPh: 'رمز الوصول', unlock: 'فتح', allow: 'سماح', allowS: 'السماح طوال الجلسة', deny: 'رفض',
   okOnce: '✓ تم السماح مرة واحدة', okSession: '✓ تم السماح لهذه الجلسة', denied: '✕ تم الرفض',
-  apTitle: '🙋 يلزم موافقتك — ', noMsg: 'لا رسائل بعد',
+  apTitle: 'يلزم موافقتك — ', noMsg: 'لا رسائل بعد',
 };
 
 const hi = {
   ...en,
-  newBot: 'नया बॉट', models: '⚙ मॉडल', importTeam: 'टीम आयात करें', exportTeam: 'निर्यात',
+  newBot: 'नया बॉट', models: 'मॉडल', importTeam: 'टीम आयात करें', exportTeam: 'निर्यात',
   pickBot: 'एक बॉट चुनें', send: 'भेजें', msgPh: 'संदेश…',
   dNew: 'नया बॉट', dEdit: 'बॉट संपादित करें', fName: 'नाम', fEngine: 'इंजन', fProvider: 'मॉडल प्रदाता',
   fPersona: 'व्यक्तित्व', del: 'हटाएँ', cancel: 'रद्द करें', save: 'सहेजें',
@@ -298,7 +310,7 @@ const hi = {
   pKey: 'API कुंजी', addProv: 'प्रदाता जोड़ें', close: 'बंद करें', audit: 'हाल की गतिविधि', noAudit: 'अभी कुछ नहीं।',
   lockPh: 'एक्सेस टोकन', unlock: 'अनलॉक', allow: 'अनुमति दें', allowS: 'इस सत्र में सब अनुमति दें', deny: 'अस्वीकार',
   okOnce: '✓ एक बार अनुमति दी', okSession: '✓ इस सत्र के लिए अनुमति', denied: '✕ अस्वीकृत',
-  apTitle: '🙋 आपकी स्वीकृति चाहिए — ', noMsg: 'अभी कोई संदेश नहीं',
+  apTitle: 'आपकी स्वीकृति चाहिए — ', noMsg: 'अभी कोई संदेश नहीं',
 };
 
 export const DICT = { zh, tw, en, ja, ko, es, fr, de, ru, pt, vi, th, id, ar, hi };

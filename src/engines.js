@@ -150,14 +150,22 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       ...images.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
     ];
   }
+  // Ask for token usage in the stream (OpenAI/DeepSeek/OpenRouter/
+  // Ollama all support stream_options.include_usage). A provider that
+  // rejects the field gets one retry without it — see below.
+  let useUsage = true;
   const doFetch = () => fetch(baseUrl + '/chat/completions', { signal,
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
-    body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true }),
+    body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true, ...(useUsage ? { stream_options: { include_usage: true } } : {}) }),
   });
   for (let round = 0; round < 25; round++) {
     if (signal && signal.aborted) return;
     let res = await doFetch();
+    if (!res.ok && useUsage) {
+      const peek = await res.clone().text().catch(() => '');
+      if (/stream_options|include_usage/.test(peek)) { useUsage = false; res = await doFetch(); }
+    }
     if (!res.ok && visionActive && round === 0) {
       visionActive = false;
       userMsg.content = userText + (zh
@@ -167,6 +175,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
     }
     if (!res.ok || !res.body) throw new Error('AI endpoint returned ' + res.status);
     const calls = new Map();
+    let lastUsage = null;
     let content = '';
     // Small/local models often skip the structured tool_calls channel
     // and print the call as plain JSON text instead. Hold back content
@@ -188,6 +197,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
         const data = line.slice(5).trim();
         if (data === '[DONE]') break;
         let json; try { json = JSON.parse(data); } catch { continue; }
+        if (json.usage) lastUsage = json.usage;
         const delta = json.choices?.[0]?.delta || {};
         if (delta.content) {
           content += delta.content;
@@ -211,6 +221,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
         }
       }
     }
+    if (lastUsage) yield { type: 'usage', usage: lastUsage };
     if (!calls.size) {
       // No structured calls: was the text itself a tool call in disguise?
       const call = parseTextToolCall(content);

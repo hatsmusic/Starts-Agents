@@ -134,10 +134,10 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     const guide = zh
       ? `我还没有可用的大脑：还没给我配模型。两个办法，配好后重新发消息就行：\n` +
         `① 本地模型（不花钱、不连云）：在服务器上跑 scripts/setup-local-model.sh 再重启服务，我会自动接上；\n` +
-        `② 云端 API：点左下「⚙ 模型设置」添加一个供应商（DeepSeek、通义千问等）。`
+        `② 云端 API：点底部「设置」添加一个供应商（DeepSeek、通义千问等）。`
       : `I don't have a brain yet — no model is configured for me. Either fix works, then just send your message again:\n` +
         `1) Local model (free, nothing leaves the server): run scripts/setup-local-model.sh on the server and restart — I'll pick it up automatically.\n` +
-        `2) Cloud API: add a provider under "⚙ Models" (DeepSeek, Qwen, …).`;
+        `2) Cloud API: add a provider under Settings (DeepSeek, Qwen, …).`;
     emit('token', { text: guide });
     store.pushMessage(bot.id, { role: 'assistant', text: guide, at: new Date().toISOString() });
     return guide;
@@ -145,12 +145,19 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace), images: extras.images, signal: extras.signal });
   let assistant = '';
   let failStreak = 0;
+  const turnUsage = { prompt: 0, completion: 0, total: 0 };
   let next = await gen.next();
   while (!next.done) {
     const ev = next.value;
     if (ev.type === 'token') {
       assistant += ev.text;
       emit('token', { text: ev.text });
+      next = await gen.next();
+    } else if (ev.type === 'usage') {
+      turnUsage.prompt += ev.usage?.prompt_tokens || 0;
+      turnUsage.completion += ev.usage?.completion_tokens || 0;
+      turnUsage.total += ev.usage?.total_tokens || ((ev.usage?.prompt_tokens || 0) + (ev.usage?.completion_tokens || 0));
+      if (extras.onUsage) extras.onUsage({ ...turnUsage });
       next = await gen.next();
     } else if (ev.type === 'tool') {
       const tool = getTool(ev.name);
@@ -167,7 +174,7 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
           } else {
             let preview = null;
             if (typeof tool.preview === 'function') {
-              try { preview = tool.preview(ev.args, ctx); } catch (e) { preview = '⚠ preview failed: ' + e.message; }
+              try { preview = tool.preview(ev.args, ctx); } catch (e) { preview = 'preview failed: ' + e.message; }
             }
             if (extras.onApprovalWait) extras.onApprovalWait(true);
             const { decision } = await requestApproval({
@@ -305,10 +312,11 @@ function startRun(bot, title) {
   saveRuns();
   return run;
 }
-function endRun(run, status, error) {
+function endRun(run, status, error, tokens) {
   run.status = status;
   run.endedAt = Date.now();
   if (error) run.error = String(error).slice(0, 300);
+  if (tokens) run.tokens = tokens;
   saveRuns();
 }
 /* A bot's honest status, derived from live state — never decoration:
@@ -326,6 +334,33 @@ async function botStatus(bot) {
   }
   if (engineAvailCache.map[bot.engine] === false) return 'offline';
   return 'idle';
+}
+/* --------------- token usage accounting (v0.7.1) ---------------
+ * Only REAL reported usage is counted: the OpenAI-compatible stream
+ * reports prompt/completion tokens (stream_options.include_usage);
+ * engines/providers that report nothing contribute nothing — no
+ * estimates, no fake numbers. Persisted in data/usage.json. */
+const USAGE_FILE = path.join(config.dataDir, 'usage.json');
+let usageStore = { byBot: {}, byDay: {} };
+try { const u = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); if (u && u.byBot) usageStore = u; } catch { /* fresh */ }
+function saveUsage() {
+  try {
+    const tmp = USAGE_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(usageStore), { mode: 0o600 });
+    fs.renameSync(tmp, USAGE_FILE);
+  } catch { /* best effort */ }
+}
+function recordUsage(botId, u) {
+  if (!u || !u.total) return;
+  const day = new Date().toISOString().slice(0, 10);
+  for (const bucket of [usageStore.byBot[botId] || (usageStore.byBot[botId] = { prompt: 0, completion: 0, total: 0, turns: 0 }),
+                        usageStore.byDay[day] || (usageStore.byDay[day] = { prompt: 0, completion: 0, total: 0, turns: 0 })]) {
+    bucket.prompt += u.prompt || 0;
+    bucket.completion += u.completion || 0;
+    bucket.total += u.total || 0;
+    bucket.turns += 1;
+  }
+  saveUsage();
 }
 function botLastActive(bot) {
   const msgs = store.getMessages(bot.id);
@@ -701,24 +736,33 @@ const server = http.createServer(async (req, res) => {
         modelText += (modelText ? '\n' : '') + (zh
           ? `[用户附带了 ${saved.meta.length} 个文件，已存入工作区：${listing}]`
           : `[The user attached ${saved.meta.length} file(s), saved in the workspace: ${listing}]`);
-        storedText += (storedText ? '\n' : '') + '📎 ' + saved.meta.map((m) => m.name).join(', ');
+        storedText += (storedText ? '\n' : '') + (zh ? '附件：' : 'Files: ') + saved.meta.map((m) => m.name).join(', ');
       }
       if (liveRuns.has(bot.id)) return json(res, 409, { error: 'this agent is already running a task' });
       const controller = new AbortController();
       const run = startRun(bot, storedText);
+      const usageAcc = { prompt: 0, completion: 0, total: 0 };
       const live = { controller, runId: run.id, status: 'running', since: run.startedAt, title: run.title };
       liveRuns.set(bot.id, live);
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const emit = (type, data) => { try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ } };
+      const finishRun = (status, err) => {
+        if (usageAcc.total > 0) recordUsage(bot.id, usageAcc);
+        endRun(run, status, err, usageAcc.total || null);
+      };
       try {
         await chatTurn(bot, modelText, emit, langStr, {
           images: saved.images, storedText, attachments: saved.meta, signal: controller.signal,
           onApprovalWait: (waiting) => { live.status = waiting ? 'awaiting_approval' : 'running'; },
+          onUsage: (u) => {
+            Object.assign(usageAcc, u);
+            emit('usage', { turn: { ...u }, botTotal: (usageStore.byBot[bot.id]?.total || 0) + u.total });
+          },
         });
-        endRun(run, controller.signal.aborted ? 'cancelled' : 'succeeded');
+        finishRun(controller.signal.aborted ? 'cancelled' : 'succeeded');
         emit('done', { cancelled: controller.signal.aborted });
       } catch (e) {
-        endRun(run, controller.signal.aborted ? 'cancelled' : 'failed', e.message || String(e));
+        finishRun(controller.signal.aborted ? 'cancelled' : 'failed', e.message || String(e));
         if (controller.signal.aborted) emit('done', { cancelled: true });
         else emit('error', { message: e.message || String(e) });
       } finally {
@@ -745,6 +789,19 @@ const server = http.createServer(async (req, res) => {
         botName: store.getBot(botId)?.name || botId,
       }));
       return json(res, 200, { live, runs: runHistory.slice(0, 60) });
+    }
+
+    // Token usage: per-bot totals + today (real reported numbers only).
+    if (p === '/api/usage' && req.method === 'GET') {
+      const day = new Date().toISOString().slice(0, 10);
+      const byBot = Object.entries(usageStore.byBot).map(([botId, u]) => ({
+        botId, botName: store.getBot(botId)?.name || botId, ...u,
+      })).sort((a, b) => b.total - a.total);
+      const total = byBot.reduce((acc, u) => ({
+        prompt: acc.prompt + u.prompt, completion: acc.completion + u.completion,
+        total: acc.total + u.total, turns: acc.turns + u.turns,
+      }), { prompt: 0, completion: 0, total: 0, turns: 0 });
+      return json(res, 200, { byBot, today: usageStore.byDay[day] || { prompt: 0, completion: 0, total: 0, turns: 0 }, total });
     }
 
     // Workspace listing for the Workspace view + roster card stats.
@@ -794,7 +851,7 @@ const server = http.createServer(async (req, res) => {
       return fs.createReadStream(full).pipe(res);
     }
 
-    // Manual packaging (the 📦 button): zip the bot's whole workspace
+    // Manual packaging (the package button in the chat header): zip the bot's whole workspace
     // into a deployment package the user can download right away.
     const pkgPostMatch = p.match(/^\/api\/bots\/([\w-]+)\/package$/);
     if (pkgPostMatch && req.method === 'POST') {

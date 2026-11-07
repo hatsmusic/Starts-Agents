@@ -276,3 +276,25 @@ details.set-card summary::-webkit-details-marker { display: none; }
  * item the page background. */
 .bot-item { background: var(--bg); }
 .swipe-actions { border-radius: 18px; overflow: hidden; }
+
+/* v0.7.1: SVG icon alignment + usage line */
+.ic { vertical-align: -2px; }
+.qa-ic svg, .tab-ic svg { display: block; }
+.ws-ic { color: #7fb3e0; display: grid; place-items: center; }
+.h4-ic svg { vertical-align: -3px; color: #ff8fa3; }
+.vol-ic { margin-left: 6px; color: #ff8fa3; }
+.msg-file { display: flex; align-items: center; gap: 6px; }
+.ws-fname { display: flex; align-items: center; gap: 7px; }
+.ws-fname svg { flex: 0 0 auto; color: var(--mut); }
+.att-ic { display: grid; place-items: center; }
+.usage-line { color: #57c7c2; min-height: 15px; }
+.tool-chip b { display: inline-flex; align-items: center; }
+.task-head { display: flex; align-items: center; gap: 6px; }
+
+/* v0.7.2: visible per-card action menu */
+.card-menu { background: none; border: 0; color: var(--mut); font-size: 21px; line-height: 1; padding: 8px 6px; cursor: pointer; align-self: center; }
+.card-pop { position: fixed; z-index: 45; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 6px; box-shadow: 0 14px 40px rgba(0, 0, 0, .5); display: flex; flex-direction: column; min-width: 158px; animation: saRise .18s cubic-bezier(.22, 1.36, .36, 1) both; }
+.pop-item { background: none; border: 0; color: var(--ink); font: inherit; font-size: 14.5px; text-align: left; padding: 11px 12px; border-radius: 9px; cursor: pointer; }
+.pop-item:hover { background: var(--panel2); }
+.pop-del { color: var(--danger); }
+.pop-del.arm { background: rgba(255, 107, 129, .16); font-weight: 700; }
