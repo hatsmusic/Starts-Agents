@@ -161,8 +161,8 @@ async function chatTurn(bot, userText, emit, lang) {
     // Never leave the user staring at silence — say so, in their language.
     const zh = lang === 'zh' || lang === 'tw';
     assistant = zh
-      ? '（我这轮没想出回复——本地小模型偶尔会这样。换个说法再问我，或者直接给我派个具体的活，比如「列出文件」「写一个 hello.html 放到工作区」。）'
-      : '(I came back empty-handed that time — small local models do that occasionally. Ask me again in different words, or give me a concrete task, like "list files" or "write a hello.html".)';
+      ? '（我这轮没想出回复——本地小模型偶尔会这样，换个说法再问我一次吧。）'
+      : '(I came back empty-handed that time — small local models do that occasionally. Try asking me again in different words.)';
     emit('token', { text: assistant });
   }
   store.pushMessage(bot.id, { role: 'assistant', text: assistant, at: new Date().toISOString() });
