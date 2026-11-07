@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { makeZip } from './zip.js';
 
 function inWorkspace(ctx, rel) {
   const base = path.resolve(ctx.workspace);
@@ -33,6 +34,39 @@ function walk(dir, base, depth, out) {
     if (d.isDirectory()) walk(full, base, depth + 1, out);
     if (out.length > 400) return;
   }
+}
+
+/* Zip the whole workspace into a deliverable deployment package under
+ * data/packages/<botId>/. Skips dependency/build dirs and oversize
+ * files. Returns { file, size, files } — the server turns this into a
+ * download card in the chat. */
+export function buildPackage(ctx, name) {
+  ensureWorkspace(ctx);
+  const base = path.resolve(ctx.workspace);
+  const entries = [];
+  let total = 0;
+  const collect = (dir) => {
+    for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (d.isDirectory() && SKIP_DIRS.has(d.name)) continue;
+      const full = path.join(dir, d.name);
+      if (d.isDirectory()) { collect(full); continue; }
+      const st = fs.statSync(full);
+      if (st.size > 20 * 1024 * 1024) continue;
+      total += st.size;
+      if (total > 64 * 1024 * 1024) throw new Error('project too large to package (>64 MB)');
+      entries.push({ name: path.relative(base, full), data: fs.readFileSync(full), mtime: st.mtime });
+    }
+  };
+  collect(base);
+  if (!entries.length) throw new Error('workspace is empty — nothing to package');
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const safeName = String(name || 'project').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+  const file = `${safeName}-${stamp}.zip`;
+  const dir = path.join(ctx.dataDir, 'packages', ctx.botId);
+  fs.mkdirSync(dir, { recursive: true });
+  const zip = makeZip(entries);
+  fs.writeFileSync(path.join(dir, file), zip);
+  return { file, size: zip.length, files: entries.length };
 }
 
 // A small review diff: common prefix/suffix trimmed, changed middle
@@ -154,7 +188,7 @@ export const TOOLS = [
   },
   {
     name: 'run_shell',
-    description: 'Run a shell command in the workspace (30s limit), e.g. tests or git. Needs approval.',
+    description: 'Run a shell command in the workspace (120s limit), e.g. tests, builds, syntax checks, starting a server briefly to smoke-test it. Needs approval.',
     risk: 'ask',
     args: { command: 'string' },
     preview(args) {
@@ -164,12 +198,38 @@ export const TOOLS = [
       ensureWorkspace(ctx);
       return new Promise((resolve) => {
         execFile('bash', ['-lc', String(args.command || '')], {
-          cwd: ctx.workspace, timeout: 30_000, maxBuffer: 256 * 1024,
+          cwd: ctx.workspace, timeout: 120_000, maxBuffer: 256 * 1024,
         }, (err, stdout, stderr) => {
           const out = (stdout || '') + (stderr || '');
           resolve((err ? `exit ${err.code ?? '?'} — ` : '') + out.slice(0, 6000) || '(no output)');
         });
       });
+    },
+  },
+  {
+    name: 'package_project',
+    description: 'Package the whole workspace into a downloadable deployment zip. Call this when the work is done and verified, as the final deliverable.',
+    risk: 'safe',
+    args: { name: 'string, optional package name' },
+    async run(args, ctx) {
+      const pkg = buildPackage(ctx, args.name);
+      return JSON.stringify({ package: pkg.file, size: pkg.size, files: pkg.files });
+    },
+  },
+  {
+    name: 'update_tasks',
+    description: 'Replace the visible task checklist for the current job (stored per bot, shown above the chat). Use it on multi-step work: create the list before starting, then update it as items complete. tasks is a JSON array like [{"text":"build index.html","done":false}].',
+    risk: 'safe',
+    args: { tasks: 'string, JSON array of {text, done}' },
+    async run(args, ctx) {
+      let list;
+      try { list = JSON.parse(String(args.tasks || '[]')); } catch { throw new Error('tasks must be a JSON array'); }
+      if (!Array.isArray(list)) throw new Error('tasks must be a JSON array');
+      const clean = list.slice(0, 30).map((t) => ({ text: String(t?.text || '').slice(0, 200), done: !!t?.done })).filter((t) => t.text);
+      const dir = path.join(ctx.dataDir, 'tasks');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, ctx.botId + '.json'), JSON.stringify(clean));
+      return `task list updated: ${clean.filter((t) => t.done).length}/${clean.length} done`;
     },
   },
   {

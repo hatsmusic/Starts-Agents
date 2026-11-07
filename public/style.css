@@ -21,6 +21,20 @@ button { font: inherit; cursor: pointer; }
 .bot-av.sm { width: 28px; height: 28px; border-radius: 8px; flex-basis: 28px; margin-top: 2px; }
 .lock-img { width: 76px; height: 76px; border-radius: 20px; }
 
+/* deployment package download card */
+.package-card { background: var(--panel); border: 1px solid #1f7a6d; border-radius: 16px; padding: 14px 16px; margin: 6px 0; max-width: 86%; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); }
+.package-card h4 { margin: 0 0 6px; font-size: 15px; }
+.pkg-meta { color: var(--mut); font-size: 13px; margin-bottom: 10px; word-break: break-all; }
+.dl-btn { display: inline-block; background: linear-gradient(90deg, var(--a), var(--b)); color: #fff; font-weight: 700; text-decoration: none; padding: 9px 18px; border-radius: 999px; font-size: 14px; }
+
+/* live task checklist strip */
+#taskStrip { border-bottom: 1px solid var(--line); padding: 10px 16px; background: rgba(108, 92, 231, .08); max-height: 168px; overflow-y: auto; }
+#taskStrip[hidden] { display: none; }
+.task-head { font-size: 12.5px; color: var(--mut); font-weight: 700; margin-bottom: 6px; }
+.task-row { display: flex; gap: 8px; align-items: baseline; padding: 2.5px 0; font-size: 14px; }
+.task-row .task-box { color: var(--b); flex: 0 0 auto; }
+.task-row.done .task-text { color: var(--mut); text-decoration: line-through; }
+
 /* language picker */
 .lang-wrap { position: relative; }
 .lang-menu { position: absolute; top: 42px; right: 0; z-index: 40; background: var(--panel2); border: 1px solid var(--line); border-radius: 14px; padding: 6px; min-width: 168px; max-height: 320px; overflow-y: auto; box-shadow: 0 12px 32px rgba(0, 0, 0, .45); }

@@ -120,6 +120,7 @@ function renderHead() {
   const prov = bot?.providerId ? state.providers.find((p) => p.id === bot.providerId) : null;
   $('#botMeta').textContent = bot ? `${bot.engine}${prov ? ' · ' + prov.label : ''}${bot.model ? ' · ' + bot.model : ''}` : '';
   $('#editBotBtn').style.visibility = bot ? 'visible' : 'hidden';
+  $('#packageBtn').style.visibility = bot ? 'visible' : 'hidden';
 }
 
 async function selectBot(id) {
@@ -131,6 +132,7 @@ async function selectBot(id) {
   const { messages } = await api('GET', `/api/bots/${id}/messages`);
   for (const m of messages) addMessage(m.role, m.text, m.at);
   if (!messages.length) addMessage('system', t('tryHint'));
+  renderTasks(currentBot()?.tasks || []);
   scrollDown();
 }
 
@@ -223,6 +225,8 @@ async function sendChat(text) {
         if (type === 'token') { bubble.textContent += data.text; scrollDown(); }
         else if (type === 'tool_pending') addToolChip(data.name, data.args);
         else if (type === 'approval') addApprovalCard(data);
+        else if (type === 'package') addPackageCard(data);
+        else if (type === 'tasks') renderTasks(data.tasks);
         else if (type === 'error') addMessage('system', '⚠ ' + data.message);
       }
     }
@@ -232,6 +236,39 @@ async function sendChat(text) {
     addMessage('system', '⚠ ' + e.message);
   } finally {
     state.busy = false;
+  }
+}
+
+function fmtSize(n) {
+  if (!n && n !== 0) return '';
+  return n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
+/* A finished deployment package, rendered as a download card. */
+function addPackageCard(data) {
+  const box = el('div', 'package-card');
+  box.append(el('h4', '', t('pkgReady')));
+  box.append(el('div', 'pkg-meta', `${data.name} · ${fmtSize(data.size)}${data.files ? ` · ${data.files} ${t('pkgFiles')}` : ''}`));
+  const a = el('a', 'dl-btn', '⬇ ' + t('pkgDl'));
+  a.href = data.url;
+  a.setAttribute('download', '');
+  box.append(a);
+  $('#messages').append(box);
+  scrollDown();
+}
+
+/* The bot's live task checklist, pinned above the messages. */
+function renderTasks(tasks) {
+  const strip = $('#taskStrip');
+  if (!strip) return;
+  strip.innerHTML = '';
+  if (!tasks || !tasks.length) { strip.hidden = true; return; }
+  strip.hidden = false;
+  strip.append(el('div', 'task-head', `📋 ${tasks.filter((x) => x.done).length}/${tasks.length}`));
+  for (const task of tasks) {
+    const row = el('div', 'task-row' + (task.done ? ' done' : ''));
+    row.append(el('span', 'task-box', task.done ? '✓' : '○'), el('span', 'task-text', task.text));
+    strip.append(row);
   }
 }
 
@@ -376,6 +413,14 @@ async function init() {
   });
   $('#addBotBtn').onclick = () => openDialog(null);
   $('#editBotBtn').onclick = () => openDialog(currentBot());
+  $('#packageBtn').onclick = async () => {
+    const bot = currentBot();
+    if (!bot) return;
+    try {
+      const pkg = await api('POST', `/api/bots/${bot.id}/package`, {});
+      addPackageCard(pkg);
+    } catch (e) { addMessage('system', '⚠ ' + e.message); }
+  };
   $('#cancelBtn').onclick = () => $('#botDialog').close();
   $('#botForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();

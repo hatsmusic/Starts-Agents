@@ -6,9 +6,13 @@
 # Default model: qwen2.5-coder:1.5b — chosen for small-memory servers:
 # ~1.1 GB on disk, ~1.2 GB RAM while answering, and the harness asks
 # Ollama to unload it after 5 idle minutes, so the RAM comes back.
-# More RAM to spare? Pass a bigger one, e.g.:
-#   sudo bash scripts/setup-local-model.sh qwen2.5-coder:3b    (~2.2 GB RAM)
-#   sudo bash scripts/setup-local-model.sh qwen2.5-coder:7b    (~4.7 GB RAM)
+# BUT be honest about tiers: 1.5b is a demo brain — it chats, it fumbles
+# real agent work. If you can give it the RAM (the whole point of an
+# agent is that the result RUNS), step up:
+#   sudo bash scripts/setup-local-model.sh qwen2.5-coder:7b   (~4.7 GB RAM — usable start)
+#   sudo bash scripts/setup-local-model.sh qwen3-coder:30b   (~19 GB RAM — a real coding agent)
+#   sudo bash scripts/setup-local-model.sh qwen3.6:27b       (~17 GB RAM — strong all-round coder)
+#   sudo bash scripts/setup-local-model.sh qwen2.5-coder:3b  (~2.2 GB RAM — tight machines)
 #
 # Ollama listens on 127.0.0.1 only. The harness auto-detects it on
 # boot and registers a "本地模型 · Ollama" provider — no API key,

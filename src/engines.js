@@ -89,15 +89,51 @@ function parseTextToolCall(text) {
   return { name, args };
 }
 
-async function* openaiRun({ bot, history, userText, provider }) {
+/* The agent working protocol, injected as a system message on every
+ * turn (not stored in the bot's persona, so it upgrades every existing
+ * bot the moment the server updates). Distilled from how the strong
+ * open-source coding agents are built — OpenHands' reason→act→observe
+ * loop, aider's explore/edit/lint-feedback flow, Cline's
+ * plan-before-act and human checkpoints, SWE-agent's
+ * edit→test→iterate spine. The point of every line: the result must
+ * actually RUN, not just exist. */
+function agentProtocol(lang) {
+  const zh = lang === 'zh' || lang === 'tw';
+  return zh ? [
+    '【Agent 工作协议 — 每个任务都遵守】',
+    '1. 先探索后动手：先看工作区现状（文件树 / list_files / read_file / search_text），不猜、不编造路径。',
+    '2. 先说计划：动手前用 2-4 句话讲清计划——要建或改哪些文件、最后怎么验证——然后再调用工具。任务超过 3 步时，先调用 update_tasks 把清单列出来，每做完一项就更新，进度始终可见。',
+    '3. 小步且完整：write_file 写出的文件必须完整、可运行，不留占位符、TODO 或半截代码；路径用相对路径（如 index.html、src/app.js），不要编造绝对路径。',
+    '4. 必须真验证（最重要）：写完后用 run_shell 实际验证——JS 跑 node --check；网页项目核对文件齐全、引用路径正确；带服务端的项目实际启动一次并 curl 本地端口确认有响应。没有亲眼看到验证通过，不许说“完成”。',
+    '5. 出错就改：验证失败先读懂报错再改，改完重新验证；同一个错误反复出现就换思路，不要原样重试。',
+    '6. 打包交付：验证通过后，调用 package_project 把整个项目打成部署包；最终总结写清：做了什么、文件清单、怎么运行/部署、验证结果。',
+    '7. 闲聊、打招呼、一般问题只用文字回复，不调用任何工具。',
+  ].join('\n') : [
+    '[Agent working protocol — follow on every task]',
+    '1. Explore before acting: inspect the workspace first (file tree / list_files / read_file / search_text). Never guess or invent paths.',
+    '2. State a plan: before touching tools, say in 2-4 sentences what you will create or change and how you will verify it. For work with more than 3 steps, first call update_tasks to lay out the checklist, and update it as items complete so progress is always visible.',
+    '3. Small and complete: every file you write must be complete and runnable — no placeholders, no TODOs, no half-finished code. Use relative paths, never invented absolute ones.',
+    '4. Verify for real (most important): after writing, use run_shell to actually check — node --check for JS; file-completeness and reference-path checks for web projects; for a server project, start it briefly and curl the local port. Never claim "done" without having seen the verification pass.',
+    '5. Fix and re-verify: when verification fails, read the error, fix the cause, verify again. If the same error keeps coming back, change approach instead of retrying verbatim.',
+    '6. Package the deliverable: once verified, call package_project to zip the whole project, then summarize what was built, the file list, how to run/deploy it, and the verification result.',
+    '7. Chat, greetings and general questions: reply in plain text only, no tools.',
+  ].join('\n');
+}
+
+async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree }) {
   const baseUrl = provider?.baseUrl || config.ai.baseUrl;
   const apiKey = provider?.apiKey || config.ai.apiKey;
   const model = bot.model || provider?.model || config.ai.model;
   if (!apiKey && !/127\.0\.0\.1|localhost/.test(baseUrl)) {
     throw new Error('No API key for this bot. Add a provider in Settings (⚙), then pick it in the bot editor.');
   }
+  const zh = lang === 'zh' || lang === 'tw';
   const messages = [
     { role: 'system', content: bot.persona || 'You are a helpful agent.' },
+    { role: 'system', content: agentProtocol(lang) },
+    ...(workspaceTree ? [{ role: 'system', content: (zh
+      ? '当前工作区文件树（需要细节再用 read_file / search_text 看）：\n'
+      : 'Current workspace file tree (use read_file / search_text for details):\n') + workspaceTree }] : []),
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userText },
   ];

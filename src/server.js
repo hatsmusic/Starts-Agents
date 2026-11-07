@@ -9,7 +9,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import * as store from './store.js';
 import { getEngine, engineStatus } from './engines.js';
-import { getTool, toolCatalog } from './tools.js';
+import { getTool, toolCatalog, buildPackage } from './tools.js';
 import { requestApproval, resolveApproval, listPending } from './approvals.js';
 import { parseTeam, exportTeam } from './team.js';
 import { ICON_PNG } from './icon.js';
@@ -74,6 +74,36 @@ function resolveProvider(bot) {
 // a server restart revokes everything, which is the safe direction.
 const sessionGrants = new Set();
 
+/* The bot's visible task checklist (written by the update_tasks
+ * tool, one JSON file per bot). */
+function readBotTasks(botId) {
+  try {
+    const list = JSON.parse(fs.readFileSync(path.join(config.dataDir, 'tasks', botId + '.json'), 'utf8'));
+    return Array.isArray(list) ? list : [];
+  } catch { return []; }
+}
+
+/* A compact map of the bot's workspace, handed to the model with
+ * every turn (aider's RepoMap idea, shrunk): the model starts out
+ * knowing what exists instead of spending rounds discovering it. */
+function workspaceTree(workspace) {
+  const SKIP = new Set(['node_modules', '.git', 'dist', '.next']);
+  const lines = [];
+  const walk = (dir, prefix, depth) => {
+    if (depth > 4 || lines.length >= 150) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of entries) {
+      if (lines.length >= 150) return;
+      if (d.isDirectory() && SKIP.has(d.name)) continue;
+      lines.push(prefix + d.name + (d.isDirectory() ? '/' : ''));
+      if (d.isDirectory()) walk(path.join(dir, d.name), prefix + d.name + '/', depth + 1);
+    }
+  };
+  walk(workspace, '', 0);
+  return lines.join('\n');
+}
+
 /* ------------------------- the chat turn ------------------------- */
 async function chatTurn(bot, userText, emit, lang) {
   const history = store.getMessages(bot.id)
@@ -102,8 +132,9 @@ async function chatTurn(bot, userText, emit, lang) {
     store.pushMessage(bot.id, { role: 'assistant', text: guide, at: new Date().toISOString() });
     return guide;
   }
-  const gen = engine.run({ bot, history, userText, provider, lang });
+  const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace) });
   let assistant = '';
+  let failStreak = 0;
   let next = await gen.next();
   while (!next.done) {
     const ev = next.value;
@@ -147,8 +178,23 @@ async function chatTurn(bot, userText, emit, lang) {
         } else {
           try { result = String(await tool.run(ev.args, ctx)); }
           catch (e) { result = 'Error: ' + e.message; }
-          store.audit({ bot: bot.id, kind: 'tool', tool: tool.name, ok: !result.startsWith('Error'), args: summarizeArgs(ev.args) });
-          emit('tool_result', { name: tool.name, ok: !result.startsWith('Error'), result: result.slice(0, 2000) });
+          const ok = !result.startsWith('Error');
+          store.audit({ bot: bot.id, kind: 'tool', tool: tool.name, ok, args: summarizeArgs(ev.args) });
+          emit('tool_result', { name: tool.name, ok, result: result.slice(0, 2000) });
+          if (tool.name === 'package_project' && ok) {
+            try {
+              const pkg = JSON.parse(result);
+              emit('package', { name: pkg.package, size: pkg.size, files: pkg.files, url: `/api/bots/${bot.id}/packages/${encodeURIComponent(pkg.package)}` });
+            } catch { /* not a package payload — nothing to render */ }
+          }
+          if (tool.name === 'update_tasks' && ok) emit('tasks', { tasks: readBotTasks(bot.id) });
+          // Stagnation guard (OpenHands-style): after repeated tool
+          // failures, tell the model plainly to change approach or
+          // report the blocker instead of looping the same mistake.
+          failStreak = ok ? 0 : failStreak + 1;
+          if (failStreak >= 3) {
+            result += `\n\n[System note] Tools have failed ${failStreak} times in a row. Do NOT retry the same thing: change approach, or stop and tell the user exactly what is blocking you. [系统提示] 工具已连续失败 ${failStreak} 次，不要原样重试：换个方法，或停下来明确告诉用户你卡在哪里。`;
+          }
         }
       }
       next = await gen.next(String(result));
@@ -249,7 +295,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { entries: store.readAudit(Math.min(200, Number(url.searchParams.get('limit') || 100))) });
     }
 
-    if (p === '/api/bots' && req.method === 'GET') return json(res, 200, { bots: store.listBots() });
+    if (p === '/api/bots' && req.method === 'GET') return json(res, 200, { bots: store.listBots().map((b) => ({ ...b, tasks: readBotTasks(b.id) })) });
     if (p === '/api/bots' && req.method === 'POST') {
       const b = await readBody(req);
       if (!b.name) return json(res, 400, { error: 'name required' });
@@ -288,6 +334,31 @@ const server = http.createServer(async (req, res) => {
       try { await chatTurn(bot, String(text), emit, typeof lang === 'string' ? lang : undefined); emit('done', {}); }
       catch (e) { emit('error', { message: e.message || String(e) }); }
       return res.end();
+    }
+
+    // Manual packaging (the 📦 button): zip the bot's whole workspace
+    // into a deployment package the user can download right away.
+    const pkgPostMatch = p.match(/^\/api\/bots\/([\w-]+)\/package$/);
+    if (pkgPostMatch && req.method === 'POST') {
+      const bot = store.getBot(pkgPostMatch[1]);
+      if (!bot) return json(res, 404, { error: 'no such bot' });
+      const { name } = await readBody(req);
+      try {
+        const pkg = buildPackage({ botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) }, name || bot.name);
+        store.audit({ bot: bot.id, kind: 'tool', tool: 'package_project', ok: true, args: { via: 'manual' } });
+        return json(res, 201, { name: pkg.file, size: pkg.size, files: pkg.files, url: `/api/bots/${bot.id}/packages/${encodeURIComponent(pkg.file)}` });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    const pkgGetMatch = p.match(/^\/api\/bots\/([\w-]+)\/packages\/([^/]+)$/);
+    if (pkgGetMatch && req.method === 'GET') {
+      const bot = store.getBot(pkgGetMatch[1]);
+      if (!bot) return json(res, 404, { error: 'no such bot' });
+      const file = path.basename(decodeURIComponent(pkgGetMatch[2]));
+      const full = path.join(config.dataDir, 'packages', bot.id, file);
+      if (!file.endsWith('.zip') || !fs.existsSync(full)) return json(res, 404, { error: 'no such package' });
+      const data = fs.readFileSync(full);
+      res.writeHead(200, { 'content-type': 'application/zip', 'content-length': data.length, 'content-disposition': `attachment; filename="${file}"` });
+      return res.end(data);
     }
 
     const apMatch = p.match(/^\/api\/approvals\/([\w-]+)$/);
