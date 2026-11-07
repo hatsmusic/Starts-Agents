@@ -1,7 +1,15 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
+// UI language: 15 languages via ./i18n.js, choice saved on this device.
+import { LANGS, getLang, makeT } from './i18n.js';
+
 const $ = (s) => document.querySelector(s);
-const state = { bots: [], engines: [], providers: [], presets: [], current: null, editing: null, busy: false };
+const state = {
+  bots: [], engines: [], providers: [], presets: [],
+  current: null, editing: null, busy: false,
+  lang: getLang(),
+};
+let t = makeT(state.lang);
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -14,9 +22,6 @@ async function api(method, path, body) {
   return data;
 }
 
-function showLock() { $('#lockScreen').hidden = false; }
-function hideLock() { $('#lockScreen').hidden = true; }
-
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -24,14 +29,70 @@ function el(tag, cls, text) {
   return e;
 }
 
+function botAvatar(cls) {
+  const img = el('img', 'bot-av ' + (cls || ''));
+  img.src = '/complay-c.svg';
+  img.alt = '';
+  return img;
+}
+
+/* ------------------------------ i18n ------------------------------ */
+function applyLang() {
+  t = makeT(state.lang);
+  document.documentElement.lang = state.lang === 'zh' ? 'zh-CN' : state.lang === 'tw' ? 'zh-TW' : state.lang;
+  document.documentElement.dir = state.lang === 'ar' ? 'rtl' : 'ltr';
+  for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = t(node.dataset.i18n);
+  for (const node of document.querySelectorAll('[data-i18n-ph]')) node.placeholder = t(node.dataset.i18nPh);
+  for (const node of document.querySelectorAll('[data-i18n-title]')) node.title = t(node.dataset.i18nTitle);
+  renderRoster();
+  renderHead();
+}
+
+function buildLangMenu() {
+  const menu = $('#langMenu');
+  menu.innerHTML = '';
+  for (const [code, label] of LANGS) {
+    const b = el('button', 'lang-item' + (code === state.lang ? ' on' : ''), label);
+    b.onclick = () => {
+      state.lang = code;
+      localStorage.setItem('sa-lang', code);
+      menu.hidden = true;
+      applyLang();
+      buildLangMenu();
+    };
+    menu.append(b);
+  }
+}
+$('#langBtn').addEventListener('click', (ev) => {
+  ev.stopPropagation();
+  $('#langMenu').hidden = !$('#langMenu').hidden;
+});
+document.addEventListener('click', () => { $('#langMenu').hidden = true; });
+
+/* ----------------------------- roster ----------------------------- */
+function fmtDay(at) {
+  if (!at) return '';
+  const d = new Date(at);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const hh = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  return sameDay ? hh : `${d.getMonth() + 1}/${d.getDate()} ${hh}`;
+}
+
 function renderRoster() {
   const list = $('#botList');
+  if (!list) return;
   list.innerHTML = '';
   for (const bot of state.bots) {
     const btn = el('button', 'bot-item' + (state.current === bot.id ? ' on' : ''));
-    btn.append(el('span', 'avatar', (bot.name || '?').slice(0, 1).toUpperCase()));
-    const meta = el('span');
-    meta.append(el('div', 'n', bot.name), el('div', 'e', bot.engine + (bot.model ? ' · ' + bot.model : '')));
+    btn.append(botAvatar());
+    const meta = el('span', 'bot-meta-col');
+    const top = el('span', 'bot-top');
+    top.append(el('span', 'n', bot.name), el('span', 'tm', fmtDay(bot.lastMessage?.at)));
+    const preview = bot.lastMessage?.text
+      ? String(bot.lastMessage.text).replace(/\s+/g, ' ')
+      : `${bot.engine}${bot.model ? ' · ' + bot.model : ''}`;
+    meta.append(top, el('span', 'p', preview));
     btn.append(meta);
     btn.onclick = () => selectBot(bot.id);
     list.append(btn);
@@ -50,7 +111,7 @@ function currentBot() { return state.bots.find((b) => b.id === state.current) ||
 
 function renderHead() {
   const bot = currentBot();
-  $('#botName').textContent = bot ? bot.name : 'Pick a bot';
+  $('#botName').textContent = bot ? bot.name : t('pickBot');
   const prov = bot?.providerId ? state.providers.find((p) => p.id === bot.providerId) : null;
   $('#botMeta').textContent = bot ? `${bot.engine}${prov ? ' · ' + prov.label : ''}${bot.model ? ' · ' + bot.model : ''}` : '';
   $('#editBotBtn').style.visibility = bot ? 'visible' : 'hidden';
@@ -58,56 +119,69 @@ function renderHead() {
 
 async function selectBot(id) {
   state.current = id;
-  document.body.classList.add('in-chat'); // mobile: slide to the chat view
+  document.body.classList.add('in-chat');
   renderRoster(); renderHead();
   const box = $('#messages');
   box.innerHTML = '';
   const { messages } = await api('GET', `/api/bots/${id}/messages`);
-  for (const m of messages) addMessage(m.role, m.text);
-  if (!messages.length) addMessage('system', 'Say hello — or try: list files · read <file> · note <text> · run <command>');
+  for (const m of messages) addMessage(m.role, m.text, m.at);
+  if (!messages.length) addMessage('system', t('tryHint'));
   scrollDown();
 }
 
 function scrollDown() { const b = $('#messages'); b.scrollTop = b.scrollHeight; }
 
-function addMessage(role, text) {
-  const m = el('div', 'msg ' + role, text);
-  $('#messages').append(m);
+/* ---------------------------- messages ---------------------------- */
+function fmtTime(at) {
+  const d = at ? new Date(at) : new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function addMessage(role, text, at) {
+  if (role === 'system') {
+    const m = el('div', 'msg system', text);
+    $('#messages').append(m);
+    scrollDown();
+    return m;
+  }
+  const row = el('div', 'msg-row ' + role);
+  if (role === 'assistant') row.append(botAvatar('sm'));
+  const col = el('div', 'msg-col');
+  const bubble = el('div', 'msg ' + role, text);
+  col.append(bubble, el('div', 'msg-time', fmtTime(at)));
+  row.append(col);
+  $('#messages').append(row);
   scrollDown();
-  return m;
+  return bubble;
 }
 
 function addToolChip(name, args) {
   const chip = el('div', 'tool-chip');
-  chip.append(Object.assign(el('b', '', '⚙ ' + name + ' '), {}), document.createTextNode(JSON.stringify(args || {})));
+  chip.append(el('b', '', '⚙ ' + name + ' '), document.createTextNode(JSON.stringify(args || {})));
   $('#messages').append(chip);
   scrollDown();
 }
 
 function addApprovalCard(card) {
   const box = el('div', 'approval');
-  box.append(el('h4', '', '🙋 Approval needed — ' + card.tool));
+  box.append(el('h4', '', t('apTitle') + card.tool));
   if (card.preview) {
     const pre = el('pre', 'diff');
     for (const line of String(card.preview).split('\n')) {
-      const span = el('span', line.startsWith('+ ') ? 'dl-add' : line.startsWith('- ') ? 'dl-del' : '', line + '\n');
-      pre.append(span);
+      pre.append(el('span', line.startsWith('+ ') ? 'dl-add' : line.startsWith('- ') ? 'dl-del' : '', line + '\n'));
     }
     box.append(pre);
   } else {
     box.append(el('pre', '', JSON.stringify(card.args, null, 2)));
   }
   const row = el('div', 'row');
-  const allow = el('button', 'allow', 'Allow');
-  const allowAll = el('button', 'allow-session', 'Allow all this session');
-  const deny = el('button', 'deny', 'Deny');
-  const finish = (label) => {
-    box.classList.add('resolved');
-    row.replaceWith(el('div', '', label));
-  };
-  allow.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow' }); finish('✓ Allowed once'); };
-  allowAll.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow_session' }); finish('✓ Allowed — and for the rest of this session'); };
-  deny.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'deny' }); finish('✕ Denied'); };
+  const allow = el('button', 'allow', t('allow'));
+  const allowAll = el('button', 'allow-session', t('allowS'));
+  const deny = el('button', 'deny', t('deny'));
+  const finish = (label) => { box.classList.add('resolved'); row.replaceWith(el('div', '', label)); };
+  allow.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow' }); finish(t('okOnce')); };
+  allowAll.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow_session' }); finish(t('okSession')); };
+  deny.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'deny' }); finish(t('denied')); };
   row.append(allow, allowAll, deny);
   box.append(row);
   $('#messages').append(box);
@@ -123,9 +197,9 @@ async function sendChat(text) {
   const bubble = addMessage('assistant', '');
   try {
     const res = await fetch(`/api/bots/${bot.id}/chat`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, lang: state.lang }),
     });
-    if (res.status === 401) { showLock(); throw new Error('session locked — enter the access token'); }
+    if (res.status === 401) { showLock(); throw new Error(t('sessExp')); }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -147,7 +221,8 @@ async function sendChat(text) {
         else if (type === 'error') addMessage('system', '⚠ ' + data.message);
       }
     }
-    if (!bubble.textContent) bubble.remove();
+    if (!bubble.textContent) bubble.closest('.msg-row')?.remove();
+    loadBots().catch(() => {}); // refresh roster previews
   } catch (e) {
     addMessage('system', '⚠ ' + e.message);
   } finally {
@@ -155,47 +230,24 @@ async function sendChat(text) {
   }
 }
 
-/* PWA: register the shell cache (API traffic is never cached). */
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
-}
-
-/* Lock screen: trade the access token for a long-lived cookie. */
-$('#lockForm').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  $('#lockError').textContent = '';
-  try {
-    const res = await fetch('/api/login', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: $('#lockToken').value }),
-    });
-    if (!res.ok) throw new Error('wrong token');
-    hideLock();
-    location.reload();
-  } catch {
-    $('#lockError').textContent = 'That token did not work — try again.';
-  }
-});
-$('#backBtn').addEventListener('click', () => document.body.classList.remove('in-chat'));
-
-/* Bot dialog (create / edit) */
+/* ------------------------- bot dialog ------------------------- */
 function openDialog(bot) {
   state.editing = bot ? bot.id : null;
-  $('#dialogTitle').textContent = bot ? 'Edit bot' : 'New bot';
+  $('#dialogTitle').textContent = bot ? t('dEdit') : t('dNew');
   $('#fName').value = bot?.name || '';
   $('#fModel').value = bot?.model || '';
   $('#fPersona').value = bot?.persona || '';
   const sel = $('#fEngine');
   sel.innerHTML = '';
   for (const e of state.engines) {
-    const o = el('option', '', `${e.label}${e.available ? '' : ' (not configured)'}`);
+    const o = el('option', '', `${e.label}${e.available ? '' : t('notConf')}`);
     o.value = e.id;
     sel.append(o);
   }
   sel.value = bot?.engine || state.engines[0]?.id || 'echo';
   const psel = $('#fProvider');
   psel.innerHTML = '';
-  const none = el('option', '', '(none — env default)'); none.value = '';
+  const none = el('option', '', t('provNone')); none.value = '';
   psel.append(none);
   for (const p of state.providers) {
     const o = el('option', '', `${p.label} · ${p.model}`);
@@ -207,22 +259,22 @@ function openDialog(bot) {
   $('#botDialog').showModal();
 }
 
-/* Settings: providers (vault-backed keys) + audit trail */
+/* --------------------- settings: providers --------------------- */
 async function loadProviders() {
   const { providers } = await api('GET', '/api/providers');
   state.providers = providers;
   const list = $('#providerList');
   list.innerHTML = '';
-  if (!providers.length) list.append(el('p', 'set-hint', 'No providers yet — add one below. Bots on the "API model" engine need a provider.'));
+  if (!providers.length) list.append(el('p', 'set-hint', t('noProv')));
   for (const p of providers) {
     const row = el('div', 'provider-row');
     const info = el('div');
     info.append(
       el('div', 'pv-name', p.label),
       el('div', 'pv-meta', `${p.model} · ${p.baseUrl}`),
-      el('div', 'pv-meta', p.hasKey ? `key ${p.keyHint}` : 'no key (local endpoint)')
+      el('div', 'pv-meta', p.hasKey ? `${t('keyYes')} ${p.keyHint}` : t('keyNo'))
     );
-    const del = el('button', 'mini-btn danger-text', 'Delete');
+    const del = el('button', 'mini-btn danger-text', t('del'));
     del.onclick = async () => { await api('DELETE', `/api/providers/${p.id}`); loadProviders(); };
     row.append(info, del);
     list.append(row);
@@ -234,7 +286,7 @@ async function loadAudit() {
   const { entries } = await api('GET', '/api/audit?limit=30');
   const list = $('#auditList');
   list.innerHTML = '';
-  if (!entries.length) list.append(el('p', 'set-hint', 'Nothing yet.'));
+  if (!entries.length) list.append(el('p', 'set-hint', t('noAudit')));
   for (const e of entries) {
     const line = `${e.at?.slice(5, 19).replace('T', ' ') || ''} · ${e.kind}${e.tool ? ' · ' + e.tool : ''}${e.decision ? ' · ' + e.decision : ''}${e.ok === false ? ' · FAILED' : ''}`;
     list.append(el('div', 'audit-row', line));
@@ -265,7 +317,35 @@ async function openSettings() {
   $('#settingsDialog').showModal();
 }
 
+/* --------------------------- lock --------------------------- */
+function showLock() { $('#lockScreen').hidden = false; }
+function hideLock() { $('#lockScreen').hidden = true; }
+$('#lockForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('#lockError').textContent = '';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: $('#lockToken').value }),
+    });
+    if (!res.ok) throw new Error('bad');
+    hideLock();
+    location.reload();
+  } catch {
+    $('#lockError').textContent = t('lockErr');
+  }
+});
+$('#backBtn').addEventListener('click', () => document.body.classList.remove('in-chat'));
+
+/* PWA: register the shell cache (API traffic is never cached). */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+
+/* ---------------------------- init ---------------------------- */
 async function init() {
+  buildLangMenu();
+  applyLang();
   const { engines } = await api('GET', '/api/engines');
   state.engines = engines;
   await loadProviders().catch(() => {});
@@ -274,26 +354,22 @@ async function init() {
 
   $('#composer').addEventListener('submit', (ev) => {
     ev.preventDefault();
-    const text = $('#input').value.trim();
+    const input = $('#input');
+    const text = input.value.trim();
     if (!text) return;
-    $('#input').value = '';
+    input.value = '';
+    input.style.height = 'auto';
     sendChat(text);
+  });
+  $('#input').addEventListener('input', (ev) => {
+    const tg = ev.target;
+    tg.style.height = 'auto';
+    tg.style.height = Math.min(120, tg.scrollHeight) + 'px';
   });
   $('#input').addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); $('#composer').requestSubmit(); }
   });
   $('#addBotBtn').onclick = () => openDialog(null);
-  $('#settingsBtn').onclick = () => openSettings().catch((e) => addMessage('system', '⚠ ' + e.message));
-  $('#settingsClose').onclick = () => $('#settingsDialog').close();
-  $('#providerForm').addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    await api('POST', '/api/providers', {
-      presetId: $('#pPreset').value, label: $('#pLabel').value,
-      baseUrl: $('#pBaseUrl').value, model: $('#pModel').value, apiKey: $('#pKey').value,
-    });
-    $('#pKey').value = '';
-    await loadProviders();
-  });
   $('#editBotBtn').onclick = () => openDialog(currentBot());
   $('#cancelBtn').onclick = () => $('#botDialog').close();
   $('#botForm').addEventListener('submit', async (ev) => {
@@ -313,6 +389,17 @@ async function init() {
     await loadBots();
     if (state.current) selectBot(state.current); else { $('#messages').innerHTML = ''; renderHead(); }
   };
+  $('#settingsBtn').onclick = () => openSettings().catch((e) => addMessage('system', '⚠ ' + e.message));
+  $('#settingsClose').onclick = () => $('#settingsDialog').close();
+  $('#providerForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    await api('POST', '/api/providers', {
+      presetId: $('#pPreset').value, label: $('#pLabel').value,
+      baseUrl: $('#pBaseUrl').value, model: $('#pModel').value, apiKey: $('#pKey').value,
+    });
+    $('#pKey').value = '';
+    await loadProviders();
+  });
   $('#importBtn').onclick = () => $('#importFile').click();
   $('#importFile').addEventListener('change', async (ev) => {
     const file = ev.target.files[0];
@@ -323,8 +410,8 @@ async function init() {
       state.current = bots[0]?.id || state.current;
       await loadBots();
       if (state.current) selectBot(state.current);
-      addMessage('system', `Imported team "${team}" — ${bots.length} bot(s).`);
-    } catch (e) { addMessage('system', '⚠ Import failed: ' + e.message); }
+      addMessage('system', t('imported', { name: team, n: bots.length }));
+    } catch (e) { addMessage('system', t('importFail') + e.message); }
     ev.target.value = '';
   });
 }

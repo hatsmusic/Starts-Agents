@@ -1,8 +1,8 @@
 // Starts-Agents service worker: cache the app shell so the installed
 // PWA opens instantly (and offline shows the shell), but NEVER cache
 // API traffic — chats, approvals and transcripts must stay live.
-const CACHE = 'starts-agents-v1';
-const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/manifest.webmanifest', '/icon.png'];
+const CACHE = 'starts-agents-v2';
+const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/i18n.js', '/manifest.webmanifest', '/icon.png', '/complay-c.svg'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

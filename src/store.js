@@ -38,7 +38,12 @@ export function newId(prefix) {
 }
 
 export function listBots() {
-  return load().bots;
+  const s = load();
+  return s.bots.map((b) => {
+    const msgs = s.messages[b.id] || [];
+    const last = msgs[msgs.length - 1];
+    return { ...b, lastMessage: last ? { text: String(last.text).slice(0, 120), at: last.at } : null };
+  });
 }
 
 export function getBot(id) {

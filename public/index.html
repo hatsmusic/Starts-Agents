@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Starts-Agents</title>
+<title>Complay Ai</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0f212e">
@@ -12,17 +12,17 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Agents">
+<meta name="apple-mobile-web-app-title" content="Complay Ai">
 </head>
 <body>
 <div id="lockScreen" hidden>
   <div class="lock-card">
-    <div class="lock-logo">🤖</div>
-    <h2>Starts-Agents</h2>
-    <p class="lock-hint">This deployment is protected. Enter the access token once — this device will remember it.</p>
+    <img class="lock-img" src="/complay-c.svg" alt="Complay">
+    <h2>Complay Ai</h2>
+    <p class="lock-hint" data-i18n="lockHint">这是一个受保护的部署。输入访问口令一次，这台设备之后免输。</p>
     <form id="lockForm">
-      <input id="lockToken" type="password" placeholder="Access token" autocomplete="current-password">
-      <button type="submit">Unlock</button>
+      <input id="lockToken" type="password" data-i18n-ph="lockPh" placeholder="访问口令" autocomplete="current-password">
+      <button type="submit" data-i18n="unlock">解锁</button>
     </form>
     <p id="lockError" class="lock-error"></p>
   </div>
@@ -30,75 +30,81 @@
 <div id="app">
   <aside id="roster">
     <header class="r-head">
-      <div class="logo">🤖 Starts&#8202;·&#8202;Agents</div>
-      <button id="addBotBtn" class="icon-btn" title="New bot">＋</button>
+      <div class="logo"><img class="logo-img" src="/complay-c.svg" alt=""> Complay&#8202;·&#8202;Ai</div>
+      <div class="r-actions">
+        <div class="lang-wrap">
+          <button id="langBtn" class="icon-btn" title="Language">🌐</button>
+          <div id="langMenu" class="lang-menu" hidden></div>
+        </div>
+        <button id="addBotBtn" class="icon-btn" data-i18n-title="newBot" title="新建机器人">＋</button>
+      </div>
     </header>
     <div id="botList" class="bot-list"></div>
     <footer class="r-foot">
-      <button id="settingsBtn" class="mini-btn">⚙ Models</button>
-      <button id="importBtn" class="mini-btn">Import team</button>
-      <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md">Export</a>
+      <button id="settingsBtn" class="mini-btn" data-i18n="models">⚙ 模型设置</button>
+      <button id="importBtn" class="mini-btn" data-i18n="importTeam">导入团队</button>
+      <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md" data-i18n="exportTeam">导出</a>
       <input type="file" id="importFile" accept=".md,text/markdown,text/plain" hidden>
     </footer>
   </aside>
 
   <main id="chatPane">
     <header id="chatHead">
-      <button id="backBtn" class="icon-btn" title="Back to roster">‹</button>
+      <button id="backBtn" class="icon-btn" title="返回列表">‹</button>
       <div class="head-main">
-        <div id="botName" class="bot-name">Pick a bot</div>
+        <div id="botName" class="bot-name">选择一个机器人</div>
         <div id="botMeta" class="bot-meta"></div>
       </div>
-      <button id="editBotBtn" class="icon-btn" title="Edit bot">✎</button>
+      <button id="editBotBtn" class="icon-btn" title="编辑机器人">✎</button>
     </header>
     <div id="messages" class="messages"></div>
     <form id="composer">
-      <textarea id="input" rows="1" placeholder="Message…  (try: list files · read x.txt · note hello · run ls)"></textarea>
-      <button id="sendBtn" type="submit">Send</button>
+      <textarea id="input" rows="1" data-i18n-ph="msgPh" placeholder="输入消息…"></textarea>
+      <button id="sendBtn" type="submit" data-i18n="send">发送</button>
     </form>
   </main>
 </div>
 
 <dialog id="botDialog">
   <form method="dialog" id="botForm">
-    <h3 id="dialogTitle">New bot</h3>
-    <label>Name <input id="fName" required maxlength="60"></label>
-    <label>Engine <select id="fEngine"></select></label>
-    <label>Model provider <select id="fProvider"></select></label>
-    <label>Model <input id="fModel" placeholder="(provider default)"></label>
-    <label>Persona <textarea id="fPersona" rows="5" placeholder="Who is this bot? How should it behave?"></textarea></label>
+    <h3 id="dialogTitle">新建机器人</h3>
+    <label><span data-i18n="fName">名字</span> <input id="fName" required maxlength="60"></label>
+    <label><span data-i18n="fEngine">引擎</span> <select id="fEngine"></select></label>
+    <label><span data-i18n="fProvider">模型供应商</span> <select id="fProvider"></select></label>
+    <label><span data-i18n="fModel">模型</span> <input id="fModel" data-i18n-ph="fModelPh" placeholder="（用供应商默认）"></label>
+    <label><span data-i18n="fPersona">人设</span> <textarea id="fPersona" rows="5" data-i18n-ph="fPersonaPh" placeholder="这个机器人是谁？应该怎么干活？"></textarea></label>
     <div class="dialog-actions">
-      <button type="button" id="deleteBotBtn" class="danger" hidden>Delete</button>
+      <button type="button" id="deleteBotBtn" class="danger" hidden data-i18n="del">删除</button>
       <span class="spacer"></span>
-      <button type="button" id="cancelBtn">Cancel</button>
-      <button type="submit" class="primary">Save</button>
+      <button type="button" id="cancelBtn" data-i18n="cancel">取消</button>
+      <button type="submit" class="primary" data-i18n="save">保存</button>
     </div>
   </form>
 </dialog>
 
 <dialog id="settingsDialog">
   <div class="settings-wrap">
-    <h3>Model providers</h3>
-    <p class="set-hint">Keys are encrypted on the server and never shown again — only a hint. Strong open-weight models first; every preset talks straight to the provider, no middleman.</p>
+    <h3 data-i18n="sTitle">模型供应商</h3>
+    <p class="set-hint" data-i18n="sHint">密钥在服务器上加密保存，之后不再明文显示，只留掩码提示。强开源模型优先；所有预设都直连供应商，没有中间商。</p>
     <div id="providerList" class="provider-list"></div>
     <form id="providerForm">
-      <label>Preset <select id="pPreset"></select></label>
+      <label><span data-i18n="preset">预设</span> <select id="pPreset"></select></label>
       <p id="pHint" class="set-hint"></p>
-      <label>Label <input id="pLabel" placeholder="e.g. My DeepSeek"></label>
-      <label>Base URL <input id="pBaseUrl" placeholder="https://…/v1"></label>
-      <label>Model <input id="pModel" placeholder="model id"></label>
-      <label>API key <input id="pKey" type="password" placeholder="sk-… (not needed for local Ollama)" autocomplete="off"></label>
+      <label><span data-i18n="pLabel">名称</span> <input id="pLabel" data-i18n-ph="pLabelPh" placeholder="例如：我的 DeepSeek"></label>
+      <label><span data-i18n="pBase">接口地址</span> <input id="pBaseUrl" placeholder="https://…/v1"></label>
+      <label><span data-i18n="pModel">模型</span> <input id="pModel" placeholder="模型 ID"></label>
+      <label><span data-i18n="pKey">API 密钥</span> <input id="pKey" type="password" data-i18n-ph="pKeyPh" placeholder="sk-…（本地 Ollama 可不填）" autocomplete="off"></label>
       <div class="dialog-actions">
         <span class="spacer"></span>
-        <button type="button" id="settingsClose">Close</button>
-        <button type="submit" class="primary">Add provider</button>
+        <button type="button" id="settingsClose" data-i18n="close">关闭</button>
+        <button type="submit" class="primary" data-i18n="addProv">添加供应商</button>
       </div>
     </form>
-    <h3 class="audit-head">Recent activity</h3>
+    <h3 class="audit-head" data-i18n="audit">最近动态</h3>
     <div id="auditList" class="audit-list"></div>
   </div>
 </dialog>
 
-<script src="/app.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -15,7 +15,8 @@ import { TOOLS } from './tools.js';
 // No key, no network. It reflects the conversation, and proposes tools
 // when you phrase requests plainly:
 //   "list files" / "read notes.txt" / "note buy milk" / "run ls -la"
-async function* echoRun({ bot, history, userText }) {
+async function* echoRun({ bot, history, userText, lang }) {
+  const zh = lang === 'zh' || lang === 'tw';
   const say = async function* (text) {
     const words = String(text).split(/(?<=\s)/);
     for (const w of words) yield { type: 'token', text: w };
@@ -24,20 +25,20 @@ async function* echoRun({ bot, history, userText }) {
   let m;
   const tool = async function* (name, args) {
     const result = yield { type: 'tool', name, args };
-    yield* say(`\n\n${name} returned:\n${String(result).slice(0, 800)}`);
+    yield* say(`\n\n${name} ${zh ? '返回' : 'returned'}:\n${String(result).slice(0, 800)}`);
   };
   if (/^(list|ls)\b/i.test(t)) { yield* tool('list_files', {}); return; }
   if ((m = t.match(/^read\s+(\S+)/i))) { yield* tool('read_file', { path: m[1] }); return; }
   if ((m = t.match(/^note\s+(.+)/is))) { yield* tool('write_note', { text: m[1] }); return; }
   if ((m = t.match(/^run\s+(.+)/is))) { yield* tool('run_shell', { command: m[1] }); return; }
   const lastUser = [...history].reverse().find((x) => x.role === 'user');
-  yield* say(
-    `(${bot.name}, echo engine) I heard: "${t}". ` +
-    (lastUser && lastUser.content !== t ? `Before that you said: "${lastUser.content}". ` : '') +
-    `I run fully offline, so use me to learn the harness: try "list files", ` +
-    `"read <file>", "note <text>", or "run <command>" (shell asks for approval first). ` +
-    `For real coding work, add a model provider in Settings and switch this bot's engine to "API model".`
-  );
+  yield* say(zh
+    ? `我是 ${bot.name}，现在用的是离线演示引擎（echo），只会照着学系统：` +
+      `试试 "list files"、"read 文件名"、"note 内容"、"run 命令"（要你批准）。` +
+      `想让我真正写代码，去「⚙ 模型设置」加一个供应商，把机器人引擎换成「API 模型」。`
+    : `I'm ${bot.name}, running on the offline demo engine (echo) — I just mirror the system: ` +
+      `try "list files", "read <file>", "note <text>", "run <command>" (asks your approval). ` +
+      `For real coding, add a provider under "⚙ Models" and switch this bot to the API engine.`);
 }
 
 /* ------------- openai: any OpenAI-compatible endpoint ------------- */

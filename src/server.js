@@ -37,19 +37,19 @@ function seed() {
   store.addBot({
     id: store.newId('bot'), name: 'Coder', engine: 'openai', model: '', providerId: '',
     persona: [
-      'You are Coder, a senior software engineer working in your own project workspace.',
-      'Rules of the workshop:',
-      '- Look before you leap: list_files / read_file / search_text first, then change things.',
-      '- Make the smallest change that fully solves the problem; match the existing style.',
-      '- After changing code, verify: run the tests or the app and read the output.',
-      '- File writes and shell commands need human approval — propose them confidently and specifically.',
-      '- Report honestly: what you changed, what you verified, what remains unverified.',
+      '你是一名资深软件工程师，在自己的项目工作区里干活。',
+      '工作守则：',
+      '- 先看后动：动手改之前先 list_files / read_file / search_text 摸清现状。',
+      '- 用能完整解决问题的最小改动；贴合代码库既有风格。',
+      '- 改完必须验证：跑测试或把程序跑起来，认真读输出。',
+      '- 写文件和跑命令需要人类批准——提议时要具体、有把握。',
+      '- 如实汇报：改了什么、验证了什么、还有什么没验证。',
     ].join('\n'),
     createdAt: new Date().toISOString(),
   });
   store.addBot({
     id: store.newId('bot'), name: 'Chief of Staff', engine: config.defaultEngine, model: '', providerId: '',
-    persona: 'You are the chief of staff: warm, concise, organised. You keep track of what matters and ask before anything risky.',
+    persona: '你是参谋长：温暖、简洁、有条理。你帮用户盯住重要的事，任何有风险的动作都先问过再做。',
     createdAt: new Date().toISOString(),
   });
 }
@@ -74,7 +74,7 @@ function resolveProvider(bot) {
 const sessionGrants = new Set();
 
 /* ------------------------- the chat turn ------------------------- */
-async function chatTurn(bot, userText, emit) {
+async function chatTurn(bot, userText, emit, lang) {
   const history = store.getMessages(bot.id)
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-30)
@@ -83,7 +83,7 @@ async function chatTurn(bot, userText, emit) {
 
   const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) };
   const engine = getEngine(bot.engine);
-  const gen = engine.run({ bot, history, userText, provider: resolveProvider(bot) });
+  const gen = engine.run({ bot, history, userText, provider: resolveProvider(bot), lang });
   let assistant = '';
   let next = await gen.next();
   while (!next.done) {
@@ -253,11 +253,11 @@ const server = http.createServer(async (req, res) => {
     if (chatMatch && req.method === 'POST') {
       const bot = store.getBot(chatMatch[1]);
       if (!bot) return json(res, 404, { error: 'no such bot' });
-      const { text } = await readBody(req);
+      const { text, lang } = await readBody(req);
       if (!text || !String(text).trim()) return json(res, 400, { error: 'text required' });
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const emit = (type, data) => { try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ } };
-      try { await chatTurn(bot, String(text), emit); emit('done', {}); }
+      try { await chatTurn(bot, String(text), emit, typeof lang === 'string' ? lang : undefined); emit('done', {}); }
       catch (e) { emit('error', { message: e.message || String(e) }); }
       return res.end();
     }
@@ -306,3 +306,29 @@ seed();
 server.listen(config.port, config.host, () => {
   console.log(`Starts-Agents harness on http://${config.host}:${config.port}  (data: ${config.dataDir})`);
 });
+
+// Local-model auto-detect: if an Ollama server answers on this machine
+// and no local provider exists yet, register it (no API key needed) and
+// point the Coder bot at it — local models work out of the box.
+(async () => {
+  try {
+    if (store.listProviders().some((p) => p.preset === 'ollama')) return;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 1200);
+    const res = await fetch('http://127.0.0.1:11434/api/tags', { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return;
+    const tags = await res.json();
+    const names = (tags.models || []).map((m) => m.name).filter(Boolean);
+    if (!names.length) return;
+    const model = names.find((n) => /qwen.*coder/i.test(n)) || names.find((n) => /coder/i.test(n)) || names[0];
+    const provider = store.addProvider({
+      id: store.newId('prov'), label: '本地模型 · Ollama', preset: 'ollama',
+      baseUrl: 'http://127.0.0.1:11434/v1', model, keyEnc: '', createdAt: new Date().toISOString(),
+    });
+    const coder = store.listBots().find((b) => b.name === 'Coder' && !b.providerId);
+    if (coder) store.updateBot(coder.id, { providerId: provider.id });
+    store.audit({ kind: 'provider_auto_local', provider: provider.id, model });
+    console.log(`Local model detected via Ollama: ${model} (provider registered)`);
+  } catch { /* no local model server — fine, API providers still work */ }
+})();
