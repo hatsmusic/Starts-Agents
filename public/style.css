@@ -21,6 +21,18 @@ button { font: inherit; cursor: pointer; }
 .bot-av.sm { width: 28px; height: 28px; border-radius: 8px; flex-basis: 28px; margin-top: 2px; }
 .lock-img { width: 76px; height: 76px; border-radius: 20px; }
 
+/* markdown inside assistant bubbles */
+.msg.assistant p { margin: 0 0 8px; }
+.msg.assistant p:last-child { margin-bottom: 0; }
+.msg.assistant ul, .msg.assistant ol { margin: 2px 0 10px; padding-left: 20px; }
+.msg.assistant li { margin: 2px 0; }
+.msg.assistant strong { color: #fff; }
+.msg.assistant a { color: var(--b); }
+.msg.assistant .md-h { font-weight: 700; font-size: 1.06em; color: #fff; }
+.md-code { background: rgba(255, 255, 255, .1); padding: 1px 5px; border-radius: 5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+.md-pre { background: #0a1622; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; margin: 6px 0 10px; }
+.md-pre code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; white-space: pre; color: #d6e4f0; }
+
 /* deployment package download card */
 .package-card { background: var(--panel); border: 1px solid #1f7a6d; border-radius: 16px; padding: 14px 16px; margin: 6px 0; max-width: 86%; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); }
 .package-card h4 { margin: 0 0 6px; font-size: 15px; }

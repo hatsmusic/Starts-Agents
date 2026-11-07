@@ -144,6 +144,42 @@ function fmtTime(at) {
   return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
 }
 
+/* Minimal, safe Markdown for assistant bubbles: the model answers in
+ * Markdown, and plain textContent showed the raw ** and ` soup.
+ * Everything is HTML-escaped FIRST; only the renderer's own tags are
+ * generated afterwards, and code spans/blocks are lifted out before
+ * any formatting so their contents stay literal. */
+function renderMd(src) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  let text = String(src || '');
+  const blocks = [];
+  const lift = (html) => { blocks.push(html); return '\u0001' + (blocks.length - 1) + '\u0002'; };
+  text = text.replace(/```\w*\n?([\s\S]*?)```/g, (m, code) => lift('<pre class="md-pre"><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>'));
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => lift('<code class="md-code">' + esc(code) + '</code>'));
+  text = esc(text);
+  text = text.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  const lines = text.split('\n');
+  let html = '', listTag = null;
+  const closeList = () => { if (listTag) { html += '</' + listTag + '>'; listTag = null; } };
+  for (const line of lines) {
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || ordered) {
+      const tag = ordered ? 'ol' : 'ul';
+      if (listTag !== tag) { closeList(); html += '<' + tag + '>'; listTag = tag; }
+      html += '<li>' + (bullet ? bullet[1] : ordered[1]) + '</li>';
+      continue;
+    }
+    closeList();
+    const h = line.match(/^\s*#{1,4}\s+(.+)$/);
+    if (h) { html += '<p class="md-h">' + h[1] + '</p>'; continue; }
+    if (line.trim()) html += '<p>' + line + '</p>';
+  }
+  closeList();
+  return html.replace(/\u0001(\d+)\u0002/g, (m, i) => blocks[+i]);
+}
+
 function addMessage(role, text, at) {
   if (role === 'system') {
     const m = el('div', 'msg system', text);
@@ -154,7 +190,8 @@ function addMessage(role, text, at) {
   const row = el('div', 'msg-row ' + role);
   if (role === 'assistant') row.append(botAvatar('sm'));
   const col = el('div', 'msg-col');
-  const bubble = el('div', 'msg ' + role, text);
+  const bubble = el('div', 'msg ' + role, role === 'assistant' ? undefined : text);
+  if (role === 'assistant') { bubble._raw = text || ''; bubble.innerHTML = renderMd(bubble._raw); }
   col.append(bubble, el('div', 'msg-time', fmtTime(at)));
   row.append(col);
   $('#messages').append(row);
@@ -222,7 +259,7 @@ async function sendChat(text) {
         if (!evLine || !dataLine) continue;
         const type = evLine.slice(6).trim();
         const data = JSON.parse(dataLine.slice(5));
-        if (type === 'token') { bubble.textContent += data.text; scrollDown(); }
+        if (type === 'token') { bubble._raw = (bubble._raw || '') + data.text; bubble.innerHTML = renderMd(bubble._raw); scrollDown(); }
         else if (type === 'tool_pending') addToolChip(data.name, data.args);
         else if (type === 'approval') addApprovalCard(data);
         else if (type === 'package') addPackageCard(data);
