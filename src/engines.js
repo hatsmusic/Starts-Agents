@@ -35,10 +35,10 @@ async function* echoRun({ bot, history, userText, lang, signal }) {
   yield* say(zh
     ? `我是 ${bot.name}，现在用的是离线演示引擎（echo），只会照着学系统：` +
       `试试 "list files"、"read 文件名"、"note 内容"、"run 命令"（要你批准）。` +
-      `想让我真正写代码，去「⚙ 模型设置」加一个供应商，把机器人引擎换成「API 模型」。`
+      `想让我真正写代码，去「设置」加一个供应商，把机器人引擎换成「API 模型」。`
     : `I'm ${bot.name}, running on the offline demo engine (echo) — I just mirror the system: ` +
       `try "list files", "read <file>", "note <text>", "run <command>" (asks your approval). ` +
-      `For real coding, add a provider under "⚙ Models" and switch this bot to the API engine.`);
+      `For real coding, add a provider under Settings and switch this bot to the API engine.`);
 }
 
 /* ------------- openai: any OpenAI-compatible endpoint ------------- */
@@ -127,7 +127,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
   const apiKey = provider?.apiKey || config.ai.apiKey;
   const model = bot.model || provider?.model || config.ai.model;
   if (!apiKey && !/127\.0\.0\.1|localhost/.test(baseUrl)) {
-    throw new Error('No API key for this bot. Add a provider in Settings (⚙), then pick it in the bot editor.');
+    throw new Error('No API key for this bot. Add a provider in Settings, then pick it in the bot editor.');
   }
   const zh = lang === 'zh' || lang === 'tw';
   const messages = [
