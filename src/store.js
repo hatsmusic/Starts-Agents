@@ -107,6 +107,15 @@ export function removeProvider(id) {
   save();
 }
 
+export function updateProvider(id, patch) {
+  const s = load();
+  const p = (s.providers || []).find((x) => x.id === id);
+  if (!p) return null;
+  Object.assign(p, patch);
+  save();
+  return p;
+}
+
 /* --------------------------- audit --------------------------- */
 // Append-only JSONL: every tool execution and every approval decision
 // lands here, so the human can always answer "what did the bot do?".

@@ -108,6 +108,7 @@ function agentProtocol(lang) {
     '5. 出错就改：验证失败先读懂报错再改，改完重新验证；同一个错误反复出现就换思路，不要原样重试。',
     '6. 打包交付：验证通过后，调用 package_project 把整个项目打成部署包；最终总结写清：做了什么、文件清单、怎么运行/部署、验证结果。',
     '7. 闲聊、打招呼、一般问题只用文字回复，不调用任何工具。',
+    '8. 直接干，不要反复追问：用户的要求只要大方向明确，就立刻执行；细节缺失时用合理默认自己补齐，在交付总结里说明即可，不要把问题推回给用户，更不要把同一句追问说第二遍。',
   ].join('\n') : [
     '[Agent working protocol — follow on every task]',
     '1. Explore before acting: inspect the workspace first (file tree / list_files / read_file / search_text). Never guess or invent paths.',
@@ -117,6 +118,7 @@ function agentProtocol(lang) {
     '5. Fix and re-verify: when verification fails, read the error, fix the cause, verify again. If the same error keeps coming back, change approach instead of retrying verbatim.',
     '6. Package the deliverable: once verified, call package_project to zip the whole project, then summarize what was built, the file list, how to run/deploy it, and the verification result.',
     '7. Chat, greetings and general questions: reply in plain text only, no tools.',
+    '8. Act, do not interrogate: when the request is clear in intent, execute it immediately. Fill missing details with sensible defaults and note them in the summary — never bounce the question back, and never ask the same clarifying question twice.',
   ].join('\n');
 }
 

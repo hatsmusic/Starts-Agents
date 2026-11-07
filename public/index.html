@@ -102,6 +102,9 @@
         <button type="submit" class="primary" data-i18n="addProv">添加供应商</button>
       </div>
     </form>
+    <h3 class="audit-head" data-i18n="lmTitle">本地模型（Ollama）</h3>
+    <p class="set-hint" data-i18n="lmHint">在本机跑的开源模型，不用 API、不用 key。注意两个数：磁盘是下载占的硬盘，内存是回答问题时占的运行内存（闲置 5 分钟自动卸载释放）。</p>
+    <div id="localModels" class="provider-list"></div>
     <h3 class="audit-head" data-i18n="audit">最近动态</h3>
     <div id="auditList" class="audit-list"></div>
   </div>

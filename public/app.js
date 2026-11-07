@@ -324,6 +324,68 @@ async function loadProviders() {
   renderHead();
 }
 
+/* ------------------- settings: local models ------------------- */
+let lmPollTimer = null;
+async function loadLocalModels() {
+  const box = $('#localModels');
+  if (!box) return;
+  let data;
+  try { data = await api('GET', '/api/local-models'); } catch { return; }
+  box.innerHTML = '';
+  if (!data.available) {
+    box.append(el('p', 'set-hint', t('lmOff')));
+    return;
+  }
+  const zhUi = state.lang === 'zh' || state.lang === 'tw';
+  const pulling = data.pull?.status === 'pulling';
+  for (const m of data.catalog) {
+    const installed = data.installed.includes(m.tag);
+    const isCurrent = data.current === m.tag;
+    const isPullingThis = pulling && data.pull.tag === m.tag;
+    const row = el('div', 'provider-row');
+    const info = el('div');
+    info.append(
+      el('div', 'pv-name', m.name + (isCurrent ? ' · ' + t('lmUsing') : '')),
+      el('div', 'pv-meta', `${t('lmDisk')} ~${m.diskGB} GB · ${t('lmRam')} ~${m.ramGB} GB`),
+      el('div', 'pv-meta', zhUi ? m.blurbZh : m.blurbEn)
+    );
+    if (isPullingThis) {
+      const pct = data.pull.total ? Math.floor((data.pull.completed / data.pull.total) * 100) : 0;
+      const bar = el('div', 'lm-bar');
+      const fill = el('div', 'lm-fill');
+      fill.style.width = pct + '%';
+      bar.append(fill);
+      info.append(bar, el('div', 'pv-meta', `${t('lmPulling')} ${pct}%`));
+    } else if (data.pull?.status === 'error' && data.pull.tag === m.tag) {
+      info.append(el('div', 'pv-meta lm-err', t('lmFailed')));
+    }
+    row.append(info);
+    const actions = el('div', 'lm-actions');
+    if (installed && !isCurrent) {
+      const use = el('button', 'mini-btn', t('lmUse'));
+      use.onclick = async () => { await api('POST', '/api/local-models/use', { tag: m.tag }); await loadProviders(); loadLocalModels(); };
+      actions.append(use);
+    }
+    if (!installed && !isPullingThis) {
+      const pull = el('button', 'mini-btn', t('lmPull'));
+      pull.disabled = pulling;
+      pull.onclick = async () => { await api('POST', '/api/local-models/pull', { tag: m.tag }); loadLocalModels(); };
+      actions.append(pull);
+    }
+    if (installed && !isCurrent) {
+      const del = el('button', 'mini-btn danger-text', t('lmDel'));
+      del.onclick = async () => { await api('DELETE', '/api/local-models/' + encodeURIComponent(m.tag)); loadLocalModels(); };
+      actions.append(del);
+    }
+    row.append(actions);
+    box.append(row);
+  }
+  clearTimeout(lmPollTimer);
+  if (pulling && $('#settingsDialog').open) {
+    lmPollTimer = setTimeout(loadLocalModels, 2500);
+  }
+}
+
 async function loadAudit() {
   const { entries } = await api('GET', '/api/audit?limit=30');
   const list = $('#auditList');
@@ -355,6 +417,7 @@ async function openSettings() {
     fillPreset();
   }
   await loadProviders();
+  await loadLocalModels().catch(() => {});
   await loadAudit();
   $('#settingsDialog').showModal();
 }

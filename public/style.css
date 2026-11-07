@@ -35,6 +35,12 @@ button { font: inherit; cursor: pointer; }
 .task-row .task-box { color: var(--b); flex: 0 0 auto; }
 .task-row.done .task-text { color: var(--mut); text-decoration: line-through; }
 
+/* local-model download progress */
+.lm-bar { height: 6px; background: var(--panel); border-radius: 3px; overflow: hidden; margin-top: 8px; max-width: 320px; }
+.lm-fill { height: 100%; background: linear-gradient(90deg, var(--a), var(--b)); transition: width .4s ease; }
+.lm-err { color: #ff8a80; }
+.lm-actions { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
+
 /* language picker */
 .lang-wrap { position: relative; }
 .lang-menu { position: absolute; top: 42px; right: 0; z-index: 40; background: var(--panel2); border: 1px solid var(--line); border-radius: 14px; padding: 6px; min-width: 168px; max-height: 320px; overflow-y: auto; box-shadow: 0 12px 32px rgba(0, 0, 0, .45); }

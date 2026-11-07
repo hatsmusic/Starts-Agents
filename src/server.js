@@ -14,6 +14,7 @@ import { requestApproval, resolveApproval, listPending } from './approvals.js';
 import { parseTeam, exportTeam } from './team.js';
 import { ICON_PNG } from './icon.js';
 import { PRESETS, getPreset } from './presets.js';
+import { LOCAL_MODELS, getLocalModel } from './local-models.js';
 import { encrypt, decrypt, mask } from './vault.js';
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
@@ -231,6 +232,76 @@ function hasAccess(req) {
   return cookie.split(';').some((c) => c.trim() === 'sa_access=' + config.accessToken);
 }
 
+/* --------------------- local models (Ollama) --------------------- */
+const OLLAMA_BASE = 'http://127.0.0.1:11434';
+let pullState = null;
+
+async function ollamaInstalled() {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    const res = await fetch(OLLAMA_BASE + '/api/tags', { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const tags = await res.json();
+    return (tags.models || []).map((m) => m.name).filter(Boolean);
+  } catch { return null; }
+}
+
+/* Find or create the Ollama provider. With switchModel, also make
+ * `model` the active one (the 设置页「使用」按钮); a finished download
+ * alone never steals the active slot. */
+function ensureOllamaProvider(model, switchModel = false) {
+  let prov = store.listProviders().find((x) => x.preset === 'ollama');
+  if (!prov) {
+    prov = store.addProvider({
+      id: store.newId('prov'), label: '本地模型 · Ollama', preset: 'ollama',
+      baseUrl: OLLAMA_BASE + '/v1', model: model || '', keyEnc: '', createdAt: new Date().toISOString(),
+    });
+    const coder = store.listBots().find((b) => b.name === 'Coder' && !b.providerId);
+    if (coder) store.updateBot(coder.id, { providerId: prov.id });
+  } else if (model && (switchModel || !prov.model) && prov.model !== model) {
+    prov = store.updateProvider(prov.id, { model }) || prov;
+  }
+  return prov;
+}
+
+/* Background pull with progress. Ollama keeps the partial blobs, so
+ * an interrupted pull resumes where it left off when retried. */
+function startOllamaPull(tag) {
+  pullState = { tag, status: 'pulling', phase: '', completed: 0, total: 0, error: null, at: new Date().toISOString() };
+  (async () => {
+    try {
+      const res = await fetch(OLLAMA_BASE + '/api/pull', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: tag, stream: true }) });
+      if (!res.ok || !res.body) throw new Error('ollama returned ' + res.status);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line) continue;
+          let j; try { j = JSON.parse(line); } catch { continue; }
+          if (j.error) throw new Error(j.error);
+          if (typeof j.completed === 'number') pullState.completed = j.completed;
+          if (typeof j.total === 'number' && j.total) pullState.total = j.total;
+          if (j.status) pullState.phase = j.status;
+        }
+      }
+      pullState = { ...pullState, status: 'done' };
+      ensureOllamaProvider(tag);
+      store.audit({ kind: 'local_model_pull', tool: tag, ok: true });
+    } catch (e) {
+      pullState = { ...pullState, status: 'error', error: e.message || String(e) };
+      store.audit({ kind: 'local_model_pull', tool: tag, ok: false });
+    }
+  })();
+}
+
 /* --------------------------- HTTP API ---------------------------- */
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://local');
@@ -262,6 +333,49 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/engines' && req.method === 'GET') return json(res, 200, { engines: await engineStatus(), tools: toolCatalog() });
 
     if (p === '/api/presets' && req.method === 'GET') return json(res, 200, { presets: PRESETS });
+
+    /* -------- local models (Ollama): browse / pull / use / delete -------- */
+    if (p === '/api/local-models' && req.method === 'GET') {
+      const installed = await ollamaInstalled();
+      const prov = store.listProviders().find((x) => x.preset === 'ollama');
+      return json(res, 200, {
+        available: installed !== null,
+        installed: installed || [],
+        current: prov?.model || null,
+        catalog: LOCAL_MODELS,
+        pull: pullState,
+      });
+    }
+    if (p === '/api/local-models/pull' && req.method === 'POST') {
+      const { tag } = await readBody(req);
+      if (!getLocalModel(String(tag || ''))) return json(res, 400, { error: 'unknown model tag' });
+      if (pullState?.status === 'pulling') return json(res, 409, { error: 'a pull is already running', pull: pullState });
+      startOllamaPull(String(tag));
+      return json(res, 202, { pull: pullState });
+    }
+    if (p === '/api/local-models/use' && req.method === 'POST') {
+      const { tag } = await readBody(req);
+      const installed = await ollamaInstalled();
+      if (!installed || !installed.includes(String(tag))) return json(res, 400, { error: 'model is not installed' });
+      const prov = ensureOllamaProvider(String(tag), true);
+      store.audit({ kind: 'local_model_use', tool: String(tag) });
+      return json(res, 200, { current: prov.model });
+    }
+    const lmDelMatch = p.match(/^\/api\/local-models\/(.+)$/);
+    if (lmDelMatch && req.method === 'DELETE') {
+      const tag = decodeURIComponent(lmDelMatch[1]);
+      try {
+        const r = await fetch(OLLAMA_BASE + '/api/delete', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: tag }) });
+        if (!r.ok) throw new Error('ollama returned ' + r.status);
+      } catch (e) { return json(res, 502, { error: 'delete failed: ' + e.message }); }
+      const prov = store.listProviders().find((x) => x.preset === 'ollama');
+      if (prov && prov.model === tag) {
+        const rest = (await ollamaInstalled()) || [];
+        store.updateProvider(prov.id, { model: rest[0] || '' });
+      }
+      store.audit({ kind: 'local_model_delete', tool: tag });
+      return json(res, 200, { ok: true });
+    }
 
     // Providers: keys are write-only. Reads return a masked hint only.
     if (p === '/api/providers' && req.method === 'GET') {

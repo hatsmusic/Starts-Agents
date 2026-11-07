@@ -18,7 +18,20 @@
 # boot and registers a "本地模型 · Ollama" provider — no API key,
 # no cloud, nothing leaves this machine.
 set -euo pipefail
-MODEL="${1:-qwen2.5-coder:1.5b}"
+# Friendly aliases for the curated catalog (same list as the app's
+# Settings → Local models page). Anything else is passed through as a
+# raw Ollama tag.
+case "${1:-}" in
+  ""|demo|1.5b) MODEL="qwen2.5-coder:1.5b" ;;
+  3b) MODEL="qwen2.5-coder:3b" ;;
+  7b) MODEL="qwen2.5-coder:7b" ;;
+  14b) MODEL="qwen2.5-coder:14b" ;;
+  gpt-oss) MODEL="gpt-oss:20b" ;;
+  devstral) MODEL="devstral:24b" ;;
+  27b) MODEL="qwen3.6:27b" ;;
+  30b) MODEL="qwen3-coder:30b" ;;
+  *) MODEL="$1" ;;
+esac
 
 if ! command -v ollama >/dev/null 2>&1; then
   echo "Installing Ollama…"
