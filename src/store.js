@@ -12,7 +12,7 @@ const file = path.join(config.dataDir, 'state.json');
 let state = null;
 
 function blank() {
-  return { bots: [], messages: {} };
+  return { bots: [], messages: {}, providers: [] };
 }
 
 export function load() {
@@ -75,4 +75,51 @@ export function pushMessage(botId, msg) {
   (s.messages[botId] = s.messages[botId] || []).push(msg);
   save();
   return msg;
+}
+
+/* ------------------------- providers ------------------------- */
+// A provider is a named OpenAI-compatible endpoint. Its API key lives
+// ONLY in `keyEnc` (vault ciphertext) — see src/vault.js.
+export function listProviders() {
+  return load().providers || [];
+}
+
+export function getProvider(id) {
+  return listProviders().find((p) => p.id === id) || null;
+}
+
+export function addProvider(provider) {
+  const s = load();
+  s.providers = s.providers || [];
+  s.providers.push(provider);
+  save();
+  return provider;
+}
+
+export function removeProvider(id) {
+  const s = load();
+  s.providers = (s.providers || []).filter((p) => p.id !== id);
+  save();
+}
+
+/* --------------------------- audit --------------------------- */
+// Append-only JSONL: every tool execution and every approval decision
+// lands here, so the human can always answer "what did the bot do?".
+const auditFile = path.join(config.dataDir, 'audit.log');
+
+export function audit(entry) {
+  fs.mkdirSync(config.dataDir, { recursive: true });
+  fs.appendFileSync(auditFile, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n');
+}
+
+export function readAudit(limit = 100) {
+  try {
+    const lines = fs.readFileSync(auditFile, 'utf8').trim().split('\n').filter(Boolean);
+    return lines.slice(-limit).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+  } catch { return []; }
+}
+
+/* ------------------------- workspaces ------------------------ */
+export function workspaceOf(botId) {
+  return path.join(config.dataDir, 'projects', botId);
 }

@@ -9,6 +9,11 @@ export const config = {
   root,
   host: process.env.START_AGENTS_HOST || '127.0.0.1',
   port: Number(process.env.START_AGENTS_PORT || 8797),
+  // Access token for public (subdomain) deployments. When set, every
+  // page and API call requires it: visitors enter it once and get a
+  // long-lived cookie. Leave unset ONLY for localhost-only use —
+  // without it, anyone who finds the URL can approve shell commands.
+  accessToken: process.env.START_AGENTS_ACCESS_TOKEN || '',
   dataDir: process.env.START_AGENTS_DATA || path.join(root, 'data'),
   // The sandbox is the only directory the file tools may touch. Point it
   // somewhere harmless while you learn the shape of the system.

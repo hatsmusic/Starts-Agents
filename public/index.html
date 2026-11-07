@@ -2,11 +2,31 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Starts-Agents</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0f212e">
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Agents">
 </head>
 <body>
+<div id="lockScreen" hidden>
+  <div class="lock-card">
+    <div class="lock-logo">🤖</div>
+    <h2>Starts-Agents</h2>
+    <p class="lock-hint">This deployment is protected. Enter the access token once — this device will remember it.</p>
+    <form id="lockForm">
+      <input id="lockToken" type="password" placeholder="Access token" autocomplete="current-password">
+      <button type="submit">Unlock</button>
+    </form>
+    <p id="lockError" class="lock-error"></p>
+  </div>
+</div>
 <div id="app">
   <aside id="roster">
     <header class="r-head">
@@ -15,15 +35,17 @@
     </header>
     <div id="botList" class="bot-list"></div>
     <footer class="r-foot">
+      <button id="settingsBtn" class="mini-btn">⚙ Models</button>
       <button id="importBtn" class="mini-btn">Import team</button>
-      <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md">Export team</a>
+      <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md">Export</a>
       <input type="file" id="importFile" accept=".md,text/markdown,text/plain" hidden>
     </footer>
   </aside>
 
   <main id="chatPane">
     <header id="chatHead">
-      <div>
+      <button id="backBtn" class="icon-btn" title="Back to roster">‹</button>
+      <div class="head-main">
         <div id="botName" class="bot-name">Pick a bot</div>
         <div id="botMeta" class="bot-meta"></div>
       </div>
@@ -42,7 +64,8 @@
     <h3 id="dialogTitle">New bot</h3>
     <label>Name <input id="fName" required maxlength="60"></label>
     <label>Engine <select id="fEngine"></select></label>
-    <label>Model <input id="fModel" placeholder="(engine default)"></label>
+    <label>Model provider <select id="fProvider"></select></label>
+    <label>Model <input id="fModel" placeholder="(provider default)"></label>
     <label>Persona <textarea id="fPersona" rows="5" placeholder="Who is this bot? How should it behave?"></textarea></label>
     <div class="dialog-actions">
       <button type="button" id="deleteBotBtn" class="danger" hidden>Delete</button>
@@ -51,6 +74,29 @@
       <button type="submit" class="primary">Save</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="settingsDialog">
+  <div class="settings-wrap">
+    <h3>Model providers</h3>
+    <p class="set-hint">Keys are encrypted on the server and never shown again — only a hint. Strong open-weight models first; every preset talks straight to the provider, no middleman.</p>
+    <div id="providerList" class="provider-list"></div>
+    <form id="providerForm">
+      <label>Preset <select id="pPreset"></select></label>
+      <p id="pHint" class="set-hint"></p>
+      <label>Label <input id="pLabel" placeholder="e.g. My DeepSeek"></label>
+      <label>Base URL <input id="pBaseUrl" placeholder="https://…/v1"></label>
+      <label>Model <input id="pModel" placeholder="model id"></label>
+      <label>API key <input id="pKey" type="password" placeholder="sk-… (not needed for local Ollama)" autocomplete="off"></label>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="settingsClose">Close</button>
+        <button type="submit" class="primary">Add provider</button>
+      </div>
+    </form>
+    <h3 class="audit-head">Recent activity</h3>
+    <div id="auditList" class="audit-list"></div>
+  </div>
 </dialog>
 
 <script src="/app.js"></script>

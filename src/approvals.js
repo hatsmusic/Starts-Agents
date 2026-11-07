@@ -5,12 +5,13 @@
 const pending = new Map();
 const TIMEOUT_MS = 5 * 60 * 1000;
 
-// requestApproval({ botId, tool, args, onCard }) -> Promise<{decision}>
+// requestApproval({ botId, tool, args, preview, onCard }) -> Promise<{decision}>
 // onCard(card) fires immediately so the UI can render the card while
-// this promise stays pending.
-export function requestApproval({ botId, tool, args, onCard }) {
+// this promise stays pending. `preview` is an optional human-readable
+// rendering of what the tool is about to do (a diff, a command line).
+export function requestApproval({ botId, tool, args, preview, onCard }) {
   const id = 'ap_' + Math.random().toString(36).slice(2, 10);
-  const card = { id, botId, tool, args, createdAt: new Date().toISOString() };
+  const card = { id, botId, tool, args, preview: preview || null, createdAt: new Date().toISOString() };
   const promise = new Promise((resolve) => {
     const timer = setTimeout(() => {
       if (pending.delete(id)) resolve({ decision: 'deny', reason: 'approval timed out' });
@@ -28,7 +29,8 @@ export function resolveApproval(id, decision) {
   const entry = pending.get(id);
   if (!entry) return false;
   pending.delete(id);
-  entry.resolve({ decision: decision === 'allow' ? 'allow' : 'deny' });
+  const d = decision === 'allow' || decision === 'allow_session' ? decision : 'deny';
+  entry.resolve({ decision: d });
   return true;
 }
 

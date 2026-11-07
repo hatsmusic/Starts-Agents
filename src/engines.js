@@ -36,11 +36,15 @@ async function* echoRun({ bot, history, userText }) {
     (lastUser && lastUser.content !== t ? `Before that you said: "${lastUser.content}". ` : '') +
     `I run fully offline, so use me to learn the harness: try "list files", ` +
     `"read <file>", "note <text>", or "run <command>" (shell asks for approval first). ` +
-    `Give this bot the "openai" engine plus an API key for a real model.`
+    `For real coding work, add a model provider in Settings and switch this bot's engine to "API model".`
   );
 }
 
 /* ------------- openai: any OpenAI-compatible endpoint ------------- */
+// The server resolves the bot's provider (a vault-backed endpoint, see
+// src/presets.js + src/vault.js) and hands { baseUrl, apiKey, model }
+// in. The tool loop runs up to 25 rounds so real coding work — read,
+// edit, run tests, fix, re-run — completes in one turn.
 function openaiTools() {
   return TOOLS.map((t) => ({
     type: 'function',
@@ -55,17 +59,22 @@ function openaiTools() {
   }));
 }
 
-async function* openaiRun({ bot, history, userText }) {
-  const model = bot.model || config.ai.model;
+async function* openaiRun({ bot, history, userText, provider }) {
+  const baseUrl = provider?.baseUrl || config.ai.baseUrl;
+  const apiKey = provider?.apiKey || config.ai.apiKey;
+  const model = bot.model || provider?.model || config.ai.model;
+  if (!apiKey && !/127\.0\.0\.1|localhost/.test(baseUrl)) {
+    throw new Error('No API key for this bot. Add a provider in Settings (⚙), then pick it in the bot editor.');
+  }
   const messages = [
     { role: 'system', content: bot.persona || 'You are a helpful agent.' },
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userText },
   ];
-  for (let round = 0; round < 5; round++) {
-    const res = await fetch(config.ai.baseUrl + '/chat/completions', {
+  for (let round = 0; round < 25; round++) {
+    const res = await fetch(baseUrl + '/chat/completions', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + config.ai.apiKey },
+      headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
       body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true }),
     });
     if (!res.ok || !res.body) throw new Error('AI endpoint returned ' + res.status);
@@ -103,7 +112,7 @@ async function* openaiRun({ bot, history, userText }) {
       let args = {};
       try { args = JSON.parse(c.args || '{}'); } catch { /* keep {} */ }
       const result = yield { type: 'tool', name: c.name, args };
-      messages.push({ role: 'tool', tool_call_id: 'call_' + idx++, content: String(result).slice(0, 8000) });
+      messages.push({ role: 'tool', tool_call_id: 'call_' + idx++, content: String(result).slice(0, 16000) });
     }
   }
 }
@@ -134,8 +143,8 @@ function checkClaude() {
 export const ENGINES = {
   echo: { label: 'Echo (offline demo)', available: async () => true, run: echoRun },
   openai: {
-    label: 'OpenAI-compatible API',
-    available: async () => Boolean(config.ai.apiKey),
+    label: 'API model (providers in Settings)',
+    available: async () => true,
     run: openaiRun,
   },
   'claude-cli': { label: 'Claude CLI (local login)', available: checkClaude, run: claudeCliRun },

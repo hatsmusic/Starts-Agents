@@ -12,8 +12,11 @@ import { getEngine, engineStatus } from './engines.js';
 import { getTool, toolCatalog } from './tools.js';
 import { requestApproval, resolveApproval, listPending } from './approvals.js';
 import { parseTeam, exportTeam } from './team.js';
+import { ICON_PNG } from './icon.js';
+import { PRESETS, getPreset } from './presets.js';
+import { encrypt, decrypt, mask } from './vault.js';
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -32,11 +35,43 @@ function readBody(req) {
 function seed() {
   if (store.listBots().length) return;
   store.addBot({
-    id: store.newId('bot'), name: 'Chief of Staff', engine: config.defaultEngine, model: '',
+    id: store.newId('bot'), name: 'Coder', engine: 'openai', model: '', providerId: '',
+    persona: [
+      'You are Coder, a senior software engineer working in your own project workspace.',
+      'Rules of the workshop:',
+      '- Look before you leap: list_files / read_file / search_text first, then change things.',
+      '- Make the smallest change that fully solves the problem; match the existing style.',
+      '- After changing code, verify: run the tests or the app and read the output.',
+      '- File writes and shell commands need human approval — propose them confidently and specifically.',
+      '- Report honestly: what you changed, what you verified, what remains unverified.',
+    ].join('\n'),
+    createdAt: new Date().toISOString(),
+  });
+  store.addBot({
+    id: store.newId('bot'), name: 'Chief of Staff', engine: config.defaultEngine, model: '', providerId: '',
     persona: 'You are the chief of staff: warm, concise, organised. You keep track of what matters and ask before anything risky.',
     createdAt: new Date().toISOString(),
   });
 }
+
+// Resolve a bot's provider into a ready-to-call endpoint. The API key
+// exists in plaintext only inside this function's return value, in
+// memory, for the duration of the turn.
+function safeDecrypt(keyEnc) {
+  try { return decrypt(keyEnc); } catch { return ''; }
+}
+
+function resolveProvider(bot) {
+  const p = bot.providerId ? store.getProvider(bot.providerId) : null;
+  if (!p) return null;
+  let apiKey = '';
+  try { apiKey = decrypt(p.keyEnc); } catch { apiKey = ''; }
+  return { baseUrl: p.baseUrl, model: p.model, apiKey };
+}
+
+// "Allow all this session" grants, per bot+tool. In-memory on purpose:
+// a server restart revokes everything, which is the safe direction.
+const sessionGrants = new Set();
 
 /* ------------------------- the chat turn ------------------------- */
 async function chatTurn(bot, userText, emit) {
@@ -46,8 +81,9 @@ async function chatTurn(bot, userText, emit) {
     .map((m) => ({ role: m.role, content: m.text }));
   store.pushMessage(bot.id, { role: 'user', text: userText, at: new Date().toISOString() });
 
+  const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) };
   const engine = getEngine(bot.engine);
-  const gen = engine.run({ bot, history, userText });
+  const gen = engine.run({ bot, history, userText, provider: resolveProvider(bot) });
   let assistant = '';
   let next = await gen.next();
   while (!next.done) {
@@ -61,25 +97,40 @@ async function chatTurn(bot, userText, emit) {
       let result;
       if (!tool) {
         result = `Error: unknown tool "${ev.name}"`;
-      } else if (tool.risk === 'ask') {
+      } else {
         emit('tool_pending', { name: tool.name, args: ev.args });
-        const { decision } = await requestApproval({
-          botId: bot.id, tool: tool.name, args: ev.args,
-          onCard: (card) => emit('approval', card),
-        });
-        if (decision !== 'allow') {
+        let permitted = tool.risk !== 'ask';
+        if (tool.risk === 'ask') {
+          if (sessionGrants.has(bot.id + ':' + tool.name)) {
+            permitted = true;
+            store.audit({ bot: bot.id, kind: 'grant_used', tool: tool.name });
+          } else {
+            let preview = null;
+            if (typeof tool.preview === 'function') {
+              try { preview = tool.preview(ev.args, ctx); } catch (e) { preview = '⚠ preview failed: ' + e.message; }
+            }
+            const { decision } = await requestApproval({
+              botId: bot.id, tool: tool.name, args: ev.args, preview,
+              onCard: (card) => emit('approval', card),
+            });
+            store.audit({ bot: bot.id, kind: 'approval', tool: tool.name, decision });
+            if (decision === 'allow_session') {
+              sessionGrants.add(bot.id + ':' + tool.name);
+              permitted = true;
+            } else if (decision === 'allow') {
+              permitted = true;
+            }
+          }
+        }
+        if (!permitted) {
           result = 'The user denied this action. Do not retry it; continue without it or ask what they prefer.';
           emit('tool_result', { name: tool.name, ok: false, result });
         } else {
-          try { result = await tool.run(ev.args, { botId: bot.id }); }
+          try { result = String(await tool.run(ev.args, ctx)); }
           catch (e) { result = 'Error: ' + e.message; }
-          emit('tool_result', { name: tool.name, ok: true, result: String(result).slice(0, 2000) });
+          store.audit({ bot: bot.id, kind: 'tool', tool: tool.name, ok: !result.startsWith('Error'), args: summarizeArgs(ev.args) });
+          emit('tool_result', { name: tool.name, ok: !result.startsWith('Error'), result: result.slice(0, 2000) });
         }
-      } else {
-        emit('tool_pending', { name: tool.name, args: ev.args });
-        try { result = await tool.run(ev.args, { botId: bot.id }); }
-        catch (e) { result = 'Error: ' + e.message; }
-        emit('tool_result', { name: tool.name, ok: !String(result).startsWith('Error'), result: String(result).slice(0, 2000) });
       }
       next = await gen.next(String(result));
     } else {
@@ -90,12 +141,85 @@ async function chatTurn(bot, userText, emit) {
   return assistant;
 }
 
+// Audit args without ever logging file contents or secrets.
+function summarizeArgs(args) {
+  const out = {};
+  for (const [k, v] of Object.entries(args || {})) {
+    out[k] = k === 'content' || k === 'new' || k === 'old' ? `<${String(v).length} chars>` : String(v).slice(0, 200);
+  }
+  return out;
+}
+
+/* --------------------- access gate (public use) ------------------- */
+function hasAccess(req) {
+  if (!config.accessToken) return true; // localhost-only mode, no gate
+  const cookie = String(req.headers.cookie || '');
+  return cookie.split(';').some((c) => c.trim() === 'sa_access=' + config.accessToken);
+}
+
 /* --------------------------- HTTP API ---------------------------- */
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://local');
   const p = url.pathname;
   try {
+    // App icon (PWA + apple-touch-icon). Public on purpose: the browser
+    // fetches it before any login, and it reveals nothing.
+    if (p === '/icon.png' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
+      return res.end(ICON_PNG);
+    }
+    // Login: exchange the access token for a long-lived cookie.
+    if (p === '/api/login' && req.method === 'POST') {
+      const { token } = await readBody(req);
+      if (!config.accessToken || token === config.accessToken) {
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'set-cookie': `sa_access=${config.accessToken}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`,
+        });
+        return res.end(JSON.stringify({ ok: true }));
+      }
+      return json(res, 403, { error: 'wrong access token' });
+    }
+    if (!hasAccess(req)) {
+      if (p.startsWith('/api/')) return json(res, 401, { error: 'access token required', locked: true });
+      // Non-API requests fall through to the static UI, which shows
+      // the lock screen when its first API call answers 401.
+    }
     if (p === '/api/engines' && req.method === 'GET') return json(res, 200, { engines: await engineStatus(), tools: toolCatalog() });
+
+    if (p === '/api/presets' && req.method === 'GET') return json(res, 200, { presets: PRESETS });
+
+    // Providers: keys are write-only. Reads return a masked hint only.
+    if (p === '/api/providers' && req.method === 'GET') {
+      const providers = store.listProviders().map((pr) => ({
+        id: pr.id, label: pr.label, preset: pr.preset || 'custom',
+        baseUrl: pr.baseUrl, model: pr.model,
+        keyHint: mask(safeDecrypt(pr.keyEnc)), hasKey: Boolean(pr.keyEnc),
+        createdAt: pr.createdAt,
+      }));
+      return json(res, 200, { providers });
+    }
+    if (p === '/api/providers' && req.method === 'POST') {
+      const b = await readBody(req);
+      const preset = b.presetId ? getPreset(b.presetId) : null;
+      const baseUrl = String(b.baseUrl || preset?.baseUrl || '').replace(/\/$/, '');
+      const model = String(b.model || preset?.model || '');
+      if (!baseUrl) return json(res, 400, { error: 'baseUrl required' });
+      const provider = store.addProvider({
+        id: store.newId('prov'), label: String(b.label || preset?.label || 'Provider').slice(0, 60),
+        preset: b.presetId || 'custom', baseUrl, model,
+        keyEnc: b.apiKey ? encrypt(String(b.apiKey)) : '',
+        createdAt: new Date().toISOString(),
+      });
+      store.audit({ kind: 'provider_added', provider: provider.id, label: provider.label });
+      return json(res, 201, { provider: { id: provider.id, label: provider.label, baseUrl, model } });
+    }
+    const provMatch = p.match(/^\/api\/providers\/([\w-]+)$/);
+    if (provMatch && req.method === 'DELETE') { store.removeProvider(provMatch[1]); return json(res, 200, { ok: true }); }
+
+    if (p === '/api/audit' && req.method === 'GET') {
+      return json(res, 200, { entries: store.readAudit(Math.min(200, Number(url.searchParams.get('limit') || 100))) });
+    }
 
     if (p === '/api/bots' && req.method === 'GET') return json(res, 200, { bots: store.listBots() });
     if (p === '/api/bots' && req.method === 'POST') {
@@ -104,6 +228,7 @@ const server = http.createServer(async (req, res) => {
       const bot = store.addBot({
         id: store.newId('bot'), name: String(b.name).slice(0, 60),
         engine: String(b.engine || config.defaultEngine), model: String(b.model || ''),
+        providerId: String(b.providerId || ''),
         persona: String(b.persona || ''), createdAt: new Date().toISOString(),
       });
       return json(res, 201, { bot });
@@ -112,7 +237,7 @@ const server = http.createServer(async (req, res) => {
     if (botMatch && req.method === 'PATCH') {
       const b = await readBody(req);
       const patch = {};
-      for (const k of ['name', 'engine', 'model', 'persona']) if (b[k] !== undefined) patch[k] = String(b[k]);
+      for (const k of ['name', 'engine', 'model', 'persona', 'providerId']) if (b[k] !== undefined) patch[k] = String(b[k]);
       const bot = store.updateBot(botMatch[1], patch);
       return bot ? json(res, 200, { bot }) : json(res, 404, { error: 'no such bot' });
     }
@@ -159,11 +284,16 @@ const server = http.createServer(async (req, res) => {
       return res.end(md);
     }
 
-    // Static web UI
+    // Static web UI (+ PWA shell). sw.js, the manifest and the page
+    // itself must revalidate so updates reach installed phones.
     const rel = p === '/' ? 'index.html' : p.slice(1);
     const full = path.join(config.root, 'public', rel);
     if (full.startsWith(path.join(config.root, 'public')) && fs.existsSync(full) && fs.statSync(full).isFile()) {
-      res.writeHead(200, { 'content-type': MIME[path.extname(full)] || 'application/octet-stream' });
+      const noCache = ['index.html', 'sw.js', 'manifest.webmanifest'].includes(rel);
+      res.writeHead(200, {
+        'content-type': MIME[path.extname(full)] || 'application/octet-stream',
+        ...(noCache ? { 'cache-control': 'no-cache' } : {}),
+      });
       return fs.createReadStream(full).pipe(res);
     }
     return json(res, 404, { error: 'not found' });
