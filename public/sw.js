@@ -3,7 +3,7 @@
 // cache only when offline) — a cache-first shell once served an old
 // stylesheet against a new page after an upgrade and blew the layout
 // up. API traffic is never touched: chats and approvals stay live.
-const CACHE = 'starts-agents-v3';
+const CACHE = 'starts-agents-v4';
 const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/i18n.js', '/manifest.webmanifest', '/icon.png', '/complay-c.svg'];
 
 self.addEventListener('install', (e) => {

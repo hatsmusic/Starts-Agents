@@ -497,15 +497,17 @@ const server = http.createServer(async (req, res) => {
       return res.end(md);
     }
 
-    // Static web UI (+ PWA shell). sw.js, the manifest and the page
-    // itself must revalidate so updates reach installed phones.
+    // Static web UI (+ PWA shell). EVERY shell file must revalidate:
+    // app.js / i18n.js / style.css once shipped without a cache header,
+    // and iOS happily served them stale for days (heuristic caching off
+    // Last-Modified) — a fresh index.html wired to an old app.js reads
+    // exactly like "the new buttons do nothing".
     const rel = p === '/' ? 'index.html' : p.slice(1);
     const full = path.join(config.root, 'public', rel);
     if (full.startsWith(path.join(config.root, 'public')) && fs.existsSync(full) && fs.statSync(full).isFile()) {
-      const noCache = ['index.html', 'sw.js', 'manifest.webmanifest'].includes(rel);
       res.writeHead(200, {
         'content-type': MIME[path.extname(full)] || 'application/octet-stream',
-        ...(noCache ? { 'cache-control': 'no-cache' } : {}),
+        'cache-control': 'no-cache',
       });
       return fs.createReadStream(full).pipe(res);
     }
