@@ -1,7 +1,9 @@
-// Starts-Agents service worker: cache the app shell so the installed
-// PWA opens instantly (and offline shows the shell), but NEVER cache
-// API traffic — chats, approvals and transcripts must stay live.
-const CACHE = 'starts-agents-v2';
+// Complay Ai service worker: keep the installed PWA fresh first,
+// cached second. Shell assets are NETWORK-FIRST (falling back to the
+// cache only when offline) — a cache-first shell once served an old
+// stylesheet against a new page after an upgrade and blew the layout
+// up. API traffic is never touched: chats and approvals stay live.
+const CACHE = 'starts-agents-v3';
 const SHELL = ['/', '/index.html', '/style.css', '/app.js', '/i18n.js', '/manifest.webmanifest', '/icon.png', '/complay-c.svg'];
 
 self.addEventListener('install', (e) => {
@@ -19,10 +21,14 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (url.pathname.startsWith('/api/')) return; // live only, never cached
-  if (e.request.mode === 'navigate') {
-    // Page loads: network first (fresh UI), cache as offline fallback.
-    e.respondWith(fetch(e.request).catch(() => caches.match('/index.html')));
-    return;
-  }
-  e.respondWith(caches.match(e.request).then((hit) => hit || fetch(e.request)));
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request)
+      .then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
+        return res;
+      })
+      .catch(() => caches.match(e.request).then((hit) => hit || caches.match('/index.html')))
+  );
 });

@@ -83,7 +83,25 @@ async function chatTurn(bot, userText, emit, lang) {
 
   const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) };
   const engine = getEngine(bot.engine);
-  const gen = engine.run({ bot, history, userText, provider: resolveProvider(bot), lang });
+  const provider = resolveProvider(bot);
+  // A bot on the API engine with no provider configured used to fail
+  // silently (or with a raw error). Say plainly what is missing and how
+  // to fix it, in the UI's language — this is the first thing a new
+  // user hits.
+  if (bot.engine === 'openai' && !provider) {
+    const zh = lang === 'zh' || lang === 'tw';
+    const guide = zh
+      ? `我还没有可用的大脑：还没给我配模型。两个办法，配好后重新发消息就行：\n` +
+        `① 本地模型（不花钱、不连云）：在服务器上跑 scripts/setup-local-model.sh 再重启服务，我会自动接上；\n` +
+        `② 云端 API：点左下「⚙ 模型设置」添加一个供应商（DeepSeek、通义千问等）。`
+      : `I don't have a brain yet — no model is configured for me. Either fix works, then just send your message again:\n` +
+        `1) Local model (free, nothing leaves the server): run scripts/setup-local-model.sh on the server and restart — I'll pick it up automatically.\n` +
+        `2) Cloud API: add a provider under "⚙ Models" (DeepSeek, Qwen, …).`;
+    emit('token', { text: guide });
+    store.pushMessage(bot.id, { role: 'assistant', text: guide, at: new Date().toISOString() });
+    return guide;
+  }
+  const gen = engine.run({ bot, history, userText, provider, lang });
   let assistant = '';
   let next = await gen.next();
   while (!next.done) {

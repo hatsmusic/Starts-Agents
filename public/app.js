@@ -33,6 +33,11 @@ function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
   img.src = '/complay-c.svg';
   img.alt = '';
+  // Dimension attributes are a hard floor: even if a stale cached
+  // stylesheet (old PWA version) has no .bot-av rule, the SVG can
+  // never blow up to its natural 512px and eat the screen.
+  img.setAttribute('width', '44');
+  img.setAttribute('height', '44');
   return img;
 }
 
