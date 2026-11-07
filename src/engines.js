@@ -15,11 +15,11 @@ import { TOOLS } from './tools.js';
 // No key, no network. It reflects the conversation, and proposes tools
 // when you phrase requests plainly:
 //   "list files" / "read notes.txt" / "note buy milk" / "run ls -la"
-async function* echoRun({ bot, history, userText, lang }) {
+async function* echoRun({ bot, history, userText, lang, signal }) {
   const zh = lang === 'zh' || lang === 'tw';
   const say = async function* (text) {
     const words = String(text).split(/(?<=\s)/);
-    for (const w of words) yield { type: 'token', text: w };
+    for (const w of words) { if (signal && signal.aborted) return; yield { type: 'token', text: w }; }
   };
   const t = userText.trim();
   let m;
@@ -122,7 +122,7 @@ function agentProtocol(lang) {
   ].join('\n');
 }
 
-async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images }) {
+async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images, signal }) {
   const baseUrl = provider?.baseUrl || config.ai.baseUrl;
   const apiKey = provider?.apiKey || config.ai.apiKey;
   const model = bot.model || provider?.model || config.ai.model;
@@ -150,12 +150,13 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       ...images.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
     ];
   }
-  const doFetch = () => fetch(baseUrl + '/chat/completions', {
+  const doFetch = () => fetch(baseUrl + '/chat/completions', { signal,
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
     body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true }),
   });
   for (let round = 0; round < 25; round++) {
+    if (signal && signal.aborted) return;
     let res = await doFetch();
     if (!res.ok && visionActive && round === 0) {
       visionActive = false;
@@ -239,12 +240,12 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
 /* ------------- claude-cli: your locally logged-in Claude ------------- */
 // Shells out to the `claude` CLI in print mode. No tool loop in this
 // starter driver — the CLI runs its own tools under its own permissions.
-function claudeCliRun({ bot, history, userText }) {
+function claudeCliRun({ bot, history, userText, signal }) {
   return (async function* () {
     const transcript = history.map((h) => `${h.role}: ${h.content}`).join('\n');
     const prompt = `${bot.persona || ''}\n\nConversation so far:\n${transcript}\n\nuser: ${userText}`;
     const out = await new Promise((resolve, reject) => {
-      execFile('claude', ['-p', prompt, '--output-format', 'text'], { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
+      execFile('claude', ['-p', prompt, '--output-format', 'text'], { timeout: 120_000, maxBuffer: 4 * 1024 * 1024, signal },
         (err, stdout, stderr) => (err ? reject(new Error('claude CLI failed: ' + (stderr || err.message))) : resolve(stdout)));
     });
     yield { type: 'token', text: String(out).trim() };

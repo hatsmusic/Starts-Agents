@@ -9,24 +9,47 @@ import path from 'node:path';
 import { config } from './config.js';
 
 let masterKey = null;
+let keySource = '';
 
 function loadMasterKey() {
   if (masterKey) return masterKey;
   const env = process.env.START_AGENTS_MASTER_KEY || '';
   if (env) {
+    // Environment key wins over the file key — that priority is explicit
+    // (v0.7): rotating means setting the env var; the file stays as the
+    // fallback for zero-config local runs.
     const raw = Buffer.from(env, 'base64');
     masterKey = raw.length === 32 ? raw : crypto.createHash('sha256').update(env).digest();
+    keySource = 'env START_AGENTS_MASTER_KEY';
     return masterKey;
   }
   const keyFile = path.join(config.dataDir, '.vault-key');
   fs.mkdirSync(config.dataDir, { recursive: true });
   try {
-    masterKey = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'base64');
-  } catch {
+    const raw = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'base64');
+    if (raw.length !== 32) {
+      // A corrupt key file must fail loudly at boot — silently minting a
+      // new key would make every stored secret undecryptable mush.
+      throw new Error(`vault key file is corrupt (${raw.length} bytes decoded, expected 32): ${keyFile} — restore it from backup or delete it AND all stored provider keys`);
+    }
+    masterKey = raw;
+    try { // tighten permissions if a copy/restore loosened them
+      if ((fs.statSync(keyFile).mode & 0o077) !== 0) fs.chmodSync(keyFile, 0o600);
+    } catch { /* best effort */ }
+  } catch (e) {
+    if (e && e.message && e.message.includes('corrupt')) throw e;
     masterKey = crypto.randomBytes(32);
     fs.writeFileSync(keyFile, masterKey.toString('base64'), { mode: 0o600 });
   }
+  keySource = 'file data/.vault-key';
   return masterKey;
+}
+
+// Boot-time check (v0.7): load the key once and report its source, so a
+// broken vault is a startup error, not a surprise at first decrypt.
+export function vaultStatus() {
+  loadMasterKey();
+  return { ok: true, source: keySource };
 }
 
 // encrypt(plaintext) -> "v1:<iv>:<tag>:<ciphertext>" (all base64)

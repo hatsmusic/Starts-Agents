@@ -15,13 +15,19 @@ import { parseTeam, exportTeam } from './team.js';
 import { ICON_PNG } from './icon.js';
 import { PRESETS, getPreset } from './presets.js';
 import { LOCAL_MODELS, getLocalModel } from './local-models.js';
-import { encrypt, decrypt, mask } from './vault.js';
+import { encrypt, decrypt, mask, vaultStatus } from './vault.js';
+import { auth, loginGate, loginFail, loginOk } from './auth.js';
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
+const SEC_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+};
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...SEC_HEADERS });
   res.end(body);
 }
 
@@ -116,7 +122,7 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     ...(extras.attachments?.length ? { attachments: extras.attachments } : {}),
   });
 
-  const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) };
+  const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id), signal: extras.signal };
   const engine = getEngine(bot.engine);
   const provider = resolveProvider(bot);
   // A bot on the API engine with no provider configured used to fail
@@ -136,7 +142,7 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     store.pushMessage(bot.id, { role: 'assistant', text: guide, at: new Date().toISOString() });
     return guide;
   }
-  const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace), images: extras.images });
+  const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace), images: extras.images, signal: extras.signal });
   let assistant = '';
   let failStreak = 0;
   let next = await gen.next();
@@ -163,10 +169,12 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
             if (typeof tool.preview === 'function') {
               try { preview = tool.preview(ev.args, ctx); } catch (e) { preview = '⚠ preview failed: ' + e.message; }
             }
+            if (extras.onApprovalWait) extras.onApprovalWait(true);
             const { decision } = await requestApproval({
               botId: bot.id, tool: tool.name, args: ev.args, preview,
               onCard: (card) => emit('approval', card),
             });
+            if (extras.onApprovalWait) extras.onApprovalWait(false);
             store.audit({ bot: bot.id, kind: 'approval', tool: tool.name, decision });
             if (decision === 'allow_session') {
               sessionGrants.add(bot.id + ':' + tool.name);
@@ -180,11 +188,12 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
           result = 'The user denied this action. Do not retry it; continue without it or ask what they prefer.';
           emit('tool_result', { name: tool.name, ok: false, result });
         } else {
+          const t0 = Date.now();
           try { result = String(await tool.run(ev.args, ctx)); }
           catch (e) { result = 'Error: ' + e.message; }
           const ok = !result.startsWith('Error');
           store.audit({ bot: bot.id, kind: 'tool', tool: tool.name, ok, args: summarizeArgs(ev.args) });
-          emit('tool_result', { name: tool.name, ok, result: result.slice(0, 2000) });
+          emit('tool_result', { name: tool.name, ok, ms: Date.now() - t0, result: result.slice(0, 2000) });
           if (tool.name === 'package_project' && ok) {
             try {
               const pkg = JSON.parse(result);
@@ -228,11 +237,101 @@ function summarizeArgs(args) {
   return out;
 }
 
-/* --------------------- access gate (public use) ------------------- */
-function hasAccess(req) {
-  if (!config.accessToken) return true; // localhost-only mode, no gate
-  const cookie = String(req.headers.cookie || '');
-  return cookie.split(';').some((c) => c.trim() === 'sa_access=' + config.accessToken);
+/* ------------------ accounts, sessions, access gate ------------------
+ * v0.7: the shared access token is replaced by per-person accounts
+ * (src/auth.js). Sessions are server-side and revocable; logout works.
+ * Migration path: while START_AGENTS_ACCESS_TOKEN is still set, the old
+ * token (and old sa_access cookies) count as the owner — unset the env
+ * var once everyone has an account and the token path closes for good.
+ * With neither accounts nor a token, the instance is in open local
+ * mode (localhost-only) and the caller is the implicit owner. */
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+function currentUser(req) {
+  if (!auth.hasUsers() && !config.accessToken) return { id: 'local', name: 'Local', role: 'owner', implicit: true };
+  const cookies = parseCookies(req);
+  const u = cookies.sa_session ? auth.sessionUser(cookies.sa_session) : null;
+  if (u) return u;
+  if (config.accessToken && cookies.sa_access === config.accessToken) {
+    return { id: 'token', name: 'Owner', role: 'owner', legacy: true };
+  }
+  return null;
+}
+function isHttps(req) {
+  return Boolean(req.socket.encrypted) || req.headers['x-forwarded-proto'] === 'https';
+}
+function sessionCookie(req, sid) {
+  return `sa_session=${sid}; Path=/; Max-Age=${30 * 24 * 3600}; HttpOnly; SameSite=Lax${isHttps(req) ? '; Secure' : ''}`;
+}
+
+/* --------------- run registry & task history (v0.7) ---------------
+ * liveRuns tracks the turn executing right now per bot (status +
+ * AbortController for the Stop button). runHistory persists every
+ * turn (data/runs.json, newest first, capped) for the Task Center;
+ * entries still marked 'running' at boot were cut off by a restart
+ * and are honestly relabelled 'interrupted'. */
+const liveRuns = new Map();
+const RUNS_FILE = path.join(config.dataDir, 'runs.json');
+let runHistory = [];
+try { runHistory = JSON.parse(fs.readFileSync(RUNS_FILE, 'utf8')); if (!Array.isArray(runHistory)) runHistory = []; } catch { runHistory = []; }
+{
+  let swept = false;
+  for (const r of runHistory) if (r.status === 'running') { r.status = 'interrupted'; r.endedAt = Date.now(); swept = true; }
+  if (swept) saveRuns();
+}
+function saveRuns() {
+  try {
+    fs.mkdirSync(config.dataDir, { recursive: true });
+    const tmp = RUNS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(runHistory.slice(0, 200)), { mode: 0o600 });
+    fs.renameSync(tmp, RUNS_FILE);
+  } catch { /* history is best-effort */ }
+}
+function startRun(bot, title) {
+  const run = {
+    id: 'run_' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36),
+    botId: bot.id, botName: bot.name, title: String(title || '').slice(0, 120),
+    prompt: String(title || '').slice(0, 2000),
+    startedAt: Date.now(), endedAt: null, status: 'running', error: null,
+  };
+  runHistory.unshift(run);
+  if (runHistory.length > 200) runHistory.length = 200;
+  saveRuns();
+  return run;
+}
+function endRun(run, status, error) {
+  run.status = status;
+  run.endedAt = Date.now();
+  if (error) run.error = String(error).slice(0, 300);
+  saveRuns();
+}
+/* A bot's honest status, derived from live state — never decoration:
+ * running/awaiting come from the registry; 'offline' means the bot
+ * cannot answer at all (API engine with no provider, or its engine
+ * binary is missing); otherwise it is idle and ready. */
+const engineAvailCache = { at: 0, map: {} };
+async function botStatus(bot) {
+  const live = liveRuns.get(bot.id);
+  if (live) return live.status;
+  if (bot.engine === 'openai' && !resolveProvider(bot)) return 'offline';
+  if (Date.now() - engineAvailCache.at > 30_000) {
+    engineAvailCache.at = Date.now();
+    for (const e of await engineStatus()) engineAvailCache.map[e.id] = e.available;
+  }
+  if (engineAvailCache.map[bot.engine] === false) return 'offline';
+  return 'idle';
+}
+function botLastActive(bot) {
+  const msgs = store.getMessages(bot.id);
+  const last = msgs[msgs.length - 1];
+  const lastRun = runHistory.find((r) => r.botId === bot.id);
+  return Math.max(last?.at ? Date.parse(last.at) || 0 : 0, lastRun?.endedAt || lastRun?.startedAt || 0) || null;
 }
 
 /* --------------------- local models (Ollama) --------------------- */
@@ -345,22 +444,121 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
       return res.end(ICON_PNG);
     }
-    // Login: exchange the access token for a long-lived cookie.
-    if (p === '/api/login' && req.method === 'POST') {
+    /* ------------------------- auth (v0.7) ------------------------- */
+    const user = currentUser(req);
+    const clientIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    if (p === '/api/auth/state' && req.method === 'GET') {
+      return json(res, 200, {
+        open: !auth.hasUsers() && !config.accessToken,
+        hasUsers: auth.hasUsers(),
+        tokenEnabled: Boolean(config.accessToken),
+        user: user ? { name: user.name, role: user.role, legacy: Boolean(user.legacy) } : null,
+      });
+    }
+    if (p === '/api/auth/register' && req.method === 'POST') {
+      if (auth.hasUsers()) return json(res, 403, { error: 'accounts already exist — the owner adds new accounts in Settings' });
+      const b = await readBody(req);
+      try {
+        const u = auth.registerFirst(b.name, b.password);
+        const sid = auth.createSession(u);
+        store.audit({ kind: 'auth_register', user: u.name });
+        res.writeHead(201, { 'content-type': 'application/json', 'set-cookie': sessionCookie(req, sid), ...SEC_HEADERS });
+        return res.end(JSON.stringify({ ok: true, user: { name: u.name, role: u.role } }));
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/auth/login' && req.method === 'POST') {
+      const b = await readBody(req);
+      const key = clientIp + '|' + String(b.name || '').toLowerCase();
+      const lockedFor = loginGate(key);
+      if (lockedFor > 0) return json(res, 429, { error: `too many failed attempts — try again in ${Math.ceil(lockedFor / 60)} min`, retryAfter: lockedFor });
+      // legacy token sign-in (migration fallback): presented as the owner
+      if (b.token && config.accessToken && b.token === config.accessToken) {
+        const sid = auth.createSession({ id: 'token', name: 'Owner', role: 'owner' });
+        loginOk(key);
+        store.audit({ kind: 'auth_login', user: 'Owner (token)' });
+        res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': sessionCookie(req, sid), ...SEC_HEADERS });
+        return res.end(JSON.stringify({ ok: true, user: { name: 'Owner', role: 'owner', legacy: true } }));
+      }
+      const u = b.name && b.password ? auth.verify(b.name, b.password) : null;
+      if (!u) {
+        loginFail(key);
+        store.audit({ kind: 'auth_login_fail', user: String(b.name || '').slice(0, 40) });
+        return json(res, 401, { error: 'wrong name or password' });
+      }
+      loginOk(key);
+      const sid = auth.createSession(u);
+      store.audit({ kind: 'auth_login', user: u.name });
+      res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': sessionCookie(req, sid), ...SEC_HEADERS });
+      return res.end(JSON.stringify({ ok: true, user: { name: u.name, role: u.role } }));
+    }
+    if (p === '/api/login' && req.method === 'POST') { // legacy shim (pre-v0.7 clients)
       const { token } = await readBody(req);
       if (!config.accessToken || token === config.accessToken) {
-        res.writeHead(200, {
-          'content-type': 'application/json',
-          'set-cookie': `sa_access=${config.accessToken}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`,
-        });
+        res.writeHead(200, { 'content-type': 'application/json', ...SEC_HEADERS,
+          'set-cookie': `sa_access=${config.accessToken}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${isHttps(req) ? '; Secure' : ''}` });
         return res.end(JSON.stringify({ ok: true }));
       }
       return json(res, 403, { error: 'wrong access token' });
     }
-    if (!hasAccess(req)) {
-      if (p.startsWith('/api/')) return json(res, 401, { error: 'access token required', locked: true });
+    if (p === '/api/auth/logout' && req.method === 'POST') {
+      auth.revoke(parseCookies(req).sa_session);
+      res.writeHead(200, {
+        'content-type': 'application/json', ...SEC_HEADERS,
+        'set-cookie': ['sa_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax', 'sa_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax'],
+      });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (!user) {
+      if (p.startsWith('/api/')) return json(res, 401, { error: 'login required', locked: true });
       // Non-API requests fall through to the static UI, which shows
-      // the lock screen when its first API call answers 401.
+      // the login screen when its first API call answers 401.
+    }
+    const needOwner = () => user.role === 'owner';
+    /* account management — owner only */
+    if (p === '/api/auth/users' && req.method === 'GET') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
+      return json(res, 200, { users: auth.listUsers(), me: { name: user.name, role: user.role } });
+    }
+    if (p === '/api/auth/users' && req.method === 'POST') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
+      const b = await readBody(req);
+      try {
+        const u = auth.createUser(b.name, b.password, b.role);
+        store.audit({ kind: 'auth_user_add', user: u.name, by: user.name });
+        return json(res, 201, { user: u });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    const userDelMatch = p.match(/^\/api\/auth\/users\/([\w-]+)$/);
+    if (userDelMatch && req.method === 'DELETE') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
+      try { auth.deleteUser(userDelMatch[1], user); return json(res, 200, { ok: true }); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    /* volunteer program (v0.7): join/leave is one click, membership
+     * and the future quota tier live on the account itself */
+    if (p === '/api/volunteer' && req.method === 'GET') {
+      const v = user.id && !user.implicit && !user.legacy ? auth.volunteerOf(user.id) : null;
+      return json(res, 200, { joined: Boolean(v), since: v?.since || null, quotaTier: v?.quotaTier || 'standard', members: auth.volunteerCount(), needsAccount: Boolean(user.implicit || user.legacy) });
+    }
+    if (p === '/api/volunteer/join' && req.method === 'POST') {
+      try {
+        const v = auth.setVolunteer(user.id, true);
+        store.audit({ kind: 'volunteer_join', user: user.name });
+        return json(res, 200, { joined: true, since: v.since, quotaTier: v.quotaTier });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/volunteer/leave' && req.method === 'POST') {
+      try {
+        auth.setVolunteer(user.id, false);
+        store.audit({ kind: 'volunteer_leave', user: user.name });
+        return json(res, 200, { joined: false });
+      } catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    if (p === '/api/auth/password' && req.method === 'POST') {
+      if (user.implicit || user.legacy) return json(res, 400, { error: 'this session has no password to change' });
+      const b = await readBody(req);
+      try { auth.changePassword(user.id, b.oldPassword, b.newPassword); return json(res, 200, { ok: true }); }
+      catch (e) { return json(res, 400, { error: e.message }); }
     }
     if (p === '/api/engines' && req.method === 'GET') return json(res, 200, { engines: await engineStatus(), tools: toolCatalog() });
 
@@ -379,6 +577,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (p === '/api/local-models/pull' && req.method === 'POST') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
       const { tag } = await readBody(req);
       if (!getLocalModel(String(tag || ''))) return json(res, 400, { error: 'unknown model tag' });
       if (pullState?.status === 'pulling') return json(res, 409, { error: 'a pull is already running', pull: pullState });
@@ -395,6 +594,7 @@ const server = http.createServer(async (req, res) => {
     }
     const lmDelMatch = p.match(/^\/api\/local-models\/(.+)$/);
     if (lmDelMatch && req.method === 'DELETE') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
       const tag = decodeURIComponent(lmDelMatch[1]);
       try {
         const r = await fetch(OLLAMA_BASE + '/api/delete', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: tag }) });
@@ -420,6 +620,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { providers });
     }
     if (p === '/api/providers' && req.method === 'POST') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
       const b = await readBody(req);
       const preset = b.presetId ? getPreset(b.presetId) : null;
       const baseUrl = String(b.baseUrl || preset?.baseUrl || '').replace(/\/$/, '');
@@ -435,14 +636,24 @@ const server = http.createServer(async (req, res) => {
       return json(res, 201, { provider: { id: provider.id, label: provider.label, baseUrl, model } });
     }
     const provMatch = p.match(/^\/api\/providers\/([\w-]+)$/);
-    if (provMatch && req.method === 'DELETE') { store.removeProvider(provMatch[1]); return json(res, 200, { ok: true }); }
+    if (provMatch && req.method === 'DELETE') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
+      store.removeProvider(provMatch[1]); return json(res, 200, { ok: true });
+    }
 
     if (p === '/api/audit' && req.method === 'GET') {
       return json(res, 200, { entries: store.readAudit(Math.min(200, Number(url.searchParams.get('limit') || 100))) });
     }
 
-    if (p === '/api/bots' && req.method === 'GET') return json(res, 200, { bots: store.listBots().map((b) => ({ ...b, tasks: readBotTasks(b.id) })) });
+    if (p === '/api/bots' && req.method === 'GET') {
+      const bots = [];
+      for (const b of store.listBots()) {
+        bots.push({ ...b, tasks: readBotTasks(b.id), status: await botStatus(b), lastActiveAt: botLastActive(b) });
+      }
+      return json(res, 200, { bots });
+    }
     if (p === '/api/bots' && req.method === 'POST') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
       const b = await readBody(req);
       if (!b.name) return json(res, 400, { error: 'name required' });
       const bot = store.addBot({
@@ -461,7 +672,10 @@ const server = http.createServer(async (req, res) => {
       const bot = store.updateBot(botMatch[1], patch);
       return bot ? json(res, 200, { bot }) : json(res, 404, { error: 'no such bot' });
     }
-    if (botMatch && req.method === 'DELETE') { store.removeBot(botMatch[1]); return json(res, 200, { ok: true }); }
+    if (botMatch && req.method === 'DELETE') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
+      store.removeBot(botMatch[1]); return json(res, 200, { ok: true });
+    }
 
     const msgMatch = p.match(/^\/api\/bots\/([\w-]+)\/messages$/);
     if (msgMatch && req.method === 'GET') {
@@ -489,11 +703,75 @@ const server = http.createServer(async (req, res) => {
           : `[The user attached ${saved.meta.length} file(s), saved in the workspace: ${listing}]`);
         storedText += (storedText ? '\n' : '') + '📎 ' + saved.meta.map((m) => m.name).join(', ');
       }
+      if (liveRuns.has(bot.id)) return json(res, 409, { error: 'this agent is already running a task' });
+      const controller = new AbortController();
+      const run = startRun(bot, storedText);
+      const live = { controller, runId: run.id, status: 'running', since: run.startedAt, title: run.title };
+      liveRuns.set(bot.id, live);
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const emit = (type, data) => { try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ } };
-      try { await chatTurn(bot, modelText, emit, langStr, { images: saved.images, storedText, attachments: saved.meta }); emit('done', {}); }
-      catch (e) { emit('error', { message: e.message || String(e) }); }
+      try {
+        await chatTurn(bot, modelText, emit, langStr, {
+          images: saved.images, storedText, attachments: saved.meta, signal: controller.signal,
+          onApprovalWait: (waiting) => { live.status = waiting ? 'awaiting_approval' : 'running'; },
+        });
+        endRun(run, controller.signal.aborted ? 'cancelled' : 'succeeded');
+        emit('done', { cancelled: controller.signal.aborted });
+      } catch (e) {
+        endRun(run, controller.signal.aborted ? 'cancelled' : 'failed', e.message || String(e));
+        if (controller.signal.aborted) emit('done', { cancelled: true });
+        else emit('error', { message: e.message || String(e) });
+      } finally {
+        liveRuns.delete(bot.id);
+      }
       return res.end();
+    }
+
+    // Stop a running turn: aborts the model stream and kills any
+    // shell process tree the turn spawned (see run_shell in tools.js).
+    const stopMatch = p.match(/^\/api\/bots\/([\w-]+)\/stop$/);
+    if (stopMatch && req.method === 'POST') {
+      const live = liveRuns.get(stopMatch[1]);
+      if (!live) return json(res, 409, { error: 'nothing is running for this agent' });
+      live.controller.abort();
+      store.audit({ bot: stopMatch[1], kind: 'run_stopped', by: user.name });
+      return json(res, 200, { ok: true });
+    }
+
+    // Task Center: live runs + persisted history (real data only).
+    if (p === '/api/tasks' && req.method === 'GET') {
+      const live = [...liveRuns.entries()].map(([botId, l]) => ({
+        botId, runId: l.runId, status: l.status, since: l.since, title: l.title,
+        botName: store.getBot(botId)?.name || botId,
+      }));
+      return json(res, 200, { live, runs: runHistory.slice(0, 60) });
+    }
+
+    // Workspace listing for the Workspace view + roster card stats.
+    const wsMatch = p.match(/^\/api\/bots\/([\w-]+)\/workspace$/);
+    if (wsMatch && req.method === 'GET') {
+      const bot = store.getBot(wsMatch[1]);
+      if (!bot) return json(res, 404, { error: 'no such bot' });
+      const ws = store.workspaceOf(bot.id);
+      fs.mkdirSync(ws, { recursive: true });
+      const realWs = fs.realpathSync(ws);
+      const items = [];
+      let bytes = 0, files = 0;
+      const walkWs = (dir, prefix, depth) => {
+        if (depth > 6 || items.length >= 400) return;
+        for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (items.length >= 400) return;
+          const full = path.join(dir, d.name);
+          const rel = prefix + d.name;
+          if (d.isDirectory()) { items.push({ path: rel + '/', dir: true, size: 0 }); walkWs(full, rel + '/', depth + 1); continue; }
+          let st; try { st = fs.statSync(full); } catch { continue; }
+          try { const real = fs.realpathSync(full); if (real !== realWs && !real.startsWith(realWs + path.sep)) continue; } catch { continue; }
+          items.push({ path: rel, dir: false, size: st.size });
+          bytes += st.size; files += 1;
+        }
+      };
+      walkWs(ws, '', 0);
+      return json(res, 200, { files, bytes, items });
     }
 
     // Serve a file from a bot's workspace (uploaded media shown in the
@@ -504,7 +782,13 @@ const server = http.createServer(async (req, res) => {
       if (!bot) return json(res, 404, { error: 'no such bot' });
       const ws = store.workspaceOf(bot.id);
       const full = path.resolve(ws, decodeURIComponent(fileMatch[2]));
-      if (!full.startsWith(ws + path.sep) || !fs.existsSync(full) || !fs.statSync(full).isFile()) return json(res, 404, { error: 'not found' });
+      let realOk = false;
+      try {
+        const realWs = fs.realpathSync(ws);
+        const real = fs.realpathSync(full);
+        realOk = real.startsWith(realWs + path.sep);
+      } catch { realOk = false; }
+      if (!realOk || !fs.existsSync(full) || !fs.statSync(full).isFile()) return json(res, 404, { error: 'not found' });
       const extraMime = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.pdf': 'application/pdf', '.zip': 'application/zip', '.md': 'text/markdown; charset=utf-8', '.csv': 'text/csv; charset=utf-8', '.webp': 'image/webp', '.gif': 'image/gif' };
       res.writeHead(200, { 'content-type': extraMime[path.extname(full).toLowerCase()] || MIME[path.extname(full)] || 'application/octet-stream', 'cache-control': 'no-cache' });
       return fs.createReadStream(full).pipe(res);
@@ -543,6 +827,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/approvals' && req.method === 'GET') return json(res, 200, { pending: listPending() });
 
     if (p === '/api/teams/import' && req.method === 'POST') {
+      if (!needOwner()) return json(res, 403, { error: 'owner only' });
       const { markdown } = await readBody(req);
       const team = parseTeam(markdown);
       const created = team.bots.map((b) => store.addBot({
@@ -567,7 +852,7 @@ const server = http.createServer(async (req, res) => {
     if (full.startsWith(path.join(config.root, 'public')) && fs.existsSync(full) && fs.statSync(full).isFile()) {
       res.writeHead(200, {
         'content-type': MIME[path.extname(full)] || 'application/octet-stream',
-        'cache-control': 'no-cache',
+        'cache-control': 'no-cache', ...SEC_HEADERS,
       });
       return fs.createReadStream(full).pipe(res);
     }
@@ -577,6 +862,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+try {
+  const v = vaultStatus();
+  console.log(`Vault OK (master key: ${v.source})`);
+} catch (e) {
+  console.error('Vault check failed: ' + e.message);
+  process.exit(1);
+}
 seed();
 server.listen(config.port, config.host, () => {
   console.log(`Starts-Agents harness on http://${config.host}:${config.port}  (data: ${config.dataDir})`);

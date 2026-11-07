@@ -1,13 +1,15 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
 // UI language: 15 languages via ./i18n.js, choice saved on this device.
-import { LANGS, getLang, makeT } from './i18n.js?v=61';
+import { LANGS, getLang, makeT } from './i18n.js?v=70';
 
 const $ = (s) => document.querySelector(s);
 const state = {
   bots: [], engines: [], providers: [], presets: [],
   current: null, editing: null, busy: false,
   lang: getLang(),
+  view: 'team', filter: 'all', query: '',
+  auth: null, wsBot: null, wsCache: {}, lastPrompt: '',
 };
 let t = makeT(state.lang);
 
@@ -31,7 +33,7 @@ function el(tag, cls, text) {
 
 function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
-  img.src = '/complay-c.svg?v=61';
+  img.src = '/complay-c.svg?v=70';
   img.alt = '';
   // Dimension attributes are a hard floor: even if a stale cached
   // stylesheet (old PWA version) has no .bot-av rule, the SVG can
@@ -51,6 +53,9 @@ function applyLang() {
   for (const node of document.querySelectorAll('[data-i18n-title]')) node.title = t(node.dataset.i18nTitle);
   renderRoster();
   renderHead();
+  if (state.view === 'tasks') loadTaskCenter().catch(() => {});
+  if (state.view === 'workspace') loadWorkspace().catch(() => {});
+  if (state.view === 'settings') { loadVolunteer().catch(() => {}); loadAccount().catch(() => {}); }
 }
 
 function buildLangMenu() {
@@ -84,18 +89,33 @@ function fmtDay(at) {
   return sameDay ? hh : `${d.getMonth() + 1}/${d.getDate()} ${hh}`;
 }
 
-/* Roster with swipe-to-reveal actions (the pattern the user knows
- * from the community app): drag a row left and 编辑 / 删除 slide out.
- * Delete is two-step inline (first tap arms it) — no native confirm,
- * which is unreliable inside installed PWAs. */
+/* Roster (v0.7): agent cards in the shape of the approved mockup —
+ * avatar tile, name, role · model line, a status pill fed by the
+ * server's live run registry (never decoration), last-message preview
+ * (2 lines), and time. Swipe-to-reveal edit/delete stays, because
+ * destructive actions should not live ONLY behind a gesture, the card
+ * header strip in chat also carries an edit button. Search + status
+ * filter chips narrow the list client-side. */
 let closeOpenSwipe = () => {};
+const STATUS_ORDER = { running: 0, awaiting_approval: 1, idle: 2, offline: 3 };
 function renderRoster() {
   const list = $('#botList');
   if (!list) return;
   list.innerHTML = '';
   closeOpenSwipe = () => {};
-  for (const bot of state.bots) {
-    const item = el('div', 'bot-item' + (state.current === bot.id ? ' on' : ''));
+  const q = state.query.trim().toLowerCase();
+  const bots = state.bots
+    .filter((b) => (state.filter === 'all' || (b.status || 'idle') === state.filter)
+      && (!q || b.name.toLowerCase().includes(q)))
+    .sort((a, b) => (STATUS_ORDER[a.status || 'idle'] - STATUS_ORDER[b.status || 'idle'])
+      || ((b.lastActiveAt || 0) - (a.lastActiveAt || 0)));
+  const online = state.bots.filter((b) => (b.status || 'idle') !== 'offline').length;
+  $('#onlinePill').textContent = `● ${online} ${t('online')} ›`;
+  let idx = 0;
+  for (const bot of bots) {
+    const status = bot.status || 'idle';
+    const item = el('div', 'bot-item botcard st-' + status + (state.current === bot.id ? ' on' : ''));
+    item.style.setProperty('--d', Math.min(idx++, 8) * 50 + 'ms');
     const actions = el('div', 'swipe-actions');
     const editB = el('button', 'sw-act edit', t('editAct'));
     editB.onclick = () => { closeOpenSwipe(); openDialog(bot); };
@@ -120,17 +140,22 @@ function renderRoster() {
     main.append(botAvatar());
     const meta = el('span', 'bot-meta-col');
     const top = el('span', 'bot-top');
-    top.append(el('span', 'n', bot.name), el('span', 'tm', fmtDay(bot.lastMessage?.at)));
+    const pill = el('span', 'pill st-' + status, '● ' + t('st_' + status));
+    top.append(el('span', 'n', bot.name), pill);
+    const prov = bot.providerId ? state.providers.find((p) => p.id === bot.providerId) : null;
+    const roleLine = `${bot.engine}${prov ? ' · ' + prov.label : ''}${bot.model || prov?.model ? ' · ' + (bot.model || prov.model) : ''}`;
     const preview = bot.lastMessage?.text
       ? String(bot.lastMessage.text).replace(/\s+/g, ' ')
-      : `${bot.engine}${bot.model ? ' · ' + bot.model : ''}`;
-    meta.append(top, el('span', 'p', preview));
-    main.append(meta);
+      : roleLine;
+    meta.append(top, el('span', 'role', roleLine),
+      el('span', 'p', preview),
+      el('span', 'tm', fmtDay(bot.lastActiveAt || bot.lastMessage?.at)));
+    main.append(meta, el('span', 'chev', '›'));
     item.append(actions, main);
     list.append(item);
 
     const OPEN_X = -144;
-    let base = 0, startX = 0, startY = 0, dragging = false, swiped = false;
+    let base = 0, startX = null, startY = 0, dragging = false, swiped = false;
     const setX = (x) => { main.style.transform = `translateX(${x}px)`; };
     const close = () => { base = 0; setX(0); item.classList.remove('open'); };
     main.addEventListener('pointerdown', (e) => {
@@ -164,6 +189,23 @@ function renderRoster() {
       selectBot(bot.id);
     };
   }
+  renderWsCard();
+}
+
+/* The workspace card under the roster: the current bot's project,
+ * with real file count / size from the server (cached per bot). */
+async function renderWsCard() {
+  const bot = currentBot();
+  $('#wsName').textContent = bot ? bot.name : '—';
+  if (!bot) { $('#wsMeta').textContent = ''; return; }
+  if (!state.wsCache[bot.id]) {
+    try {
+      const ws = await api('GET', `/api/bots/${bot.id}/workspace`);
+      state.wsCache[bot.id] = ws;
+    } catch { return; }
+  }
+  const ws = state.wsCache[bot.id];
+  if (ws) $('#wsMeta').textContent = t('wsTotals', { files: ws.files, size: fmtSize(ws.bytes) });
 }
 
 async function loadBots() {
@@ -185,9 +227,11 @@ function renderHead() {
   $('#packageBtn').style.visibility = bot ? 'visible' : 'hidden';
 }
 
-async function selectBot(id) {
+async function selectBot(id, enter = true) {
   state.current = id;
-  document.body.classList.add('in-chat');
+  // Hydrating the initial chat (page load) must not slam the mobile
+  // chat pane over the roster + tab bar — entering is for real taps.
+  if (enter) document.body.classList.add('in-chat');
   renderRoster(); renderHead();
   const box = $('#messages');
   box.innerHTML = '';
@@ -215,7 +259,7 @@ function fmtTime(at) {
  * generated afterwards, and code spans/blocks are lifted out before
  * any formatting so their contents stay literal. */
 function renderMd(src) {
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   let text = String(src || '');
   const blocks = [];
   const lift = (html) => { blocks.push(html); return '\u0001' + (blocks.length - 1) + '\u0002'; };
@@ -335,6 +379,9 @@ async function sendChat(text) {
   pendingAtt = [];
   renderAttChips();
   state.busy = true;
+  state.lastPrompt = text;
+  $('#stopBtn').hidden = false;
+  $('#sendBtn').disabled = true;
   addMessage('user', text, undefined, atts.map((a) => ({ name: a.name, mime: a.mime, src: a.dataUrl })));
   const bubble = addMessage('assistant', '');
   try {
@@ -343,6 +390,10 @@ async function sendChat(text) {
       body: JSON.stringify({ text, lang: state.lang, attachments: atts.map((a) => ({ name: a.name, mime: a.mime, data: a.dataUrl.split(',')[1] })) }),
     });
     if (res.status === 401) { showLock(); throw new Error(t('sessExp')); }
+    if (!String(res.headers.get('content-type') || '').includes('text/event-stream')) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -360,23 +411,58 @@ async function sendChat(text) {
         const data = JSON.parse(dataLine.slice(5));
         if (type === 'token') { bubble._raw = (bubble._raw || '') + data.text; bubble.innerHTML = renderMd(bubble._raw); scrollDown(); }
         else if (type === 'tool_pending') addToolChip(data.name, data.args);
+        else if (type === 'tool_result') addToolLog(data);
         else if (type === 'approval') addApprovalCard(data);
         else if (type === 'package') addPackageCard(data);
         else if (type === 'tasks') renderTasks(data.tasks);
-        else if (type === 'error') addMessage('system', '⚠ ' + data.message);
+        else if (type === 'done' && data.cancelled) addMessage('system', t('stoppedNote'));
+        else if (type === 'error') addErrorCard(data.message);
       }
     }
     if (!bubble.textContent) bubble.closest('.msg-row')?.remove();
-    loadBots().catch(() => {}); // refresh roster previews
+    delete state.wsCache[bot.id];
+    loadBots().catch(() => {}); // refresh roster previews + status
   } catch (e) {
-    addMessage('system', '⚠ ' + e.message);
+    if (e.message !== 'locked') addErrorCard(e.message);
   } finally {
     state.busy = false;
+    $('#stopBtn').hidden = true;
+    $('#sendBtn').disabled = false;
   }
+}
+
+/* Tool results used to vanish into the void — now each one lands as a
+ * folded log line under the stream (name, outcome, duration), tap to
+ * expand. Default folded, per the redesign spec. */
+function addToolLog(data) {
+  const d = el('details', 'tool-log' + (data.ok ? '' : ' bad'));
+  const sum = el('summary', '', `🔧 ${data.name} · ${data.ok ? '✓' : '✗'}${data.ms != null ? ' · ' + data.ms + 'ms' : ''}`);
+  d.append(sum, el('pre', '', String(data.result || '').slice(0, 2000)));
+  $('#messages').append(d);
+  scrollDown();
+}
+
+/* Failures get a real card: what happened, plus working Retry (resend
+ * the last prompt) and Copy (clipboard) actions. */
+function addErrorCard(message) {
+  const box = el('div', 'err-card');
+  box.append(el('div', 'err-text', '⚠ ' + message));
+  const row = el('div', 'row');
+  const retry = el('button', 'mini-btn', t('errRetry'));
+  retry.onclick = () => { box.remove(); if (state.lastPrompt) sendChat(state.lastPrompt); };
+  const copy = el('button', 'mini-btn', t('errCopy'));
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(message); copy.textContent = t('errCopied'); } catch { /* clipboard unavailable */ }
+  };
+  row.append(retry, copy);
+  box.append(row);
+  $('#messages').append(box);
+  scrollDown();
 }
 
 function fmtSize(n) {
   if (!n && n !== 0) return '';
+  if (n === 0) return '0 KB';
   return n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
 }
 
@@ -500,7 +586,12 @@ async function loadLocalModels() {
   }
   const zhUi = state.lang === 'zh' || state.lang === 'tw';
   const pulling = data.pull?.status === 'pulling';
+  let lastCat = '';
   for (const m of data.catalog) {
+    if (m.cat && m.cat !== lastCat) {
+      lastCat = m.cat;
+      box.append(el('div', 'lm-cat', t('lmCat_' + m.cat)));
+    }
     const installed = data.installed.includes(m.tag);
     const isCurrent = data.current === m.tag;
     const isPullingThis = pulling && data.pull.tag === m.tag;
@@ -543,7 +634,7 @@ async function loadLocalModels() {
     box.append(row);
   }
   clearTimeout(lmPollTimer);
-  if (pulling && $('#settingsDialog').open) {
+  if (pulling && state.view === 'settings') {
     lmPollTimer = setTimeout(loadLocalModels, 2500);
   }
 }
@@ -568,7 +659,7 @@ function fillPreset() {
   if (!$('#pLabel').value) $('#pLabel').value = preset.label;
 }
 
-async function openSettings() {
+async function fillSettings() {
   if (!state.presets.length) {
     const { presets } = await api('GET', '/api/presets');
     state.presets = presets;
@@ -581,25 +672,211 @@ async function openSettings() {
   await loadProviders();
   await loadLocalModels().catch(() => {});
   await loadAudit();
-  $('#settingsDialog').showModal();
+  await loadAccount().catch(() => {});
+  await loadVolunteer().catch(() => {});
+}
+
+/* --------------------- account & volunteers --------------------- */
+async function loadAccount() {
+  const st = await (await fetch('/api/auth/state')).json();
+  state.auth = st;
+  const me = $('#meInfo');
+  me.innerHTML = '';
+  if (st.user) {
+    me.append(el('div', '', t('meLine', { name: st.user.name, role: t(st.user.role === 'owner' ? 'roleOwner' : 'roleMember') })));
+    if (st.user.legacy) me.append(el('div', 'lm-err', t('legacyNote')));
+  }
+  $('#pwForm').style.display = st.user && !st.user.legacy ? '' : 'none';
+  const box = $('#usersBox');
+  if (st.user?.role !== 'owner') { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const { users } = await api('GET', '/api/auth/users');
+  const list = $('#userList');
+  list.innerHTML = '';
+  for (const u of users) {
+    const row = el('div', 'provider-row');
+    const info = el('div');
+    info.append(
+      el('div', 'pv-name', u.name + (u.volunteerSince ? ' 🤝' : '')),
+      el('div', 'pv-meta', `${t(u.role === 'owner' ? 'roleOwner' : 'roleMember')} · ${new Date(u.createdAt).toLocaleDateString()}${u.volunteerSince ? ' · ' + t('volBadge') : ''}`)
+    );
+    row.append(info);
+    if (u.name !== st.user.name) {
+      const del = el('button', 'mini-btn danger-text', t('del'));
+      del.onclick = async () => { await api('DELETE', `/api/auth/users/${u.id}`); loadAccount(); };
+      row.append(del);
+    }
+    list.append(row);
+  }
+}
+
+async function loadVolunteer() {
+  const v = await api('GET', '/api/volunteer');
+  const box = $('#volState');
+  box.textContent = v.needsAccount ? t('volNeedAcct')
+    : v.joined ? t('volJoined', { date: new Date(v.since).toLocaleDateString() })
+    : t('volNot', { n: v.members });
+  $('#volJoinBtn').hidden = v.joined || v.needsAccount;
+  $('#volLeaveBtn').hidden = !v.joined;
+}
+
+/* --------------------------- views --------------------------- */
+function switchView(v) {
+  state.view = v;
+  document.body.dataset.view = v;
+  for (const sec of document.querySelectorAll('#roster .view')) sec.hidden = sec.id !== 'view-' + v;
+  for (const tab of document.querySelectorAll('#tabbar .tab')) tab.classList.toggle('on', tab.dataset.view === v);
+  if (v === 'tasks') loadTaskCenter().catch(() => {});
+  if (v === 'workspace') loadWorkspace().catch(() => {});
+  if (v === 'settings') fillSettings().catch(() => {});
+}
+
+/* Task Center: live runs merged over the persisted history, grouped
+ * by state. Every action is real: Stop hits the abort endpoint,
+ * Retry reopens the bot's chat and resends the original prompt. */
+function fmtDur(ms) {
+  if (ms == null || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's';
+}
+async function loadTaskCenter() {
+  const data = await api('GET', '/api/tasks');
+  const wrap = $('#taskGroups');
+  wrap.innerHTML = '';
+  const liveByRun = new Map(data.live.map((l) => [l.runId, l]));
+  const items = [];
+  for (const l of data.live) items.push({ ...l, startedAt: l.since, endedAt: null, status: l.status, live: true });
+  for (const r of data.runs) if (!liveByRun.has(r.id)) items.push(r);
+  const groups = [
+    ['running', 'st_running', items.filter((x) => x.status === 'running')],
+    ['awaiting_approval', 'st_awaiting_approval', items.filter((x) => x.status === 'awaiting_approval')],
+    ['succeeded', 'tg_done', items.filter((x) => x.status === 'succeeded')],
+    ['failed', 'tg_failed', items.filter((x) => x.status === 'failed' || x.status === 'interrupted')],
+    ['cancelled', 'tg_cancelled', items.filter((x) => x.status === 'cancelled')],
+  ];
+  if (!items.length) wrap.append(el('p', 'set-hint', t('noTasks')));
+  for (const [key, label, rows] of groups) {
+    if (!rows.length) continue;
+    wrap.append(el('div', 'lm-cat', t(label) + ` · ${rows.length}`));
+    for (const r of rows.slice(0, 20)) {
+      const row = el('div', 'taskc-row');
+      const info = el('div', 'taskc-info');
+      info.append(
+        el('div', 'taskc-title', r.title || '(…)'),
+        el('div', 'pv-meta', `${r.botName} · ${fmtDay(r.startedAt)} · ${fmtDur((r.endedAt || Date.now()) - r.startedAt)}${r.error ? ' · ' + r.error : ''}`)
+      );
+      const pillKey = { running: 'st_running', awaiting_approval: 'st_awaiting_approval', succeeded: 'tg_done', failed: 'tg_failed', interrupted: 'tg_failed', cancelled: 'tg_cancelled' }[r.status] || 'st_idle';
+      const pillCls = { succeeded: 'ok', failed: 'bad', interrupted: 'bad', cancelled: 'mut' }[r.status] || r.status;
+      row.append(info, el('span', 'pill stp-' + pillCls, '● ' + t(pillKey)));
+      const acts = el('div', 'lm-actions');
+      if (r.live) {
+        const stop = el('button', 'mini-btn danger-text', t('tStop'));
+        stop.onclick = async () => { await api('POST', `/api/bots/${r.botId}/stop`); loadTaskCenter(); loadBots(); };
+        acts.append(stop);
+      } else if (r.status !== 'succeeded') {
+        const retry = el('button', 'mini-btn', t('tRetry'));
+        retry.onclick = async () => {
+          await selectBot(r.botId);
+          if (r.prompt) sendChat(r.prompt);
+        };
+        acts.append(retry);
+      }
+      const view = el('button', 'mini-btn', t('tView'));
+      view.onclick = () => selectBot(r.botId);
+      acts.append(view);
+      row.append(acts);
+      wrap.append(row);
+    }
+  }
+}
+
+/* Workspace view: real file listing of the chosen bot's project. */
+async function loadWorkspace() {
+  const botId = state.wsBot || state.current;
+  const chips = $('#wsBotChips');
+  chips.innerHTML = '';
+  for (const b of state.bots) {
+    const c = el('button', 'chip' + (b.id === botId ? ' on' : ''), b.name);
+    c.onclick = () => { state.wsBot = b.id; loadWorkspace(); };
+    chips.append(c);
+  }
+  if (!botId) return;
+  const ws = await api('GET', `/api/bots/${botId}/workspace`);
+  state.wsCache[botId] = ws;
+  renderWsCard();
+  $('#wsTotals').textContent = t('wsTotals', { files: ws.files, size: fmtSize(ws.bytes) });
+  const listEl = $('#wsFiles');
+  listEl.innerHTML = '';
+  if (!ws.items.length) listEl.append(el('p', 'set-hint', t('wsEmpty')));
+  for (const it of ws.items) {
+    const row = el('div', 'ws-row');
+    row.append(el('span', 'ws-fname', (it.dir ? '📁 ' : '📄 ') + it.path));
+    if (!it.dir) {
+      row.append(el('span', 'pv-meta', fmtSize(it.size)));
+      const dl = el('button', 'mini-btn', '⬇');
+      dl.onclick = () => downloadFile(`/api/bots/${botId}/files/${encodeURI(it.path)}`, it.path.split('/').pop());
+      row.append(dl);
+    }
+    listEl.append(row);
+  }
 }
 
 /* --------------------------- lock --------------------------- */
-function showLock() { $('#lockScreen').hidden = false; }
+/* v0.7: the lock screen is an account sign-in. Three modes, driven by
+ * /api/auth/state: setup (no accounts yet -> create the admin),
+ * login (name + password), token (legacy fallback while the server
+ * still has START_AGENTS_ACCESS_TOKEN set). */
+let lockMode = 'login';
+async function showLock() {
+  $('#lockScreen').hidden = false;
+  try {
+    const st = await (await fetch('/api/auth/state')).json();
+    state.auth = st;
+    lockMode = st.hasUsers ? 'login' : 'setup'; // zero accounts -> setup is always offered (server gates it to the first account)
+    paintLock(st);
+  } catch { /* keep defaults */ }
+}
+function paintLock(st) {
+  const setup = lockMode === 'setup';
+  const token = lockMode === 'token';
+  $('#lockHint').textContent = setup ? t('setupHint') : t('lockHintAcct');
+  $('#lockSubmit').textContent = setup ? t('createAcct') : t('loginBtn');
+  $('#lockName').hidden = token;
+  $('#lockPass').hidden = token;
+  $('#lockToken').hidden = !token;
+  const alt = $('#lockAlt');
+  if (st?.tokenEnabled && !token) {
+    alt.hidden = false;
+    alt.textContent = t('lockUseToken');
+  } else if (token) {
+    alt.hidden = false;
+    alt.textContent = t('lockUseAcct');
+  } else alt.hidden = true;
+}
 function hideLock() { $('#lockScreen').hidden = true; }
+$('#lockAlt').addEventListener('click', () => {
+  lockMode = lockMode === 'token' ? (state.auth?.hasUsers ? 'login' : 'setup') : 'token';
+  $('#lockError').textContent = '';
+  paintLock(state.auth);
+});
 $('#lockForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   $('#lockError').textContent = '';
   try {
-    const res = await fetch('/api/login', {
+    const url = lockMode === 'setup' ? '/api/auth/register' : '/api/auth/login';
+    const body = lockMode === 'token'
+      ? { token: $('#lockToken').value }
+      : { name: $('#lockName').value, password: $('#lockPass').value };
+    const res = await fetch(url, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: $('#lockToken').value }),
+      body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error('bad');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'bad');
     hideLock();
     location.reload();
-  } catch {
-    $('#lockError').textContent = t('lockErr');
+  } catch (e) {
+    $('#lockError').textContent = e.message && e.message !== 'bad' ? e.message : t('lockErr');
   }
 });
 $('#backBtn').addEventListener('click', () => document.body.classList.remove('in-chat'));
@@ -617,7 +894,7 @@ async function init() {
   state.engines = engines;
   await loadProviders().catch(() => {});
   await loadBots();
-  if (state.current) selectBot(state.current);
+  if (state.current) selectBot(state.current, false);
 
   $('#composer').addEventListener('submit', (ev) => {
     ev.preventDefault();
@@ -675,8 +952,62 @@ async function init() {
     await loadBots();
     if (state.current) selectBot(state.current); else { $('#messages').innerHTML = ''; renderHead(); }
   };
-  $('#settingsBtn').onclick = () => openSettings().catch((e) => addMessage('system', '⚠ ' + e.message));
-  $('#settingsClose').onclick = () => $('#settingsDialog').close();
+  /* v0.7 shell wiring: tab views, search/filter, quick actions */
+  for (const tab of document.querySelectorAll('#tabbar .tab')) {
+    tab.onclick = () => switchView(tab.dataset.view);
+  }
+  $('#botSearch').addEventListener('input', (ev) => { state.query = ev.target.value; renderRoster(); });
+  for (const chip of document.querySelectorAll('#filterChips .chip')) {
+    chip.onclick = () => {
+      state.filter = chip.dataset.f;
+      for (const c of document.querySelectorAll('#filterChips .chip')) c.classList.toggle('on', c === chip);
+      renderRoster();
+    };
+  }
+  $('#onlinePill').onclick = () => switchView('tasks');
+  $('#wsOpen').onclick = () => { state.wsBot = state.current; switchView('workspace'); };
+  $('#qaNew').onclick = () => {
+    if (state.current) { selectBot(state.current); $('#input').focus(); }
+    else openDialog(null);
+  };
+  $('#qaTeam').onclick = () => { switchView('settings'); setTimeout(() => $('#teamSection')?.scrollIntoView({ behavior: 'smooth' }), 60); };
+  $('#qaImport').onclick = () => $('#importFile').click();
+  $('#qaTasks').onclick = () => switchView('tasks');
+  $('#tasksRefresh').onclick = () => loadTaskCenter().catch(() => {});
+  $('#wsRefresh').onclick = () => { delete state.wsCache[state.wsBot || state.current]; loadWorkspace().catch(() => {}); };
+  $('#stopBtn').onclick = async () => {
+    const bot = currentBot();
+    if (bot) await api('POST', `/api/bots/${bot.id}/stop`).catch(() => {});
+  };
+  $('#pwForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      await api('POST', '/api/auth/password', { oldPassword: $('#pwOld').value, newPassword: $('#pwNew').value });
+      $('#pwMsg').textContent = t('pwOk');
+      $('#pwOld').value = ''; $('#pwNew').value = '';
+    } catch (e) { $('#pwMsg').textContent = '⚠ ' + e.message; }
+  });
+  $('#userForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      await api('POST', '/api/auth/users', { name: $('#uName').value, password: $('#uPass').value, role: $('#uRole').value });
+      $('#uName').value = ''; $('#uPass').value = '';
+      loadAccount();
+    } catch (e) { addMessage('system', '⚠ ' + e.message); }
+  });
+  $('#logoutBtn').onclick = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    location.reload();
+  };
+  $('#volJoinBtn').onclick = async () => { await api('POST', '/api/volunteer/join'); loadVolunteer(); loadAccount(); };
+  $('#volLeaveBtn').onclick = async () => { await api('POST', '/api/volunteer/leave'); loadVolunteer(); loadAccount(); };
+  /* keep status pills honest: quiet refresh while browsing the team
+   * or task views (never while a chat turn is streaming) */
+  setInterval(() => {
+    if (document.hidden || state.busy) return;
+    if (state.view === 'team') loadBots().catch(() => {});
+    if (state.view === 'tasks') loadTaskCenter().catch(() => {});
+  }, 6000);
   $('#providerForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     await api('POST', '/api/providers', {

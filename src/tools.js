@@ -8,7 +8,7 @@
 // Add your own by appending to TOOLS — one object is the whole contract.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { makeZip } from './zip.js';
 
 function inWorkspace(ctx, rel) {
@@ -16,6 +16,27 @@ function inWorkspace(ctx, rel) {
   const full = path.resolve(base, String(rel || '.'));
   if (full !== base && !full.startsWith(base + path.sep)) {
     throw new Error('path escapes the workspace: ' + rel);
+  }
+  // Symlink defence (v0.7): the lexical check above is not enough — a
+  // symlink inside the workspace can point outside it. Resolve the real
+  // path of the target (or of its nearest existing ancestor, for files
+  // about to be created) and require THAT to stay inside too.
+  let realBase = base;
+  try { realBase = fs.realpathSync(base); } catch { /* workspace not created yet */ }
+  let probe = full;
+  while (true) {
+    try {
+      const real = fs.realpathSync(probe);
+      if (real !== realBase && !real.startsWith(realBase + path.sep)) {
+        throw new Error('path escapes the workspace (symlink): ' + rel);
+      }
+      break;
+    } catch (e) {
+      if (e && e.message && e.message.includes('symlink')) throw e;
+      const parent = path.dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+    }
   }
   return full;
 }
@@ -50,6 +71,11 @@ export function buildPackage(ctx, name) {
       if (d.isDirectory() && SKIP_DIRS.has(d.name)) continue;
       const full = path.join(dir, d.name);
       if (d.isDirectory()) { collect(full); continue; }
+      // never package a symlink that points outside the workspace
+      try {
+        const real = fs.realpathSync(full);
+        if (real !== base && !real.startsWith(base + path.sep)) continue;
+      } catch { continue; }
       const st = fs.statSync(full);
       if (st.size > 20 * 1024 * 1024) continue;
       total += st.size;
@@ -197,11 +223,28 @@ export const TOOLS = [
     async run(args, ctx) {
       ensureWorkspace(ctx);
       return new Promise((resolve) => {
-        execFile('bash', ['-lc', String(args.command || '')], {
-          cwd: ctx.workspace, timeout: 120_000, maxBuffer: 256 * 1024,
-        }, (err, stdout, stderr) => {
-          const out = (stdout || '') + (stderr || '');
-          resolve((err ? `exit ${err.code ?? '?'} — ` : '') + out.slice(0, 6000) || '(no output)');
+        // detached process group so a user Stop can kill the whole tree,
+        // not just the shell (v0.7). Timeout + output cap enforced here.
+        const child = spawn('bash', ['-lc', String(args.command || '')], {
+          cwd: ctx.workspace, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '';
+        const push = (d) => { if (out.length < 256 * 1024) out += d.toString('utf8'); };
+        child.stdout.on('data', push);
+        child.stderr.on('data', push);
+        const killTree = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } } };
+        const timer = setTimeout(killTree, 120_000);
+        const onAbort = () => killTree();
+        if (ctx.signal) {
+          if (ctx.signal.aborted) killTree();
+          else ctx.signal.addEventListener('abort', onAbort, { once: true });
+        }
+        child.on('error', (e) => { clearTimeout(timer); resolve('failed to start: ' + e.message); });
+        child.on('close', (code) => {
+          clearTimeout(timer);
+          if (ctx.signal) ctx.signal.removeEventListener('abort', onAbort);
+          const aborted = ctx.signal && ctx.signal.aborted;
+          resolve((aborted ? 'stopped by user — ' : code ? `exit ${code} — ` : '') + out.slice(0, 6000) || '(no output)');
         });
       });
     },
