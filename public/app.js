@@ -1,7 +1,7 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
 // UI language: 15 languages via ./i18n.js, choice saved on this device.
-import { LANGS, getLang, makeT } from './i18n.js';
+import { LANGS, getLang, makeT } from './i18n.js?v=61';
 
 const $ = (s) => document.querySelector(s);
 const state = {
@@ -31,7 +31,7 @@ function el(tag, cls, text) {
 
 function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
-  img.src = '/complay-c.svg';
+  img.src = '/complay-c.svg?v=61';
   img.alt = '';
   // Dimension attributes are a hard floor: even if a stale cached
   // stylesheet (old PWA version) has no .bot-av rule, the SVG can
@@ -290,7 +290,8 @@ function addApprovalCard(card) {
     }
     box.append(pre);
   } else {
-    box.append(el('pre', '', JSON.stringify(card.args, null, 2)));
+    const raw = JSON.stringify(card.args, null, 2);
+    box.append(el('pre', '', raw.length > 4000 ? raw.slice(0, 4000) + '\n…' : raw));
   }
   const row = el('div', 'row');
   const allow = el('button', 'allow', t('allow'));
@@ -627,7 +628,6 @@ async function init() {
     input.style.height = 'auto';
     sendChat(text);
   });
-  $('#attBtn').onclick = () => $('#attFile').click();
   $('#attFile').addEventListener('change', async (ev) => {
     const files = [...(ev.target.files || [])];
     ev.target.value = '';

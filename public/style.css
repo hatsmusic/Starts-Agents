@@ -22,6 +22,8 @@ button { font: inherit; cursor: pointer; }
 .lock-img { width: 76px; height: 76px; border-radius: 20px; }
 
 /* attachments: pending chips + media inside user bubbles */
+.vh { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+.att-label { display: inline-grid; place-items: center; cursor: pointer; font-size: 17px; flex: 0 0 auto; }
 #attChips { display: flex; gap: 8px; flex-wrap: wrap; padding: 10px 16px 0; }
 #attChips[hidden] { display: none; }
 .att-chip { display: inline-flex; align-items: center; gap: 7px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 6px 4px 4px; max-width: 220px; }
@@ -118,7 +120,7 @@ button { font: inherit; cursor: pointer; }
 
 .approval { align-self: stretch; max-width: 560px; border: 1.5px solid var(--amber); background: rgba(255, 176, 32, .07); border-radius: 16px; padding: 14px 16px; }
 .approval h4 { margin: 0 0 6px; color: var(--amber); font-size: 14px; }
-.approval pre { margin: 6px 0 10px; background: rgba(0,0,0,.35); padding: 10px; border-radius: 10px; overflow-x: auto; font-size: 13px; }
+.approval pre { margin: 6px 0 10px; background: rgba(0,0,0,.35); padding: 10px; border-radius: 10px; overflow-x: auto; overflow-y: auto; max-height: 230px; font-size: 13px; }
 .approval .row { display: flex; gap: 8px; flex-wrap: wrap; }
 .approval button { border-radius: 10px; padding: 8px 16px; border: 1px solid var(--line); background: var(--panel2); color: var(--ink); }
 .approval button.allow { background: var(--ok); border-color: var(--ok); color: #06300f; font-weight: 700; }
