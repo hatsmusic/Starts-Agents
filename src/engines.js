@@ -122,7 +122,7 @@ function agentProtocol(lang) {
   ].join('\n');
 }
 
-async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree }) {
+async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images }) {
   const baseUrl = provider?.baseUrl || config.ai.baseUrl;
   const apiKey = provider?.apiKey || config.ai.apiKey;
   const model = bot.model || provider?.model || config.ai.model;
@@ -139,12 +139,31 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userText },
   ];
+  // Images ride along as OpenAI-style parts when the user attached
+  // any. Text-only models reject that with a 400 — caught below and
+  // downgraded to text (the files are in the workspace either way).
+  let visionActive = Array.isArray(images) && images.length > 0;
+  const userMsg = messages[messages.length - 1];
+  if (visionActive) {
+    userMsg.content = [
+      { type: 'text', text: userText },
+      ...images.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
+    ];
+  }
+  const doFetch = () => fetch(baseUrl + '/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
+    body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true }),
+  });
   for (let round = 0; round < 25; round++) {
-    const res = await fetch(baseUrl + '/chat/completions', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
-      body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true }),
-    });
+    let res = await doFetch();
+    if (!res.ok && visionActive && round === 0) {
+      visionActive = false;
+      userMsg.content = userText + (zh
+        ? '\n[注意：附带的图片没能发送给当前模型（它不支持图片输入），文件已存入工作区 uploads/ 目录。]'
+        : '\n[Note: the attached image(s) could not be sent to this model (it does not accept image input); the files are saved in the workspace under uploads/.]');
+      res = await doFetch();
+    }
     if (!res.ok || !res.body) throw new Error('AI endpoint returned ' + res.status);
     const calls = new Map();
     let content = '';

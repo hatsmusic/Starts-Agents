@@ -84,13 +84,40 @@ function fmtDay(at) {
   return sameDay ? hh : `${d.getMonth() + 1}/${d.getDate()} ${hh}`;
 }
 
+/* Roster with swipe-to-reveal actions (the pattern the user knows
+ * from the community app): drag a row left and 编辑 / 删除 slide out.
+ * Delete is two-step inline (first tap arms it) — no native confirm,
+ * which is unreliable inside installed PWAs. */
+let closeOpenSwipe = () => {};
 function renderRoster() {
   const list = $('#botList');
   if (!list) return;
   list.innerHTML = '';
+  closeOpenSwipe = () => {};
   for (const bot of state.bots) {
-    const btn = el('button', 'bot-item' + (state.current === bot.id ? ' on' : ''));
-    btn.append(botAvatar());
+    const item = el('div', 'bot-item' + (state.current === bot.id ? ' on' : ''));
+    const actions = el('div', 'swipe-actions');
+    const editB = el('button', 'sw-act edit', t('editAct'));
+    editB.onclick = () => { closeOpenSwipe(); openDialog(bot); };
+    const delB = el('button', 'sw-act del', t('del'));
+    let armTimer = null;
+    delB.onclick = async () => {
+      if (!delB.classList.contains('arm')) {
+        delB.classList.add('arm');
+        delB.textContent = t('delConfirm');
+        armTimer = setTimeout(() => { delB.classList.remove('arm'); delB.textContent = t('del'); }, 2600);
+        return;
+      }
+      clearTimeout(armTimer);
+      await api('DELETE', `/api/bots/${bot.id}`);
+      if (state.current === bot.id) state.current = null;
+      await loadBots();
+      if (state.current) selectBot(state.current);
+      else { $('#messages').innerHTML = ''; renderHead(); document.body.classList.remove('in-chat'); }
+    };
+    actions.append(editB, delB);
+    const main = el('div', 'bot-main');
+    main.append(botAvatar());
     const meta = el('span', 'bot-meta-col');
     const top = el('span', 'bot-top');
     top.append(el('span', 'n', bot.name), el('span', 'tm', fmtDay(bot.lastMessage?.at)));
@@ -98,9 +125,44 @@ function renderRoster() {
       ? String(bot.lastMessage.text).replace(/\s+/g, ' ')
       : `${bot.engine}${bot.model ? ' · ' + bot.model : ''}`;
     meta.append(top, el('span', 'p', preview));
-    btn.append(meta);
-    btn.onclick = () => selectBot(bot.id);
-    list.append(btn);
+    main.append(meta);
+    item.append(actions, main);
+    list.append(item);
+
+    const OPEN_X = -144;
+    let base = 0, startX = 0, startY = 0, dragging = false, swiped = false;
+    const setX = (x) => { main.style.transform = `translateX(${x}px)`; };
+    const close = () => { base = 0; setX(0); item.classList.remove('open'); };
+    main.addEventListener('pointerdown', (e) => {
+      if (closeOpenSwipe !== close) closeOpenSwipe();
+      closeOpenSwipe = close;
+      startX = e.clientX; startY = e.clientY; dragging = false;
+    });
+    main.addEventListener('pointermove', (e) => {
+      if (startX === null) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (!dragging && Math.abs(dx) > 9 && Math.abs(dx) > Math.abs(dy)) dragging = true;
+      if (dragging) setX(Math.max(OPEN_X, Math.min(0, base + dx)));
+    });
+    const endDrag = (e) => {
+      if (startX === null) return;
+      const dx = e.clientX - startX;
+      if (dragging) {
+        swiped = true;
+        setTimeout(() => { swiped = false; }, 80);
+        base = (base + dx) < OPEN_X / 2 ? OPEN_X : 0;
+        setX(base);
+        item.classList.toggle('open', base !== 0);
+      }
+      startX = null; dragging = false;
+    };
+    main.addEventListener('pointerup', endDrag);
+    main.addEventListener('pointercancel', endDrag);
+    main.onclick = () => {
+      if (swiped) return;
+      if (item.classList.contains('open')) { close(); return; }
+      selectBot(bot.id);
+    };
   }
 }
 
@@ -130,7 +192,10 @@ async function selectBot(id) {
   const box = $('#messages');
   box.innerHTML = '';
   const { messages } = await api('GET', `/api/bots/${id}/messages`);
-  for (const m of messages) addMessage(m.role, m.text, m.at);
+  for (const m of messages) {
+    const atts = (m.attachments || []).map((a) => ({ name: a.name, mime: a.mime, src: `/api/bots/${id}/files/${encodeURI(a.rel)}` }));
+    addMessage(m.role, m.text, m.at, atts);
+  }
   if (!messages.length) addMessage('system', t('tryHint'));
   renderTasks(currentBot()?.tasks || []);
   scrollDown();
@@ -180,7 +245,7 @@ function renderMd(src) {
   return html.replace(/\u0001(\d+)\u0002/g, (m, i) => blocks[+i]);
 }
 
-function addMessage(role, text, at) {
+function addMessage(role, text, at, attachments) {
   if (role === 'system') {
     const m = el('div', 'msg system', text);
     $('#messages').append(m);
@@ -192,6 +257,15 @@ function addMessage(role, text, at) {
   const col = el('div', 'msg-col');
   const bubble = el('div', 'msg ' + role, role === 'assistant' ? undefined : text);
   if (role === 'assistant') { bubble._raw = text || ''; bubble.innerHTML = renderMd(bubble._raw); }
+  if (attachments?.length) {
+    const media = el('div', 'msg-media');
+    for (const a of attachments) {
+      if (a.mime?.startsWith('image/')) { const img = el('img', 'msg-img'); img.src = a.src; media.append(img); }
+      else if (a.mime?.startsWith('video/')) { const v = el('video', 'msg-video'); v.src = a.src; v.controls = true; media.append(v); }
+      else media.append(el('div', 'msg-file', '📄 ' + a.name));
+    }
+    bubble.append(media);
+  }
   col.append(bubble, el('div', 'msg-time', fmtTime(at)));
   row.append(col);
   $('#messages').append(row);
@@ -232,16 +306,40 @@ function addApprovalCard(card) {
   scrollDown();
 }
 
+/* ------------------------- attachments ------------------------- */
+let pendingAtt = [];
+function renderAttChips() {
+  const box = $('#attChips');
+  if (!box) return;
+  box.innerHTML = '';
+  box.hidden = !pendingAtt.length;
+  pendingAtt.forEach((a, i) => {
+    const chip = el('span', 'att-chip');
+    if (a.mime.startsWith('image/')) { const img = el('img'); img.src = a.dataUrl; chip.append(img); }
+    else chip.append(el('span', '', '📄'));
+    chip.append(el('span', 'att-name', a.name));
+    const x = el('button', 'att-x', '✕');
+    x.type = 'button';
+    x.onclick = () => { pendingAtt.splice(i, 1); renderAttChips(); };
+    chip.append(x);
+    box.append(chip);
+  });
+}
+
 /* Streaming chat over fetch + ReadableStream (POST-friendly SSE). */
 async function sendChat(text) {
   const bot = currentBot();
   if (!bot || state.busy) return;
+  const atts = pendingAtt;
+  pendingAtt = [];
+  renderAttChips();
   state.busy = true;
-  addMessage('user', text);
+  addMessage('user', text, undefined, atts.map((a) => ({ name: a.name, mime: a.mime, src: a.dataUrl })));
   const bubble = addMessage('assistant', '');
   try {
     const res = await fetch(`/api/bots/${bot.id}/chat`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, lang: state.lang }),
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, lang: state.lang, attachments: atts.map((a) => ({ name: a.name, mime: a.mime, data: a.dataUrl.split(',')[1] })) }),
     });
     if (res.status === 401) { showLock(); throw new Error(t('sessExp')); }
     const reader = res.body.getReader();
@@ -281,15 +379,41 @@ function fmtSize(n) {
   return n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
 }
 
+/* Download without leaving the app: a plain <a download> navigates
+ * an installed PWA to a bare file page with no way back. Fetch the
+ * file instead — hand it to the system share sheet when possible
+ * (Save to Files), else trigger a blob download in place. */
+async function downloadFile(url, name) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('download failed (' + res.status + ')');
+    const blob = await res.blob();
+    const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file] });
+      return;
+    }
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 4000);
+  } catch (e) {
+    if (e?.name !== 'AbortError') addMessage('system', '⚠ ' + (e.message || e));
+  }
+}
+
 /* A finished deployment package, rendered as a download card. */
 function addPackageCard(data) {
   const box = el('div', 'package-card');
   box.append(el('h4', '', t('pkgReady')));
   box.append(el('div', 'pkg-meta', `${data.name} · ${fmtSize(data.size)}${data.files ? ` · ${data.files} ${t('pkgFiles')}` : ''}`));
-  const a = el('a', 'dl-btn', '⬇ ' + t('pkgDl'));
-  a.href = data.url;
-  a.setAttribute('download', '');
-  box.append(a);
+  const btn = el('button', 'dl-btn', '⬇ ' + t('pkgDl'));
+  btn.onclick = () => downloadFile(data.url, data.name);
+  box.append(btn);
   $('#messages').append(box);
   scrollDown();
 }
@@ -498,10 +622,22 @@ async function init() {
     ev.preventDefault();
     const input = $('#input');
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !pendingAtt.length) return;
     input.value = '';
     input.style.height = 'auto';
     sendChat(text);
+  });
+  $('#attBtn').onclick = () => $('#attFile').click();
+  $('#attFile').addEventListener('change', async (ev) => {
+    const files = [...(ev.target.files || [])];
+    ev.target.value = '';
+    for (const f of files) {
+      if (pendingAtt.length >= 6) { addMessage('system', '⚠ ' + t('attTooMany')); break; }
+      if (f.size > 10 * 1024 * 1024) { addMessage('system', '⚠ ' + t('attTooBig') + ': ' + f.name); continue; }
+      const dataUrl = await new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.readAsDataURL(f); });
+      pendingAtt.push({ name: f.name, mime: f.type || 'application/octet-stream', dataUrl });
+    }
+    renderAttChips();
   });
   $('#input').addEventListener('input', (ev) => {
     const tg = ev.target;

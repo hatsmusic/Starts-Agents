@@ -24,7 +24,7 @@ function ensureWorkspace(ctx) {
   fs.mkdirSync(ctx.workspace, { recursive: true });
 }
 
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'uploads']);
 function walk(dir, base, depth, out) {
   if (depth > 6 || out.length > 400) return;
   for (const d of fs.readdirSync(dir, { withFileTypes: true })) {

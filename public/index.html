@@ -60,7 +60,10 @@
     </header>
     <div id="taskStrip" hidden></div>
     <div id="messages" class="messages"></div>
+    <div id="attChips" hidden></div>
     <form id="composer">
+      <button id="attBtn" type="button" class="icon-btn" data-i18n-title="attach" title="添加图片 / 视频 / 文件">📎</button>
+      <input type="file" id="attFile" hidden multiple accept="image/*,video/*,audio/*,.pdf,.zip,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx">
       <textarea id="input" rows="1" data-i18n-ph="msgPh" placeholder="输入消息…"></textarea>
       <button id="sendBtn" type="submit" data-i18n="send">发送</button>
     </form>

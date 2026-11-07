@@ -25,10 +25,10 @@ function json(res, code, obj) {
   res.end(body);
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 2 * 1024 * 1024) {
   return new Promise((resolve) => {
     let data = '';
-    req.on('data', (c) => { data += c; if (data.length > 2 * 1024 * 1024) req.destroy(); });
+    req.on('data', (c) => { data += c; if (data.length > maxBytes) req.destroy(); });
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); } });
   });
 }
@@ -106,12 +106,15 @@ function workspaceTree(workspace) {
 }
 
 /* ------------------------- the chat turn ------------------------- */
-async function chatTurn(bot, userText, emit, lang) {
+async function chatTurn(bot, userText, emit, lang, extras = {}) {
   const history = store.getMessages(bot.id)
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-30)
     .map((m) => ({ role: m.role, content: m.text }));
-  store.pushMessage(bot.id, { role: 'user', text: userText, at: new Date().toISOString() });
+  store.pushMessage(bot.id, {
+    role: 'user', text: extras.storedText ?? userText, at: new Date().toISOString(),
+    ...(extras.attachments?.length ? { attachments: extras.attachments } : {}),
+  });
 
   const ctx = { botId: bot.id, dataDir: config.dataDir, workspace: store.workspaceOf(bot.id) };
   const engine = getEngine(bot.engine);
@@ -133,7 +136,7 @@ async function chatTurn(bot, userText, emit, lang) {
     store.pushMessage(bot.id, { role: 'assistant', text: guide, at: new Date().toISOString() });
     return guide;
   }
-  const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace) });
+  const gen = engine.run({ bot, history, userText, provider, lang, workspaceTree: workspaceTree(ctx.workspace), images: extras.images });
   let assistant = '';
   let failStreak = 0;
   let next = await gen.next();
@@ -302,6 +305,35 @@ function startOllamaPull(tag) {
   })();
 }
 
+/* Save chat attachments into the bot's workspace (uploads/). Images
+ * are also returned as base64 payloads so the engine can show them to
+ * a vision-capable model; everything else reaches the model as a
+ * named file it can work on with tools. */
+function saveAttachments(bot, attachments, lang) {
+  const meta = [];
+  const images = [];
+  if (!Array.isArray(attachments) || !attachments.length) return { meta, images };
+  if (attachments.length > 6) throw new Error('too many attachments (max 6)');
+  const ws = store.workspaceOf(bot.id);
+  const dir = path.join(ws, 'uploads');
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  let i = 0;
+  for (const a of attachments) {
+    const buf = Buffer.from(String(a?.data || ''), 'base64');
+    if (!buf.length) continue;
+    if (buf.length > 10 * 1024 * 1024) throw new Error('attachment too large (max 10 MB each)');
+    const rawName = String(a?.name || 'file').split(/[\\/]/).pop() || 'file';
+    const safe = rawName.replace(/[:*?"<>|]/g, '_').slice(0, 80) || 'file';
+    const fileName = `${stamp}-${i++}-${safe}`;
+    fs.writeFileSync(path.join(dir, fileName), buf);
+    const mime = String(a?.mime || 'application/octet-stream');
+    meta.push({ name: rawName, mime, size: buf.length, rel: 'uploads/' + fileName });
+    if (mime.startsWith('image/')) images.push({ mime, data: String(a.data) });
+  }
+  return { meta, images };
+}
+
 /* --------------------------- HTTP API ---------------------------- */
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://local');
@@ -441,13 +473,41 @@ const server = http.createServer(async (req, res) => {
     if (chatMatch && req.method === 'POST') {
       const bot = store.getBot(chatMatch[1]);
       if (!bot) return json(res, 404, { error: 'no such bot' });
-      const { text, lang } = await readBody(req);
-      if (!text || !String(text).trim()) return json(res, 400, { error: 'text required' });
+      const { text, lang, attachments } = await readBody(req, 24 * 1024 * 1024);
+      let saved;
+      try { saved = saveAttachments(bot, attachments, lang); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+      if ((!text || !String(text).trim()) && !saved.meta.length) return json(res, 400, { error: 'text required' });
+      const langStr = typeof lang === 'string' ? lang : undefined;
+      const zh = langStr === 'zh' || langStr === 'tw';
+      let modelText = String(text || '');
+      let storedText = modelText;
+      if (saved.meta.length) {
+        const listing = saved.meta.map((m) => `${m.rel} (${m.name}, ${Math.max(1, Math.round(m.size / 1024))} KB)`).join('; ');
+        modelText += (modelText ? '\n' : '') + (zh
+          ? `[用户附带了 ${saved.meta.length} 个文件，已存入工作区：${listing}]`
+          : `[The user attached ${saved.meta.length} file(s), saved in the workspace: ${listing}]`);
+        storedText += (storedText ? '\n' : '') + '📎 ' + saved.meta.map((m) => m.name).join(', ');
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const emit = (type, data) => { try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ } };
-      try { await chatTurn(bot, String(text), emit, typeof lang === 'string' ? lang : undefined); emit('done', {}); }
+      try { await chatTurn(bot, modelText, emit, langStr, { images: saved.images, storedText, attachments: saved.meta }); emit('done', {}); }
       catch (e) { emit('error', { message: e.message || String(e) }); }
       return res.end();
+    }
+
+    // Serve a file from a bot's workspace (uploaded media shown in the
+    // chat, generated files) — strictly inside that bot's workspace.
+    const fileMatch = p.match(/^\/api\/bots\/([\w-]+)\/files\/(.+)$/);
+    if (fileMatch && req.method === 'GET') {
+      const bot = store.getBot(fileMatch[1]);
+      if (!bot) return json(res, 404, { error: 'no such bot' });
+      const ws = store.workspaceOf(bot.id);
+      const full = path.resolve(ws, decodeURIComponent(fileMatch[2]));
+      if (!full.startsWith(ws + path.sep) || !fs.existsSync(full) || !fs.statSync(full).isFile()) return json(res, 404, { error: 'not found' });
+      const extraMime = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.pdf': 'application/pdf', '.zip': 'application/zip', '.md': 'text/markdown; charset=utf-8', '.csv': 'text/csv; charset=utf-8', '.webp': 'image/webp', '.gif': 'image/gif' };
+      res.writeHead(200, { 'content-type': extraMime[path.extname(full).toLowerCase()] || MIME[path.extname(full)] || 'application/octet-stream', 'cache-control': 'no-cache' });
+      return fs.createReadStream(full).pipe(res);
     }
 
     // Manual packaging (the 📦 button): zip the bot's whole workspace
