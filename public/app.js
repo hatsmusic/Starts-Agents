@@ -1,7 +1,7 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
 // UI language: 15 languages via ./i18n.js, choice saved on this device.
-import { LANGS, getLang, makeT } from './i18n.js?v=72';
+import { LANGS, getLang, makeT } from './i18n.js?v=120';
 
 const $ = (s) => document.querySelector(s);
 const state = {
@@ -52,7 +52,7 @@ function el(tag, cls, text) {
 
 function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
-  img.src = '/complay-c.svg?v=72';
+  img.src = '/complay-c.svg?v=120';
   img.alt = '';
   // Dimension attributes are a hard floor: even if a stale cached
   // stylesheet (old PWA version) has no .bot-av rule, the SVG can
@@ -117,9 +117,22 @@ function fmtDay(at) {
  * filter chips narrow the list client-side. */
 let closeOpenSwipe = () => {};
 const STATUS_ORDER = { running: 0, awaiting_approval: 1, idle: 2, offline: 3 };
+let rosterSig = '';
+const seenBotCards = new Set();
 function renderRoster() {
   const list = $('#botList');
   if (!list) return;
+  // Skip the rebuild when nothing the roster shows has changed
+  // (audit fix): the 6-second refresh used to tear down and rebuild
+  // every card, replaying the entrance animation and flashing the red
+  // swipe-delete layer from underneath each card.
+  const sig = JSON.stringify([
+    state.query, state.filter, state.current,
+    state.bots.map((b) => [b.id, b.name, b.engine, b.model, b.providerId, b.status || 'idle', b.lastActiveAt || 0, b.lastMessage?.text || '', b.lastMessage?.at || '']),
+    state.providers.map((p) => [p.id, p.label, p.model || '']),
+  ]);
+  if (sig === rosterSig && list.children.length) { renderWsCard(); return; }
+  rosterSig = sig;
   list.innerHTML = '';
   closeOpenSwipe = () => {};
   const q = state.query.trim().toLowerCase();
@@ -156,6 +169,10 @@ function renderRoster() {
     };
     actions.append(editB, delB);
     const main = el('div', 'bot-main');
+    // Entrance animation plays on a card's first appearance only —
+    // rebuilds for status/preview changes must not replay it.
+    if (seenBotCards.has(bot.id)) main.style.animation = 'none';
+    else seenBotCards.add(bot.id);
     main.append(botAvatar());
     const meta = el('span', 'bot-meta-col');
     const top = el('span', 'bot-top');
@@ -179,7 +196,7 @@ function renderRoster() {
     const OPEN_X = -144;
     let base = 0, startX = null, startY = 0, dragging = false, swiped = false;
     const setX = (x) => { main.style.transform = `translateX(${x}px)`; };
-    const close = () => { base = 0; setX(0); item.classList.remove('open'); };
+    const close = () => { base = 0; setX(0); item.classList.remove('open', 'drag'); };
     main.addEventListener('pointerdown', (e) => {
       if (closeOpenSwipe !== close) closeOpenSwipe();
       closeOpenSwipe = close;
@@ -188,7 +205,7 @@ function renderRoster() {
     main.addEventListener('pointermove', (e) => {
       if (startX === null) return;
       const dx = e.clientX - startX, dy = e.clientY - startY;
-      if (!dragging && Math.abs(dx) > 9 && Math.abs(dx) > Math.abs(dy)) dragging = true;
+      if (!dragging && Math.abs(dx) > 9 && Math.abs(dx) > Math.abs(dy)) { dragging = true; item.classList.add('drag'); }
       if (dragging) setX(Math.max(OPEN_X, Math.min(0, base + dx)));
     });
     const endDrag = (e) => {
@@ -200,6 +217,7 @@ function renderRoster() {
         base = (base + dx) < OPEN_X / 2 ? OPEN_X : 0;
         setX(base);
         item.classList.toggle('open', base !== 0);
+        item.classList.remove('drag');
       }
       startX = null; dragging = false;
     };
@@ -225,6 +243,8 @@ function openCardMenu(bot, anchor) {
   const pop = el('div', 'card-pop');
   const edit = el('button', 'pop-item', t('editAct'));
   edit.onclick = () => { closeCardMenu(); openDialog(bot); };
+  const share = el('button', 'pop-item', t('shareLink'));
+  share.onclick = () => { copyShareLink({ kind: 'bot' }, share, bot.id); setTimeout(closeCardMenu, 900); };
   const del = el('button', 'pop-item pop-del', t('del'));
   let armTimer = null;
   del.onclick = async () => {
@@ -242,7 +262,7 @@ function openCardMenu(bot, anchor) {
     if (state.current) selectBot(state.current, false);
     else { $('#messages').innerHTML = ''; renderHead(); document.body.classList.remove('in-chat'); }
   };
-  pop.append(edit, del);
+  pop.append(edit, share, del);
   document.body.append(pop);
   const r = anchor.getBoundingClientRect();
   pop.style.top = (r.bottom + 6) + 'px';
@@ -306,7 +326,8 @@ function renderHead() {
   $('#botName').textContent = bot ? bot.name : t('pickBot');
   const prov = bot?.providerId ? state.providers.find((p) => p.id === bot.providerId) : null;
   $('#botMeta').textContent = bot ? `${bot.engine}${prov ? ' · ' + prov.label : ''}${bot.model ? ' · ' + bot.model : ''}` : '';
-  $('#editBotBtn').style.visibility = bot ? 'visible' : 'hidden';
+  const mine = bot && (!bot.ownerId || !state.auth?.user || bot.ownerId === state.auth.user.id);
+  $('#editBotBtn').style.visibility = bot && mine ? 'visible' : 'hidden';
   $('#packageBtn').style.visibility = bot ? 'visible' : 'hidden';
 }
 
@@ -326,10 +347,50 @@ async function selectBot(id, enter = true) {
   if (!messages.length) addMessage('system', t('tryHint'));
   renderTasks(currentBot()?.tasks || []);
   loadUsageLine();
-  scrollDown();
+  scrollDown(true);
+  syncPendingApprovals();
 }
 
-function scrollDown() { const b = $('#messages'); b.scrollTop = b.scrollHeight; }
+/* Approval restore (audit fix): cards used to exist only in the live
+ * SSE stream — reload the page, switch bots, or come back from
+ * Settings and a waiting approval became invisible while the run hung
+ * until the 5-minute timeout. The server always knew (GET
+ * /api/approvals); now the client asks. Cards that vanished from the
+ * pending list without being decided HERE are marked as gone instead
+ * of staying clickable forever. */
+document.addEventListener('visibilitychange', () => { if (!document.hidden) syncPendingApprovals(); });
+
+async function syncPendingApprovals() {
+  if (!state.current) return;
+  let pending;
+  try { ({ pending } = await api('GET', '/api/approvals')); } catch { return; }
+  const mine = (pending || []).filter((c) => c.botId === state.current);
+  const ids = new Set(mine.map((c) => c.id));
+  for (const card of mine) addApprovalCard(card);
+  document.querySelectorAll('#messages .approval[data-apid]').forEach((elm) => {
+    if (!ids.has(elm.dataset.apid) && !elm.classList.contains('resolved')) {
+      elm.classList.add('resolved');
+      const row = elm.querySelector('.row');
+      if (row) row.replaceWith(el('div', 'ap-gone', t('apGone')));
+    }
+  });
+}
+
+/* Sticky-bottom scrolling (v0.12): auto-scroll follows the stream
+ * ONLY while the user is already near the bottom. The moment they
+ * scroll up to read, the stream stops yanking the page — fighting
+ * the user's scroll was half of the "page freezes while it replies"
+ * complaint. */
+let stickBottom = true;
+{
+  const b = $('#messages');
+  if (b) b.addEventListener('scroll', () => { stickBottom = b.scrollHeight - b.scrollTop - b.clientHeight < 140; }, { passive: true });
+}
+function scrollDown(force = false) {
+  if (!force && !stickBottom) return;
+  const b = $('#messages');
+  b.scrollTop = b.scrollHeight;
+}
 
 /* ---------------------------- messages ---------------------------- */
 function fmtTime(at) {
@@ -352,6 +413,29 @@ function renderMd(src) {
   text = esc(text);
   text = text.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // Pipe tables (v0.12): a header row, a |---|---| separator row,
+  // then body rows. Lifted out as one block (like code) so the line
+  // loop below never sees the pipes. Cells keep their inline
+  // formatting (already escaped + strong-applied above).
+  text = text.replace(/(^|\n)(\|[^\n]*\|)\n(\|[ :|-]+\|)((?:\n\|[^\n]*\|)*)/g, (m, pre, head, sep, body) => {
+    // The separator row must be all dashes/colons — otherwise this
+    // was two ordinary pipe-ful lines, not a table. (The character
+    // class deliberately excludes \s: an earlier version let the
+    // separator swallow the newline and the next row's first pipe.)
+    if (!sep.replace(/^\||\|$/g, '').split('|').every((c) => /^:?-+:?$/.test(c.trim()))) return m;
+    const cells = (row) => row.replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+    const aligns = cells(sep).map((c) => c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : 'left');
+    let h = '<div class="md-table-wrap"><button type="button" class="tbl-copy">' + '⧉' + '</button><table class="md-table"><thead><tr>';
+    cells(head).forEach((c, i) => { h += `<th style="text-align:${aligns[i] || 'left'}">${c}</th>`; });
+    h += '</tr></thead><tbody>';
+    for (const row of body.split('\n').filter((r) => r.trim())) {
+      h += '<tr>';
+      cells(row).forEach((c, i) => { h += `<td style="text-align:${aligns[i] || 'left'}">${c}</td>`; });
+      h += '</tr>';
+    }
+    h += '</tbody></table></div>';
+    return pre + lift(h);
+  });
   const lines = text.split('\n');
   let html = '', listTag = null;
   const closeList = () => { if (listTag) { html += '</' + listTag + '>'; listTag = null; } };
@@ -371,6 +455,20 @@ function renderMd(src) {
   }
   closeList();
   return html.replace(/\u0001(\d+)\u0002/g, (m, i) => blocks[+i]);
+}
+
+/* Table copy (v0.12): the rendered table gets its own copy button —
+ * copies as TSV so it pastes cleanly into spreadsheets and docs. */
+function wireTableCopy(bubble) {
+  bubble.querySelectorAll('.tbl-copy').forEach((btn) => {
+    btn.onclick = async () => {
+      const table = btn.parentElement?.querySelector('table');
+      if (!table) return;
+      const tsv = [...table.querySelectorAll('tr')].map((tr) => [...tr.children].map((c) => c.textContent.trim()).join('\t')).join('\n');
+      try { await navigator.clipboard.writeText(tsv); btn.textContent = '✓'; setTimeout(() => { btn.textContent = '⧉'; }, 1600); }
+      catch { /* clipboard unavailable */ }
+    };
+  });
 }
 
 function addMessage(role, text, at, attachments) {
@@ -394,45 +492,136 @@ function addMessage(role, text, at, attachments) {
     }
     bubble.append(media);
   }
-  col.append(bubble, el('div', 'msg-time', fmtTime(at)));
+  if (role === 'assistant') {
+    // Every AI bubble carries its provenance line (v0.12): generated
+    // by AI, may be wrong — plus a one-tap copy of the full text.
+    const foot = el('div', 'msg-foot');
+    foot.append(el('span', 'ai-note', t('aiNote')));
+    const cp = el('button', 'msg-copy', t('copyMsg'));
+    cp.type = 'button';
+    cp.onclick = async () => {
+      try { await navigator.clipboard.writeText(bubble._raw || bubble.textContent || ''); cp.textContent = t('copiedOk'); setTimeout(() => { cp.textContent = t('copyMsg'); }, 1600); }
+      catch { /* clipboard unavailable */ }
+    };
+    foot.append(cp);
+    col.append(bubble, foot);
+    wireTableCopy(bubble);
+  } else {
+    col.append(bubble);
+  }
+  col.append(el('div', 'msg-time', fmtTime(at)));
   row.append(col);
   $('#messages').append(row);
   scrollDown();
   return bubble;
 }
 
+/* Thinking-model output lands in ONE folded block per turn — visible
+ * if you want it, never part of the reply's clutter. */
+function addReasoningChunk(text, bubble) {
+  let box = bubble._think;
+  if (!box) {
+    box = el('details', 'think-log');
+    const sum = el('summary', '', t('thinkTitle'));
+    const body = el('div', 'think-body');
+    box.append(sum, body);
+    bubble._think = box;
+    bubble._thinkBody = body;
+    $('#messages').append(box);
+  }
+  bubble._thinkBody.textContent += text;
+  scrollDown();
+}
+
+/* Tool activity line (v0.12): a human summary — tool name plus the
+ * one argument that says what it touches (a path, a command's first
+ * words, a URL). The old chip dumped the full JSON arguments, file
+ * bodies and all, into the chat. */
+function toolSummary(name, args) {
+  const a = args || {};
+  const clip = (s, n = 70) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s; };
+  switch (name) {
+    case 'run_shell': return clip(a.command, 90);
+    case 'read_file': case 'write_file': case 'edit_file': case 'delete_file': return clip(a.path);
+    case 'rename_file': return clip(`${a.from || ''} → ${a.to || ''}`, 90);
+    case 'list_files': return clip(a.path || '.');
+    case 'search_text': return clip(a.query);
+    case 'browse_page': return clip(a.url, 90);
+    case 'ask_teammate': return clip(`${a.bot || ''}: ${a.task || ''}`, 90);
+    case 'package_project': return clip(a.name || '');
+    case 'write_note': return clip(a.text);
+    default: return '';
+  }
+}
 function addToolChip(name, args) {
   const chip = el('div', 'tool-chip');
   const b = el('b');
   b.innerHTML = icon('tool', 13);
   b.append(document.createTextNode(' ' + name + ' '));
-  chip.append(b, document.createTextNode(JSON.stringify(args || {})));
+  chip.append(b, document.createTextNode(toolSummary(name, args)));
   $('#messages').append(chip);
   scrollDown();
 }
 
 function addApprovalCard(card) {
+  // One card per approval id, ever (audit fix): the live SSE paints a
+  // card, and the pending-approvals sync may offer the same card again
+  // — duplicates would let a stale copy be clicked after the fact.
+  if (card.id && document.querySelector(`#messages .approval[data-apid="${card.id}"]`)) return;
   const box = el('div', 'approval');
+  if (card.id) box.dataset.apid = card.id;
   box.append(el('h4', '', t('apTitle') + card.tool));
+  // Plain-words first (v0.12): what this does and what it touches,
+  // generated server-side per tool. The raw preview stays below for
+  // anyone who wants the details.
+  if (card.explain) box.append(el('p', 'ap-explain', card.explain));
   if (card.preview) {
     const pre = el('pre', 'diff');
     for (const line of String(card.preview).split('\n')) {
       pre.append(el('span', line.startsWith('+ ') ? 'dl-add' : line.startsWith('- ') ? 'dl-del' : '', line + '\n'));
     }
     box.append(pre);
-  } else {
+  } else if (card.args && Object.keys(card.args).length) {
     const raw = JSON.stringify(card.args, null, 2);
     box.append(el('pre', '', raw.length > 4000 ? raw.slice(0, 4000) + '\n…' : raw));
   }
   const row = el('div', 'row');
   const allow = el('button', 'allow', t('allow'));
   const allowAll = el('button', 'allow-session', t('allowS'));
+  const allowAlways = el('button', 'allow-always', t('allowA'));
   const deny = el('button', 'deny', t('deny'));
   const finish = (label) => { box.classList.add('resolved'); row.replaceWith(el('div', '', label)); };
-  allow.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow' }); finish(t('okOnce')); };
-  allowAll.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'allow_session' }); finish(t('okSession')); };
-  deny.onclick = async () => { await api('POST', `/api/approvals/${card.id}`, { decision: 'deny' }); finish(t('denied')); };
-  row.append(allow, allowAll, deny);
+  const markGone = () => { box.classList.add('resolved'); row.replaceWith(el('div', 'ap-gone', t('apGone'))); };
+  // Decision handling (v0.12, item 1): the old handlers awaited the
+  // POST with NO feedback and NO error path — a failed request (card
+  // already expired -> 404, a network hiccup, a suspended webview)
+  // looked exactly like a dead button. Now a tap visibly registers
+  // at once, a 404 marks the card as gone, and any other failure is
+  // shown on the card with the buttons restored for another tap.
+  const decide = (decision, label) => async () => {
+    if (box.dataset.busy) return;
+    box.dataset.busy = '1';
+    const btns = [allow, allowAll, allowAlways, deny];
+    btns.forEach((b) => { b.disabled = true; });
+    const note = el('div', 'ap-note', t('deciding'));
+    row.after(note);
+    try {
+      await api('POST', `/api/approvals/${card.id}`, { decision });
+      note.remove();
+      finish(label);
+    } catch (e) {
+      note.remove();
+      delete box.dataset.busy;
+      if (String(e.message || '').includes('no pending approval')) { markGone(); return; }
+      btns.forEach((b) => { b.disabled = false; });
+      box.append(el('div', 'ap-err', t('apDecideErr')));
+    }
+  };
+  allow.onclick = decide('allow', t('okOnce'));
+  allowAll.onclick = decide('allow_session', t('okSession'));
+  allowAlways.onclick = decide('allow_always', t('okAlways'));
+  deny.onclick = decide('deny', t('denied'));
+  row.append(allow, allowAll, allowAlways, deny);
   box.append(row);
   $('#messages').append(box);
   scrollDown();
@@ -471,6 +660,14 @@ async function sendChat(text) {
   $('#sendBtn').disabled = true;
   addMessage('user', text, undefined, atts.map((a) => ({ name: a.name, mime: a.mime, src: a.dataUrl })));
   const bubble = addMessage('assistant', '');
+  // Streaming render (v0.12): tokens append to a bare text node —
+  // no Markdown re-parse, no innerHTML rebuild per token (that was
+  // O(n^2) and froze scrolling on long replies). The full Markdown
+  // render happens ONCE, when the stream ends.
+  bubble.innerHTML = '';
+  const streamNode = document.createTextNode('');
+  bubble.append(streamNode);
+  bubble.classList.add('streaming');
   try {
     const res = await fetch(`/api/bots/${bot.id}/chat`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -496,7 +693,8 @@ async function sendChat(text) {
         if (!evLine || !dataLine) continue;
         const type = evLine.slice(6).trim();
         const data = JSON.parse(dataLine.slice(5));
-        if (type === 'token') { bubble._raw = (bubble._raw || '') + data.text; bubble.innerHTML = renderMd(bubble._raw); scrollDown(); }
+        if (type === 'token') { bubble._raw = (bubble._raw || '') + data.text; streamNode.data = bubble._raw; scrollDown(); }
+        else if (type === 'reasoning') addReasoningChunk(data.text, bubble);
         else if (type === 'tool_pending') addToolChip(data.name, data.args);
         else if (type === 'tool_result') addToolLog(data);
         else if (type === 'approval') addApprovalCard(data);
@@ -507,7 +705,9 @@ async function sendChat(text) {
         else if (type === 'error') addErrorCard(data.message);
       }
     }
+    bubble.classList.remove('streaming');
     if (!bubble.textContent) bubble.closest('.msg-row')?.remove();
+    else { bubble.innerHTML = renderMd(bubble._raw || ''); wireTableCopy(bubble); }
     delete state.wsCache[bot.id];
     loadBots().catch(() => {}); // refresh roster previews + status
   } catch (e) {
@@ -587,34 +787,83 @@ async function downloadFile(url, name) {
 }
 
 /* A finished deployment package, rendered as a download card. */
+async function copyShareLink(payload, btn, botIdOverride) {
+  const botId = botIdOverride || state.current;
+  if (!botId) return;
+  try {
+    const { url } = await api('POST', `/api/bots/${botId}/share`, payload);
+    let copied = false;
+    try { await navigator.clipboard.writeText(url); copied = true; } catch { /* clipboard needs a gesture/secure context */ }
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = copied ? t('linkCopied') : url;
+      setTimeout(() => { btn.textContent = old; }, copied ? 1600 : 4000);
+    }
+    if (!copied) addMessage('system', url);
+  } catch (e) { addMessage('system', t('shareFail') + (e.message || e)); }
+}
+
 function addPackageCard(data) {
   const box = el('div', 'package-card');
-  box.append(el('h4', '', t('pkgReady')));
+  const head = el('h4', 'pkg-head');
+  head.innerHTML = icon('box', 16);
+  head.append(document.createTextNode(' ' + t('pkgReady')));
+  box.append(head);
   box.append(el('div', 'pkg-meta', `${data.name} · ${fmtSize(data.size)}${data.files ? ` · ${data.files} ${t('pkgFiles')}` : ''}`));
+  if (Array.isArray(data.list) && data.list.length) {
+    const fold = el('details', 'pkg-list');
+    const sum = el('summary', '', t('pkgList'));
+    const pre = el('pre', '', data.list.join('\n'));
+    fold.append(sum, pre);
+    box.append(fold);
+  }
+  if (Array.isArray(data.excluded) && data.excluded.length) {
+    box.append(el('div', 'pkg-meta', `${t('pkgExcluded')}: ${data.excluded.join(', ')}`));
+  }
+  const row = el('div', 'row');
   const btn = el('button', 'dl-btn');
   btn.innerHTML = icon('dl', 15);
   btn.append(document.createTextNode(' ' + t('pkgDl')));
   btn.onclick = () => downloadFile(data.url, data.name);
-  box.append(btn);
+  const share = el('button', 'dl-btn ghost', t('shareLink'));
+  share.onclick = () => copyShareLink({ kind: 'package', file: data.name }, share);
+  row.append(btn, share);
+  box.append(row);
   $('#messages').append(box);
   scrollDown();
 }
 
 /* The bot's live task checklist, pinned above the messages. */
+/* The task strip is collapsible (user request): one line by default —
+ * progress count + the current item — tap to unfold the full list.
+ * A finished list folds itself away. */
+let tasksOpen = false;
 function renderTasks(tasks) {
   const strip = $('#taskStrip');
   if (!strip) return;
   strip.innerHTML = '';
   if (!tasks || !tasks.length) { strip.hidden = true; return; }
   strip.hidden = false;
-  const head = el('div', 'task-head');
+  const done = tasks.filter((x) => x.done).length;
+  const allDone = done === tasks.length;
+  if (allDone) tasksOpen = false;
+  const current = tasks.find((x) => !x.done);
+  const head = el('button', 'task-head');
+  head.type = 'button';
   head.innerHTML = icon('list', 14);
-  head.append(document.createTextNode(` ${tasks.filter((x) => x.done).length}/${tasks.length}`));
+  head.append(el('span', 'task-count', `${done}/${tasks.length}`));
+  head.append(el('span', 'task-current', allDone ? t('tasksDone') : (current?.text || '')));
+  head.append(el('span', 'task-chev' + (tasksOpen ? ' open' : ''), '›'));
+  head.addEventListener('click', () => { tasksOpen = !tasksOpen; renderTasks(tasks); });
   strip.append(head);
-  for (const task of tasks) {
-    const row = el('div', 'task-row' + (task.done ? ' done' : ''));
-    row.append(el('span', 'task-box', task.done ? '✓' : '○'), el('span', 'task-text', task.text));
-    strip.append(row);
+  if (tasksOpen) {
+    const body = el('div', 'task-body');
+    for (const task of tasks) {
+      const row = el('div', 'task-row' + (task.done ? ' done' : ''));
+      row.append(el('span', 'task-box', task.done ? '✓' : '○'), el('span', 'task-text', task.text));
+      body.append(row);
+    }
+    strip.append(body);
   }
 }
 
@@ -634,20 +883,114 @@ function openDialog(bot) {
   }
   sel.value = bot?.engine || state.engines[0]?.id || 'echo';
   const psel = $('#fProvider');
+  psel.onchange = () => renderBotModelChips();
   psel.innerHTML = '';
   const none = el('option', '', t('provNone')); none.value = '';
   psel.append(none);
   for (const p of state.providers) {
-    const o = el('option', '', `${p.label} · ${p.model}`);
+    const o = el('option', '', `${p.label} · ${(p.models && p.models[0]) || p.model || ''}`);
     o.value = p.id;
     psel.append(o);
   }
   psel.value = bot?.providerId || '';
+  renderBotModelChips();
   $('#deleteBotBtn').hidden = !bot;
   $('#botDialog').showModal();
 }
 
+/* Two-level model pick in the bot editor: choose a provider, then tap
+ * one of ITS models. The text input still allows a custom model ID —
+ * the chips just make the common path one tap. */
+function renderBotModelChips() {
+  const box = $('#fModelChips');
+  if (!box) return;
+  box.innerHTML = '';
+  const prov = state.providers.find((p) => p.id === $('#fProvider').value);
+  const models = prov?.models?.length ? prov.models : (prov?.model ? [prov.model] : []);
+  for (const m of models) {
+    const chip = el('button', 'chip' + ($('#fModel').value === m ? ' on' : ''), m);
+    chip.type = 'button';
+    chip.onclick = () => { $('#fModel').value = m; renderBotModelChips(); };
+    box.append(chip);
+  }
+}
+
 /* --------------------- settings: providers --------------------- */
+/* One provider owns a LIST of models (v0.8): the first is the default
+ * a bot gets when it doesn't pick one. This editor renders the list
+ * as chips — tap a chip to promote it to default, × removes it — and
+ * is shared by the add form and the edit dialog. */
+function modelEditor(chipsEl) {
+  let models = [];
+  const render = () => {
+    chipsEl.innerHTML = '';
+    models.forEach((m, i) => {
+      const chip = el('button', 'chip medit-chip' + (i === 0 ? ' first' : ''));
+      chip.type = 'button';
+      chip.title = t('pModels');
+      const label = el('span', '', m + (i === 0 ? ' · ' + t('defTag') : ''));
+      label.onclick = () => { models.splice(i, 1); models.unshift(m); render(); };
+      const x = el('span', 'x', '✕');
+      x.onclick = (ev) => { ev.stopPropagation(); models.splice(i, 1); render(); };
+      chip.append(label, x);
+      chipsEl.append(chip);
+    });
+  };
+  return {
+    get: () => [...models],
+    set: (list) => { models = [...new Set((list || []).map((s) => String(s).trim()).filter(Boolean))]; render(); },
+    add: (m) => { const v = String(m || '').trim(); if (v && !models.includes(v)) { models.push(v); render(); } },
+    merge: (list) => { for (const m of list || []) if (!models.includes(m)) models.push(m); render(); },
+  };
+}
+const pEd = modelEditor($('#pModels'));
+const eEd = modelEditor($('#eModels'));
+
+async function probeModels(outEl, payload, editor) {
+  outEl.textContent = t('mTesting');
+  const t0 = Date.now();
+  try {
+    const { models } = await api('POST', '/api/providers/fetch-models', payload);
+    if (editor) editor.merge(models);
+    outEl.textContent = t('mOk', { n: models.length }) + ` · ${Date.now() - t0}ms`;
+    return true;
+  } catch (e) {
+    outEl.textContent = t('mFail') + (e.message || e);
+    return false;
+  }
+}
+function wireModelEditor({ addInput, addBtn, fetchBtn, testBtn, outEl, baseEl, keyEl, editor, savedId }) {
+  const add = () => { editor.add(addInput.value); addInput.value = ''; addInput.focus(); };
+  addBtn.onclick = add;
+  addInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); add(); } });
+  fetchBtn.onclick = () => probeModels(outEl, { id: savedId?.() || undefined, baseUrl: baseEl.value, apiKey: keyEl.value }, editor);
+  testBtn.onclick = () => probeModels(outEl, { id: savedId?.() || undefined, baseUrl: baseEl.value, apiKey: keyEl.value }, null);
+}
+wireModelEditor({ addInput: $('#pModelAdd'), addBtn: $('#pModelAddBtn'), fetchBtn: $('#pFetchBtn'), testBtn: $('#pTestBtn'), outEl: $('#pTestOut'), baseEl: $('#pBaseUrl'), keyEl: $('#pKey'), editor: pEd, savedId: () => null });
+let editingProviderId = null;
+wireModelEditor({ addInput: $('#eModelAdd'), addBtn: $('#eModelAddBtn'), fetchBtn: $('#eFetchBtn'), testBtn: $('#eTestBtn'), outEl: $('#eTestOut'), baseEl: $('#eBaseUrl'), keyEl: $('#eKey'), editor: eEd, savedId: () => editingProviderId });
+
+function openProviderDialog(p) {
+  editingProviderId = p.id;
+  $('#eLabel').value = p.label || '';
+  $('#eBaseUrl').value = p.baseUrl || '';
+  $('#eKey').value = '';
+  $('#eTestOut').textContent = '';
+  eEd.set(p.models?.length ? p.models : (p.model ? [p.model] : []));
+  $('#providerDialog').showModal();
+}
+$('#eCancelBtn').onclick = () => $('#providerDialog').close();
+$('#providerEditForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const payload = { label: $('#eLabel').value, baseUrl: $('#eBaseUrl').value, models: eEd.get() };
+  const key = $('#eKey').value;
+  if (key) payload.apiKey = key;
+  await api('PATCH', `/api/providers/${editingProviderId}`, payload);
+  $('#providerDialog').close();
+  await loadProviders();
+  await loadBots();
+});
+
 async function loadProviders() {
   const { providers } = await api('GET', '/api/providers');
   state.providers = providers;
@@ -659,18 +1002,30 @@ async function loadProviders() {
     const info = el('div');
     info.append(
       el('div', 'pv-name', p.label),
-      el('div', 'pv-meta', `${p.model} · ${p.baseUrl}`),
+      el('div', 'pv-meta', p.baseUrl),
       el('div', 'pv-meta', p.hasKey ? `${t('keyYes')} ${p.keyHint}` : t('keyNo'))
     );
+    const chipBox = el('div', 'chips pv-chips');
+    (p.models?.length ? p.models : (p.model ? [p.model] : [])).forEach((m, i) => {
+      chipBox.append(el('span', 'chip ro' + (i === 0 ? ' first' : ''), m + (i === 0 ? ' · ' + t('defTag') : '')));
+    });
+    info.append(chipBox);
+    const acts = el('div', 'lm-actions');
+    const edit = el('button', 'mini-btn', t('editAct'));
+    edit.onclick = () => openProviderDialog(p);
     const del = el('button', 'mini-btn danger-text', t('del'));
     del.onclick = async () => { await api('DELETE', `/api/providers/${p.id}`); loadProviders(); };
-    row.append(info, del);
+    acts.append(edit, del);
+    row.append(info, acts);
     list.append(row);
   }
   renderHead();
 }
 
 /* ------------------- settings: local models ------------------- */
+/* The full catalog lives in ONE dropdown (user request): the popup
+ * scrolls, and the card under it carries the selected model's sizes,
+ * blurb, install state and actions — instead of a page-long list. */
 let lmPollTimer = null;
 async function loadLocalModels() {
   const box = $('#localModels');
@@ -682,59 +1037,108 @@ async function loadLocalModels() {
     box.append(el('p', 'set-hint', t('lmOff')));
     return;
   }
-  const zhUi = state.lang === 'zh' || state.lang === 'tw';
-  const pulling = data.pull?.status === 'pulling';
-  let lastCat = '';
+  const sel = document.createElement('select');
+  sel.id = 'lmPick';
   for (const m of data.catalog) {
-    if (m.cat && m.cat !== lastCat) {
-      lastCat = m.cat;
-      box.append(el('div', 'lm-cat', t('lmCat_' + m.cat)));
-    }
-    const installed = data.installed.includes(m.tag);
-    const isCurrent = data.current === m.tag;
-    const isPullingThis = pulling && data.pull.tag === m.tag;
-    const row = el('div', 'provider-row');
-    const info = el('div');
-    info.append(
-      el('div', 'pv-name', m.name + (isCurrent ? ' · ' + t('lmUsing') : '')),
-      el('div', 'pv-meta', `${t('lmDisk')} ~${m.diskGB} GB · ${t('lmRam')} ~${m.ramGB} GB`),
-      el('div', 'pv-meta', zhUi ? m.blurbZh : m.blurbEn)
-    );
-    if (isPullingThis) {
-      const pct = data.pull.total ? Math.floor((data.pull.completed / data.pull.total) * 100) : 0;
-      const bar = el('div', 'lm-bar');
-      const fill = el('div', 'lm-fill');
-      fill.style.width = pct + '%';
-      bar.append(fill);
-      info.append(bar, el('div', 'pv-meta', `${t('lmPulling')} ${pct}%`));
-    } else if (data.pull?.status === 'error' && data.pull.tag === m.tag) {
-      info.append(el('div', 'pv-meta lm-err', t('lmFailed')));
-    }
-    row.append(info);
-    const actions = el('div', 'lm-actions');
-    if (installed && !isCurrent) {
-      const use = el('button', 'mini-btn', t('lmUse'));
-      use.onclick = async () => { await api('POST', '/api/local-models/use', { tag: m.tag }); await loadProviders(); loadLocalModels(); };
-      actions.append(use);
-    }
-    if (!installed && !isPullingThis) {
-      const pull = el('button', 'mini-btn', t('lmPull'));
-      pull.disabled = pulling;
-      pull.onclick = async () => { await api('POST', '/api/local-models/pull', { tag: m.tag }); loadLocalModels(); };
-      actions.append(pull);
-    }
-    if (installed && !isCurrent) {
-      const del = el('button', 'mini-btn danger-text', t('lmDel'));
-      del.onclick = async () => { await api('DELETE', '/api/local-models/' + encodeURIComponent(m.tag)); loadLocalModels(); };
-      actions.append(del);
-    }
-    row.append(actions);
-    box.append(row);
+    const o = document.createElement('option');
+    o.value = m.tag;
+    o.textContent = m.name + (data.installed.includes(m.tag) ? ' \u2713' : '');
+    sel.append(o);
   }
+  const wanted = state.lmTag && data.catalog.some((m) => m.tag === state.lmTag)
+    ? state.lmTag : (data.current || data.catalog[0].tag);
+  sel.value = wanted;
+  const detail = el('div', 'lm-detail');
+  box.append(sel, detail);
+  enhanceSelect(sel);
+  const paint = () => { state.lmTag = sel.value; paintLmDetail(detail, data, sel.value); };
+  sel.addEventListener('change', paint);
+  paint();
   clearTimeout(lmPollTimer);
-  if (pulling && state.view === 'settings') {
+  if (data.pull?.status === 'pulling' && state.view === 'settings') {
     lmPollTimer = setTimeout(loadLocalModels, 2500);
   }
+}
+
+function paintLmDetail(box, data, tag) {
+  const m = data.catalog.find((x) => x.tag === tag);
+  box.innerHTML = '';
+  if (!m) return;
+  const zhUi = state.lang === 'zh' || state.lang === 'tw';
+  const installed = data.installed.includes(m.tag);
+  const isCurrent = data.current === m.tag;
+  const pulling = data.pull?.status === 'pulling';
+  const isPullingThis = pulling && data.pull.tag === m.tag;
+  const info = el('div');
+  info.append(
+    el('div', 'pv-name', m.name + (isCurrent ? ' · ' + t('lmUsing') : '')),
+    el('div', 'pv-meta', `${t('lmDisk')} ~${m.diskGB} GB · ${t('lmRam')} ~${m.ramGB} GB`),
+    el('div', 'pv-meta', zhUi ? m.blurbZh : m.blurbEn)
+  );
+  if (isPullingThis) {
+    const pct = data.pull.total ? Math.floor((data.pull.completed / data.pull.total) * 100) : 0;
+    const bar = el('div', 'lm-bar');
+    const fill = el('div', 'lm-fill');
+    fill.style.width = pct + '%';
+    bar.append(fill);
+    info.append(bar, el('div', 'pv-meta', `${t('lmPulling')} ${pct}%`));
+  } else if (data.pull?.status === 'error' && data.pull.tag === m.tag) {
+    info.append(el('div', 'pv-meta lm-err', t('lmFailed')));
+  }
+  box.append(info);
+  const actions = el('div', 'lm-actions');
+  if (installed && !isCurrent) {
+    const use = el('button', 'mini-btn', t('lmUse'));
+    use.onclick = async () => { await api('POST', '/api/local-models/use', { tag: m.tag }); await loadProviders(); loadLocalModels(); };
+    actions.append(use);
+  }
+  if (!installed && !isPullingThis) {
+    const pull = el('button', 'mini-btn', t('lmPull'));
+    pull.disabled = pulling;
+    pull.onclick = async () => { await api('POST', '/api/local-models/pull', { tag: m.tag }); loadLocalModels(); };
+    actions.append(pull);
+  }
+  if (installed && !isCurrent) {
+    const del = el('button', 'mini-btn danger-text', t('lmDel'));
+    del.onclick = async () => { await api('DELETE', '/api/local-models/' + encodeURIComponent(m.tag)); loadLocalModels(); };
+    actions.append(del);
+  }
+  box.append(actions);
+}
+
+/* ------------------- in-app file viewer ------------------- */
+/* Viewing a workspace file never leaves the app (user request): text
+ * and images render in this sheet; only Save goes through the
+ * download path. */
+let fvCtx = null;
+function openFileViewer(botId, path) {
+  fvCtx = { botId, path };
+  $('#fvName').textContent = path;
+  const body = $('#fvBody');
+  body.innerHTML = '';
+  body.append(el('p', 'set-hint', '…'));
+  const dlg = $('#fileViewer');
+  if (!dlg.open) dlg.showModal();
+  api('GET', `/api/bots/${botId}/file-view?path=${encodeURIComponent(path)}`).then((v) => {
+    if (!dlg.open || !fvCtx || fvCtx.path !== path || fvCtx.botId !== botId) return;
+    body.innerHTML = '';
+    if (v.kind === 'image') {
+      const img = document.createElement('img');
+      img.className = 'fv-img';
+      img.src = `/api/bots/${botId}/files/${encodeURI(path)}`;
+      img.alt = path;
+      body.append(img);
+    } else if (v.kind === 'text') {
+      body.append(el('pre', 'fv-pre', v.content));
+      if (v.truncated) body.append(el('p', 'set-hint', t('fvTruncated')));
+    } else {
+      body.append(el('p', 'set-hint', t('fvNoPreview')));
+    }
+  }).catch(() => {
+    if (!dlg.open) return;
+    body.innerHTML = '';
+    body.append(el('p', 'set-hint', t('fvNoPreview')));
+  });
 }
 
 async function loadAudit() {
@@ -752,7 +1156,7 @@ function fillPreset() {
   const preset = state.presets.find((p) => p.id === $('#pPreset').value);
   if (!preset) return;
   $('#pBaseUrl').value = preset.baseUrl;
-  $('#pModel').value = preset.model;
+  pEd.set(preset.models?.length ? preset.models : (preset.model ? [preset.model] : []));
   $('#pHint').textContent = preset.hint || '';
   if (!$('#pLabel').value) $('#pLabel').value = preset.label;
 }
@@ -771,6 +1175,7 @@ async function fillSettings() {
   await loadLocalModels().catch(() => {});
   await loadAudit();
   await loadUsageBox().catch(() => {});
+  await loadGrants().catch(() => {});
   await loadAccount().catch(() => {});
   await loadVolunteer().catch(() => {});
 }
@@ -780,8 +1185,23 @@ async function loadUsageBox() {
   state.usage = u;
   const box = $('#usageBox');
   box.innerHTML = '';
+  const bar = (pct) => {
+    const wrap = el('div', 'u-bar');
+    const fill = el('div', 'u-fill');
+    fill.style.width = Math.max(2, Math.min(100, pct)) + '%';
+    wrap.append(fill);
+    return wrap;
+  };
+  // Daily quota bar (v0.12, user-set): the denominator is a daily
+  // allowance that starts at 500M tokens and doubles whenever the
+  // day's usage passes it — the bar tracks TODAY against that tier,
+  // so it visibly moves all day and resets tomorrow. Per-bot bars
+  // use the same tier with each bot's today numbers.
+  const q = u.quota || { today: u.today.total, tier: 500000000 };
   const sum = el('div', 'pv-meta', `${t('usageToday')}: ${fmtNum(u.today.total)} · ${t('usageTotalAll')}: ${fmtNum(u.total.total)} (${fmtNum(u.total.turns)} ${t('usageTurns')})`);
   box.append(sum);
+  box.append(el('div', 'pv-meta', t('quotaOf', { today: fmtNum(q.today), tier: fmtNum(q.tier) }) + ' · ' + t('quotaTierLbl', { tier: fmtNum(q.tier) })));
+  box.append(bar((q.today / q.tier) * 100));
   for (const b of u.byBot) {
     const row = el('div', 'provider-row');
     const info = el('div');
@@ -789,7 +1209,28 @@ async function loadUsageBox() {
       el('div', 'pv-name', b.botName),
       el('div', 'pv-meta', `${fmtNum(b.total)} tokens · ↑${fmtNum(b.prompt)} ↓${fmtNum(b.completion)} · ${fmtNum(b.turns)} ${t('usageTurns')}`)
     );
+    info.append(bar(((b.todayTotal || 0) / q.tier) * 100));
     row.append(info);
+    box.append(row);
+  }
+}
+
+/* Persistent "always allow" grants (v0.12): listed here, revocable
+ * here. A grant = this account + one bot + one tool. */
+async function loadGrants() {
+  const box = $('#grantsBox');
+  if (!box) return;
+  let grants = [];
+  try { ({ grants } = await api('GET', '/api/grants')); } catch { return; }
+  box.innerHTML = '';
+  if (!grants.length) { box.append(el('p', 'set-hint', t('grantsEmpty'))); return; }
+  for (const g of grants) {
+    const row = el('div', 'provider-row');
+    const info = el('div');
+    info.append(el('div', 'pv-name', `${g.botName} · ${g.tool}`), el('div', 'pv-meta', String(g.at || '').slice(0, 10)));
+    const btn = el('button', 'mini-btn danger-text', t('grantRevoke'));
+    btn.onclick = async () => { await api('DELETE', '/api/grants', { botId: g.botId, tool: g.tool }); loadGrants(); };
+    row.append(info, btn);
     box.append(row);
   }
 }
@@ -804,7 +1245,15 @@ async function loadAccount() {
     me.append(el('div', '', t('meLine', { name: st.user.name, role: t(st.user.role === 'owner' ? 'roleOwner' : 'roleMember') })));
     if (st.user.legacy) me.append(el('div', 'lm-err', t('legacyNote')));
   }
-  $('#pwForm').style.display = st.user && !st.user.legacy ? '' : 'none';
+  $('#pwForm').style.display = st.user && !st.user.legacy && !st.user.sso ? '' : 'none';
+  const realAcct = Boolean(st.user && !st.user.legacy && !st.user.implicit);
+  $('#profileForm').style.display = realAcct ? '' : 'none';
+  $('#sessBox').style.display = realAcct ? '' : 'none';
+  if (realAcct) {
+    $('#pfName').value = st.user.displayName || '';
+    $('#pfEmail').value = st.user.email || '';
+    loadSessions();
+  }
   const box = $('#usersBox');
   if (st.user?.role !== 'owner') { box.style.display = 'none'; return; }
   box.style.display = '';
@@ -820,13 +1269,39 @@ async function loadAccount() {
       nameEl,
       el('div', 'pv-meta', `${t(u.role === 'owner' ? 'roleOwner' : 'roleMember')} · ${new Date(u.createdAt).toLocaleDateString()}${u.volunteerSince ? ' · ' + t('volBadge') : ''}`)
     );
+    if (u.disabled) info.append(el('div', 'pv-meta', '· ' + t('disabledTag')));
     row.append(info);
     if (u.name !== st.user.name) {
+      const acts = el('div', 'lm-actions');
+      const tog = el('button', 'mini-btn', t(u.disabled ? 'uEnable' : 'uDisable'));
+      tog.onclick = async () => { await api('POST', `/api/auth/users/${u.id}/disabled`, { disabled: !u.disabled }); loadAccount(); };
       const del = el('button', 'mini-btn danger-text', t('del'));
       del.onclick = async () => { await api('DELETE', `/api/auth/users/${u.id}`); loadAccount(); };
-      row.append(del);
+      acts.append(tog, del);
+      row.append(acts);
     }
     list.append(row);
+  }
+}
+
+async function loadSessions() {
+  const box = $('#sessList');
+  if (!box) return;
+  let sessions = [];
+  try { ({ sessions } = await api('GET', '/api/auth/sessions')); } catch { return; }
+  box.innerHTML = '';
+  if (!sessions.length) { box.append(el('p', 'set-hint', t('sessUnknown'))); return; }
+  for (const s of sessions) {
+    const row = el('div', 'provider-row');
+    const info = el('div');
+    info.append(el('div', 'pv-meta', `${s.ip || '—'} · ${s.createdAt ? new Date(s.createdAt).toLocaleString() : t('sessUnknown')}${s.current ? ' · ' + t('sessNow') : ''}`));
+    row.append(info);
+    if (!s.current) {
+      const rev = el('button', 'mini-btn danger-text', t('sessRevoke'));
+      rev.onclick = async () => { await api('DELETE', `/api/auth/sessions/${s.sid}`); loadSessions(); };
+      row.append(rev);
+    }
+    box.append(row);
   }
 }
 
@@ -838,6 +1313,60 @@ async function loadVolunteer() {
     : t('volNot', { n: v.members });
   $('#volJoinBtn').hidden = v.joined || v.needsAccount;
   $('#volLeaveBtn').hidden = !v.joined;
+}
+
+/* --------------------- self-built dropdowns --------------------- */
+/* The main site's rule, applied here too (item 23): no native
+ * <select> popups — they render as OS chrome and break the design.
+ * The native element stays in the DOM as the value store (all
+ * existing code reads .value / assigns onchange and keeps working);
+ * a button + popup mirrors it. Option rebuilds are picked up by a
+ * MutationObserver, value changes by the change event. */
+let openDdPop = null;
+function enhanceSelect(sel) {
+  if (!sel || sel.dataset.dd) return;
+  sel.dataset.dd = '1';
+  const wrap = el('div', 'dd');
+  const btn = el('button', 'dd-btn');
+  btn.type = 'button';
+  const pop = el('div', 'dd-pop');
+  pop.hidden = true;
+  wrap.append(btn, pop);
+  sel.after(wrap);
+  sel.classList.add('dd-native');
+  const sync = () => {
+    const o = sel.options[sel.selectedIndex];
+    btn.innerHTML = '';
+    btn.append(el('span', 'dd-label', o ? o.textContent : ''), el('span', 'dd-caret', '▾'));
+    pop.innerHTML = '';
+    for (const opt of sel.options) {
+      const item = el('button', 'dd-item' + (opt.value === sel.value ? ' on' : ''), opt.textContent);
+      item.type = 'button';
+      item.onclick = (e) => {
+        e.stopPropagation();
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        pop.hidden = true; openDdPop = null;
+        sync();
+      };
+      pop.append(item);
+    }
+  };
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    if (openDdPop && openDdPop !== pop) openDdPop.hidden = true;
+    sync();
+    pop.hidden = !pop.hidden;
+    openDdPop = pop.hidden ? null : pop;
+  };
+  pop.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => { pop.hidden = true; if (openDdPop === pop) openDdPop = null; });
+  new MutationObserver(sync).observe(sel, { childList: true });
+  sel.addEventListener('change', sync);
+  sync();
+}
+function enhanceAllSelects() {
+  for (const sel of document.querySelectorAll('select')) enhanceSelect(sel);
 }
 
 /* --------------------------- views --------------------------- */
@@ -890,6 +1419,11 @@ async function loadTaskCenter() {
       row.append(info, el('span', 'pill stp-' + pillCls, '● ' + t(pillKey)));
       const acts = el('div', 'lm-actions');
       if (r.live) {
+        // Jump straight to the run's chat — for an awaiting_approval
+        // run that is where the (restored) approval card waits.
+        const open = el('button', 'mini-btn', t('tView'));
+        open.onclick = async () => { await selectBot(r.botId); };
+        acts.append(open);
         const stop = el('button', 'mini-btn danger-text', t('tStop'));
         stop.onclick = async () => { await api('POST', `/api/bots/${r.botId}/stop`); loadTaskCenter(); loadBots(); };
         acts.append(stop);
@@ -933,9 +1467,22 @@ async function loadWorkspace() {
     const fn = el('span', 'ws-fname');
     fn.innerHTML = icon(it.dir ? 'folder' : 'file', 15);
     fn.append(el('span', '', ' ' + it.path));
+    if (!it.dir) {
+      fn.style.cursor = 'pointer';
+      fn.title = it.path;
+      fn.onclick = () => openFileViewer(botId, it.path);
+    }
     row.append(fn);
     if (!it.dir) {
       row.append(el('span', 'pv-meta', fmtSize(it.size)));
+      if (/\.html?$/i.test(it.path)) {
+        const pv = el('button', 'mini-btn', t('preview'));
+        pv.onclick = () => openPreview(botId, it.path);
+        row.append(pv);
+        const sh = el('button', 'mini-btn', t('sharePreview'));
+        sh.onclick = () => sharePreview(botId, it.path);
+        row.append(sh);
+      }
       const dl = el('button', 'mini-btn');
       dl.innerHTML = icon('dl', 14);
       dl.onclick = () => downloadFile(`/api/bots/${botId}/files/${encodeURI(it.path)}`, it.path.split('/').pop());
@@ -943,6 +1490,42 @@ async function loadWorkspace() {
     }
     listEl.append(row);
   }
+  // Site preview shortcut when the project has a root index.html.
+  if (ws.items.some((it) => !it.dir && it.path === 'index.html')) {
+    const site = el('button', 'ws-open', t('pvSite'));
+    site.onclick = () => openPreview(botId, 'index.html');
+    listEl.prepend(site);
+  }
+}
+
+/* Preview overlay (v0.12): the workspace's web project, rendered in
+ * a sandboxed iframe (the server also sends a sandbox CSP, so the
+ * preview can never reach the app's session). */
+function openPreview(botId, rel) {
+  closePreview();
+  const wrap = el('div', 'pv-overlay');
+  const head = el('div', 'pv-head');
+  head.append(el('span', 'pv-title', rel));
+  const openBtn = el('button', 'mini-btn', '↗');
+  openBtn.onclick = () => window.open(`/api/bots/${botId}/preview/${encodeURI(rel)}`, '_blank');
+  const x = el('button', 'mini-btn', '✕');
+  x.onclick = closePreview;
+  head.append(openBtn, x);
+  const frame = document.createElement('iframe');
+  frame.className = 'pv-frame';
+  frame.setAttribute('sandbox', 'allow-scripts allow-modals allow-popups allow-forms');
+  frame.src = `/api/bots/${botId}/preview/${rel.split('/').map(encodeURIComponent).join('/')}`;
+  wrap.append(head, frame);
+  wrap.id = 'pvOverlay';
+  document.body.append(wrap);
+}
+function closePreview() { document.getElementById('pvOverlay')?.remove(); }
+async function sharePreview(botId, rel) {
+  try {
+    const { url } = await api('POST', `/api/bots/${botId}/share`, { kind: 'preview', file: rel, days: 30 });
+    try { await navigator.clipboard.writeText(url); } catch { /* clipboard unavailable */ }
+    window.prompt(t('pvLinkReady'), url);
+  } catch (e) { addMessage('system', String(e.message || e)); }
 }
 
 /* --------------------------- lock --------------------------- */
@@ -953,6 +1536,9 @@ async function loadWorkspace() {
 let lockMode = 'login';
 async function showLock() {
   $('#lockScreen').hidden = false;
+  const authErr = new URLSearchParams(location.search).get('authError');
+  if (authErr) { showAuthErr(authErr); history.replaceState(null, '', location.pathname); }
+  if (pendingLockErr) { showAuthErr(pendingLockErr); pendingLockErr = ''; }
   try {
     const st = await (await fetch('/api/auth/state')).json();
     state.auth = st;
@@ -960,47 +1546,251 @@ async function showLock() {
     paintLock(st);
   } catch { /* keep defaults */ }
 }
+/* Field layout follows the main site's auth modal: labeled fields,
+ * a show-password eye, a strength bar when creating a password, a
+ * two-step reset, login/register switching, Turnstile when the server
+ * configures it, and social buttons when configured. Server failures
+ * arrive as stable keys and are rendered in the user's language —
+ * internal error text never reaches this screen. */
+let resetStep = 1;
+function showAuthErr(key) {
+  const elx = $('#lockError');
+  if (!key) { elx.textContent = ''; return; }
+  const translated = t(key);
+  elx.textContent = translated !== key ? translated : (key === 'bad' || key.startsWith('err') ? t('lockErr') : key);
+}
+async function authPost(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(data.error || 'bad'); e.key = data.error; throw e; }
+  return data;
+}
+/* ---- Turnstile (only when the server configured a site key) ---- */
+let tsWidget = null;
+function ensureTurnstile() {
+  if (!state.auth?.turnstileSiteKey) return;
+  if (window.turnstile) { renderTurnstile(); return; }
+  if (document.querySelector('script[data-ts]')) return;
+  const s = document.createElement('script');
+  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+  s.async = true; s.defer = true; s.dataset.ts = '1';
+  s.onload = () => renderTurnstile();
+  document.head.append(s);
+}
+function renderTurnstile() {
+  const box = $('#authCap');
+  if (!box || !window.turnstile || box.hidden) return;
+  if (tsWidget == null) {
+    try { tsWidget = window.turnstile.render(box, { sitekey: state.auth.turnstileSiteKey, theme: 'dark' }); } catch { /* retry next paint */ }
+  }
+}
+function tsToken() {
+  try { return window.turnstile && tsWidget != null ? window.turnstile.getResponse(tsWidget) : undefined; } catch { return undefined; }
+}
+function tsReset() {
+  try { if (window.turnstile && tsWidget != null) window.turnstile.reset(tsWidget); } catch { /* noop */ }
+}
+/* ---- Telegram login widget callback ---- */
+window.onTelegramAuth = async (u) => {
+  try {
+    await authPost('/api/auth/telegram', u);
+    hideLock();
+    location.reload();
+  } catch (e) { showAuthErr(e.key || 'errSocial'); }
+};
+function paintSocial(st) {
+  const g = Boolean(st?.social?.google);
+  const tg = st?.social?.telegram || '';
+  $('#socialRow').hidden = !(g || tg) || lockMode === 'setup' || lockMode === 'token' || lockMode === 'reset';
+  $('#googleBtn').hidden = !g;
+  const wrap = $('#tgWrap');
+  wrap.hidden = !tg;
+  if (tg && !wrap.dataset.done) {
+    wrap.dataset.done = '1';
+    const s = document.createElement('script');
+    s.async = true;
+    s.src = 'https://telegram.org/js/telegram-widget.js?22';
+    s.setAttribute('data-telegram-login', tg);
+    s.setAttribute('data-size', 'large');
+    s.setAttribute('data-radius', '12');
+    s.setAttribute('data-onauth', 'onTelegramAuth(user)');
+    wrap.append(s);
+  }
+}
+let localOpen = false;
 function paintLock(st) {
+  // Main-site SSO is the front door: local forms stay folded behind
+  // the admin toggle until asked for (bootstrap + break-glass).
+  const ssoFirst = lockMode === 'login' && Boolean(st?.sso?.enabled) && !localOpen;
+  $('#ssoBox').hidden = !ssoFirst;
+  if (ssoFirst) {
+    $('#ssoBtn').href = (st.sso.base || 'https://egame.dev') + '/api/auth/handoff/start?to=agent';
+    for (const id of ['lfName', 'lfPass', 'lfRegEmail', 'lfRegCode', 'lfRegConfirm', 'lfToken', 'lfEmail', 'lfSendRow', 'lfCode', 'lfNewPass', 'lfConfirm', 'lfForgotRow', 'authCap', 'socialRow', 'lockSwitch']) $('#' + id).hidden = true;
+    $('#pwBarWrap').hidden = true;
+    $('#lockSubmit').hidden = true;
+    $('#lockAlt').hidden = true;
+    $('#lockBack').hidden = true;
+    $('#lockHint').textContent = t('ssoNote');
+    return;
+  }
   const setup = lockMode === 'setup';
   const token = lockMode === 'token';
-  $('#lockHint').textContent = setup ? t('setupHint') : t('lockHintAcct');
-  $('#lockSubmit').textContent = setup ? t('createAcct') : t('loginBtn');
-  $('#lockName').hidden = token;
-  $('#lockPass').hidden = token;
-  $('#lockToken').hidden = !token;
+  const reset = lockMode === 'reset';
+  const register = lockMode === 'register';
+  const show = (id, on) => { $('#' + id).hidden = !on; };
+  $('#lockHint').textContent = setup ? t('setupHint') : register ? t('regHint') : reset ? t('resetHint') : t('lockHintAcct');
+  $('#lockSubmit').textContent = setup ? t('createAcct') : reset ? t('resetBtn') : register ? t('regBtn') : t('loginBtn');
+  $('#lockSubmit').hidden = reset && resetStep === 1;
+  show('lfName', !token && !reset);
+  show('lfPass', !token && !reset);
+  $('#pwBarWrap').hidden = !(setup || register);
+  show('lfRegEmail', setup || register);
+  $('#lockRegEmailLbl').textContent = register ? t('fldEmail') : t('fldEmailOpt');
+  $('#rgSend').hidden = !register;
+  show('lfRegCode', register);
+  show('lfRegConfirm', register);
+  show('lfToken', token || (setup && Boolean(st?.tokenEnabled)));
+  $('#tokenHint').hidden = !setup;
+  show('lfEmail', reset && resetStep === 1);
+  show('lfSendRow', reset && resetStep === 1);
+  show('lfCode', reset && resetStep === 2);
+  show('lfNewPass', reset && resetStep === 2);
+  show('lfConfirm', reset && resetStep === 2);
+  show('lfForgotRow', lockMode === 'login' && Boolean(st?.mailEnabled));
+  $('#lockBack').hidden = !reset;
   const alt = $('#lockAlt');
-  if (st?.tokenEnabled && !token) {
+  if (reset || register) alt.hidden = true;
+  else if (st?.tokenEnabled && !token) {
     alt.hidden = false;
     alt.textContent = t('lockUseToken');
   } else if (token) {
     alt.hidden = false;
     alt.textContent = t('lockUseAcct');
   } else alt.hidden = true;
+  // login <-> register switch (main site's bottom row)
+  const sw = $('#lockSwitch');
+  if (lockMode === 'login' && st?.registerOpen) {
+    sw.hidden = false;
+    $('#lockSwitchTxt').textContent = t('noAcctYet');
+    $('#lockSwitchBtn').textContent = t('regBtn');
+  } else if (register) {
+    sw.hidden = false;
+    $('#lockSwitchTxt').textContent = t('haveAcct');
+    $('#lockSwitchBtn').textContent = t('loginBtn');
+  } else sw.hidden = true;
+  // Turnstile shows for password login, registration and reset sends.
+  const capWanted = Boolean(st?.turnstileSiteKey) && (lockMode === 'login' || register || (reset && resetStep === 1));
+  $('#authCap').hidden = !capWanted;
+  if (capWanted) ensureTurnstile(); else tsReset();
+  paintSocial(st);
 }
+$('#lockSwitchBtn').addEventListener('click', () => {
+  lockMode = lockMode === 'register' ? 'login' : 'register';
+  showAuthErr('');
+  paintLock(state.auth);
+});
+document.querySelectorAll('.pw-toggle').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const input = document.getElementById(btn.dataset.pw);
+    if (input) input.type = input.type === 'password' ? 'text' : 'password';
+  });
+});
+function paintStrength() {
+  if (lockMode !== 'setup' && lockMode !== 'register') return;
+  const v = $('#lockPass').value;
+  let score = 0;
+  if (v.length >= 8) score++;
+  if (v.length >= 12) score++;
+  if (/[a-z]/.test(v) && /[A-Z]/.test(v)) score++;
+  if (/\d/.test(v)) score++;
+  if (/[^A-Za-z0-9]/.test(v)) score++;
+  $('#pwFill').style.width = (v ? Math.max(12, score * 20) : 0) + '%';
+  $('#pwFill').style.background = score <= 2 ? 'var(--danger)' : score <= 3 ? '#e6b93d' : 'var(--b)';
+  $('#pwHint').textContent = v ? t(score <= 2 ? 'pwWeak' : score <= 3 ? 'pwMid' : 'pwStrong') : '';
+}
+$('#lockPass').addEventListener('input', paintStrength);
+$('#lockForgot').addEventListener('click', () => {
+  lockMode = 'reset';
+  resetStep = 1;
+  showAuthErr('');
+  paintLock(state.auth);
+});
+$('#lockBack').addEventListener('click', () => {
+  lockMode = state.auth?.hasUsers ? 'login' : 'setup';
+  resetStep = 1;
+  showAuthErr('');
+  paintLock(state.auth);
+});
+function cooldown(btn, seconds = 60) {
+  let left = seconds;
+  btn.disabled = true;
+  const iv = setInterval(() => {
+    left -= 1;
+    btn.textContent = left > 0 ? `${t('sendCode')} (${left})` : t('sendCode');
+    if (left <= 0) { clearInterval(iv); btn.disabled = false; }
+  }, 1000);
+}
+$('#lockSendCode').addEventListener('click', async () => {
+  const btn = $('#lockSendCode');
+  showAuthErr('');
+  try {
+    await authPost('/api/auth/send-code', { email: $('#lockEmail').value, purpose: 'reset', turnstileToken: tsToken() });
+    $('#lockError').textContent = t('codeSent');
+    resetStep = 2;
+    paintLock(state.auth);
+    cooldown(btn);
+  } catch (e) { showAuthErr(e.key || 'bad'); tsReset(); }
+});
+$('#rgSend').addEventListener('click', async () => {
+  const btn = $('#rgSend');
+  showAuthErr('');
+  try {
+    await authPost('/api/auth/send-code', { email: $('#lockRegEmail').value, purpose: 'register', turnstileToken: tsToken() });
+    $('#lockError').textContent = t('codeSent');
+    cooldown(btn);
+  } catch (e) { showAuthErr(e.key || 'bad'); tsReset(); }
+});
 function hideLock() { $('#lockScreen').hidden = true; }
+$('#localToggle').addEventListener('click', () => { localOpen = true; showAuthErr(''); paintLock(state.auth); });
 $('#lockAlt').addEventListener('click', () => {
+  localOpen = true;
   lockMode = lockMode === 'token' ? (state.auth?.hasUsers ? 'login' : 'setup') : 'token';
-  $('#lockError').textContent = '';
+  showAuthErr('');
   paintLock(state.auth);
 });
 $('#lockForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  $('#lockError').textContent = '';
+  showAuthErr('');
   try {
+    if (lockMode === 'reset') {
+      if ($('#lockNewPass').value !== $('#lockConfirm').value) throw Object.assign(new Error('x'), { key: 'pwMismatch' });
+      await authPost('/api/auth/reset', { email: $('#lockEmail').value, code: $('#lockCode').value, password: $('#lockNewPass').value });
+      lockMode = 'login';
+      resetStep = 1;
+      paintLock(state.auth);
+      $('#lockError').textContent = t('resetDone');
+      return;
+    }
+    if (lockMode === 'register') {
+      if ($('#lockPass').value !== $('#lockRegConfirm').value) throw Object.assign(new Error('x'), { key: 'pwMismatch' });
+      await authPost('/api/auth/register', {
+        name: $('#lockName').value, email: $('#lockRegEmail').value, code: $('#rgCode').value,
+        password: $('#lockPass').value, turnstileToken: tsToken(),
+      });
+      hideLock();
+      location.reload();
+      return;
+    }
     const url = lockMode === 'setup' ? '/api/auth/register' : '/api/auth/login';
     const body = lockMode === 'token'
       ? { token: $('#lockToken').value }
-      : { name: $('#lockName').value, password: $('#lockPass').value };
-    const res = await fetch(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'bad');
+      : { name: $('#lockName').value, password: $('#lockPass').value, turnstileToken: tsToken(), ...(lockMode === 'setup' ? { email: $('#lockRegEmail').value, token: $('#lockToken').value } : {}) };
+    await authPost(url, body);
     hideLock();
     location.reload();
   } catch (e) {
-    $('#lockError').textContent = e.message && e.message !== 'bad' ? e.message : t('lockErr');
+    showAuthErr(e.key || 'bad');
+    tsReset();
   }
 });
 $('#backBtn').addEventListener('click', () => document.body.classList.remove('in-chat'));
@@ -1011,9 +1801,20 @@ if ('serviceWorker' in navigator) {
 }
 
 /* ---------------------------- init ---------------------------- */
+let pendingLockErr = '';
 async function init() {
+  // Main-site handoff landing: ?hk=<one-time token> from egame.dev.
+  // Redeem it (our server talks to the main site server-to-server)
+  // before anything reads the auth state; the URL is cleaned either way.
+  const hkParam = new URLSearchParams(location.search).get('hk');
+  if (hkParam) {
+    history.replaceState(null, '', location.pathname);
+    try { await authPost('/api/auth/sso/exchange', { token: hkParam }); }
+    catch (e) { pendingLockErr = e.key || 'errSso'; }
+  }
   buildLangMenu();
   applyLang();
+  enhanceAllSelects();
   const { engines } = await api('GET', '/api/engines');
   state.engines = engines;
   await loadProviders().catch(() => {});
@@ -1090,6 +1891,8 @@ async function init() {
   }
   $('#onlinePill').onclick = () => switchView('tasks');
   $('#wsOpen').onclick = () => { state.wsBot = state.current; switchView('workspace'); };
+  $('#fvClose').onclick = () => $('#fileViewer').close();
+  $('#fvSave').onclick = () => { if (fvCtx) downloadFile(`/api/bots/${fvCtx.botId}/files/${encodeURI(fvCtx.path)}`, fvCtx.path.split('/').pop()); };
   $('#qaNew').onclick = () => {
     if (state.current) { selectBot(state.current); $('#input').focus(); }
     else openDialog(null);
@@ -1111,11 +1914,19 @@ async function init() {
       $('#pwOld').value = ''; $('#pwNew').value = '';
     } catch (e) { $('#pwMsg').textContent = e.message; }
   });
+  $('#profileForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      await api('PATCH', '/api/auth/me', { displayName: $('#pfName').value, email: $('#pfEmail').value });
+      $('#pfMsg').textContent = t('profSaved');
+      loadAccount();
+    } catch (e) { $('#pfMsg').textContent = e.message || 'bad'; }
+  });
   $('#userForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     try {
-      await api('POST', '/api/auth/users', { name: $('#uName').value, password: $('#uPass').value, role: $('#uRole').value });
-      $('#uName').value = ''; $('#uPass').value = '';
+      await api('POST', '/api/auth/users', { name: $('#uName').value, password: $('#uPass').value, role: $('#uRole').value, email: $('#uEmail').value });
+      $('#uName').value = ''; $('#uPass').value = ''; $('#uEmail').value = '';
       loadAccount();
     } catch (e) { addMessage('system', e.message); }
   });
@@ -1128,15 +1939,18 @@ async function init() {
   /* keep status pills honest: quiet refresh while browsing the team
    * or task views (never while a chat turn is streaming) */
   setInterval(() => {
-    if (document.hidden || state.busy) return;
-    if (state.view === 'team') loadBots().catch(() => {});
-    if (state.view === 'tasks') loadTaskCenter().catch(() => {});
+    if (document.hidden) return;
+    if (!state.busy && state.view === 'team') loadBots().catch(() => {});
+    if (!state.busy && state.view === 'tasks') loadTaskCenter().catch(() => {});
+    // Pending approvals are restored even mid-stream (deduped by id),
+    // so a card can never be lost to a view switch again.
+    if (state.current) syncPendingApprovals();
   }, 6000);
   $('#providerForm').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     await api('POST', '/api/providers', {
       presetId: $('#pPreset').value, label: $('#pLabel').value,
-      baseUrl: $('#pBaseUrl').value, model: $('#pModel').value, apiKey: $('#pKey').value,
+      baseUrl: $('#pBaseUrl').value, models: pEd.get(), apiKey: $('#pKey').value,
     });
     $('#pKey').value = '';
     await loadProviders();

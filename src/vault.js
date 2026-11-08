@@ -7,6 +7,31 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
+import os from 'node:os';
+
+// The file key lives OUTSIDE the data directory (audit fix): bot
+// workspaces sit under data/projects/, and an approved shell used to
+// reach data/.vault-key with a simple ../../ — the vault's own key
+// must not be a short walk from the sandbox. Location:
+// START_AGENTS_VAULT_KEY_FILE, else ~/.starts-agents/vault.key.
+// An existing data/.vault-key is migrated (moved) on first boot.
+function keyFilePath() {
+  if (process.env.START_AGENTS_VAULT_KEY_FILE) return process.env.START_AGENTS_VAULT_KEY_FILE;
+  return path.join(os.homedir(), '.starts-agents', 'vault.key');
+}
+function migrateLegacyKeyFile(target) {
+  const legacy = path.join(config.dataDir, '.vault-key');
+  try {
+    if (fs.existsSync(target) || !fs.existsSync(legacy)) return;
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(legacy, target);
+    fs.chmodSync(target, 0o600);
+    fs.unlinkSync(legacy);
+    console.log(`[vault] migrated master key file from ${legacy} to ${target}`);
+  } catch (e) {
+    console.error('[vault] legacy key migration failed: ' + e.message);
+  }
+}
 
 let masterKey = null;
 let keySource = '';
@@ -23,8 +48,9 @@ function loadMasterKey() {
     keySource = 'env START_AGENTS_MASTER_KEY';
     return masterKey;
   }
-  const keyFile = path.join(config.dataDir, '.vault-key');
-  fs.mkdirSync(config.dataDir, { recursive: true });
+  const keyFile = keyFilePath();
+  migrateLegacyKeyFile(keyFile);
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
   try {
     const raw = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'base64');
     if (raw.length !== 32) {
@@ -41,7 +67,7 @@ function loadMasterKey() {
     masterKey = crypto.randomBytes(32);
     fs.writeFileSync(keyFile, masterKey.toString('base64'), { mode: 0o600 });
   }
-  keySource = 'file data/.vault-key';
+  keySource = 'file ' + keyFile;
   return masterKey;
 }
 

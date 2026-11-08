@@ -1,6 +1,11 @@
 // The bot's hands — a coding toolset. Every tool declares a risk level:
-//   'safe' — runs immediately (read-only, confined to the workspace)
+//   'safe' — runs immediately: read-only tools, plus update_tasks,
+//            which only mutates the bot's OWN task list (agent state,
+//            never user files, never the shell, never the network)
 //   'ask'  — must pass the approval broker; a human clicks Allow first
+// Tools may return a plain string, or { ok, output } when success is
+// not honestly decidable from the text (run_shell's exit code) — the
+// server's failure tracking reads the structured form (audit fix).
 // All file tools are confined to the bot's own project workspace
 // (data/projects/<botId>/). Tools receive (args, ctx) and return a
 // string the engine can read. An optional preview(args, ctx) renders
@@ -49,6 +54,10 @@ const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'uploads']);
 function walk(dir, base, depth, out) {
   if (depth > 6 || out.length > 400) return;
   for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+    // Symlinks are skipped entirely (audit fix): search_text reads
+    // whatever walk lists, and a symlink inside the workspace can
+    // point outside it — read_file's realpath check never got a say.
+    if (d.isSymbolicLink()) continue;
     if (d.isDirectory() && SKIP_DIRS.has(d.name)) continue;
     const full = path.join(dir, d.name);
     out.push(path.relative(base, full) + (d.isDirectory() ? '/' : ''));
@@ -61,16 +70,34 @@ function walk(dir, base, depth, out) {
  * data/packages/<botId>/. Skips dependency/build dirs and oversize
  * files. Returns { file, size, files } — the server turns this into a
  * download card in the chat. */
+/* Files that must never ride along in a deployment package (audit
+ * fix): env files, private keys, credential stores. Matched against
+ * the workspace-relative path. */
+const SENSITIVE_SEGMENTS = new Set(['.aws', '.ssh', '.gnupg']);
+function isSensitiveFile(rel) {
+  const parts = rel.split(path.sep);
+  if (parts.some((seg) => SENSITIVE_SEGMENTS.has(seg))) return true;
+  const base = parts[parts.length - 1].toLowerCase();
+  if (base === '.env' || base.startsWith('.env.')) return true;
+  if (base === '.vault-key' || base === 'vault.key' || base === '.npmrc' || base === '.netrc') return true;
+  if (/\.(pem|key|p12|pfx|keystore)$/.test(base)) return true;
+  if (/^id_(rsa|dsa|ecdsa|ed25519)$/.test(base)) return true;
+  if (base.includes('credential') || base.endsWith('.secret') || base.endsWith('.secrets')) return true;
+  return false;
+}
+
 export function buildPackage(ctx, name) {
   ensureWorkspace(ctx);
   const base = path.resolve(ctx.workspace);
   const entries = [];
+  const excluded = [];
   let total = 0;
   const collect = (dir) => {
     for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
       if (d.isDirectory() && SKIP_DIRS.has(d.name)) continue;
       const full = path.join(dir, d.name);
       if (d.isDirectory()) { collect(full); continue; }
+      if (isSensitiveFile(path.relative(base, full))) { excluded.push(path.relative(base, full)); continue; }
       // never package a symlink that points outside the workspace
       try {
         const real = fs.realpathSync(full);
@@ -92,12 +119,12 @@ export function buildPackage(ctx, name) {
   fs.mkdirSync(dir, { recursive: true });
   const zip = makeZip(entries);
   fs.writeFileSync(path.join(dir, file), zip);
-  return { file, size: zip.length, files: entries.length };
+  return { file, size: zip.length, files: entries.length, list: entries.map((e) => e.name).slice(0, 60), excluded };
 }
 
 // A small review diff: common prefix/suffix trimmed, changed middle
 // shown with - / + prefixes, capped for phone screens.
-export function previewDiff(oldText, newText, capLines = 60) {
+export function previewDiff(oldText, newText, capLines = 120) {
   const a = String(oldText ?? '').split('\n');
   const b = String(newText ?? '').split('\n');
   let lo = 0;
@@ -151,11 +178,18 @@ export const TOOLS = [
       const q = String(args.query || '').toLowerCase();
       if (!q) throw new Error('query required');
       const hits = [];
+      const realRoot = fs.realpathSync(root);
       for (const rel of files) {
         if (rel.endsWith('/') || hits.length >= 50) continue;
         const full = path.join(root, rel);
         let text;
-        try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
+        try {
+          // Belt and braces with walk()'s symlink skip: verify the
+          // real path still lives under the search root before reading.
+          const real = fs.realpathSync(full);
+          if (real !== realRoot && !real.startsWith(realRoot + path.sep)) continue;
+          text = fs.readFileSync(full, 'utf8');
+        } catch { continue; }
         if (text.includes('�')) continue; // binary-ish, skip
         text.split('\n').forEach((line, i) => {
           if (hits.length < 50 && line.toLowerCase().includes(q)) {
@@ -225,8 +259,17 @@ export const TOOLS = [
       return new Promise((resolve) => {
         // detached process group so a user Stop can kill the whole tree,
         // not just the shell (v0.7). Timeout + output cap enforced here.
+        // Environment whitelist (audit fix): the shell must NOT inherit
+        // the server's environment — it carried MASTER_KEY /
+        // ACCESS_TOKEN / provider keys in plaintext. Only the benign
+        // basics a shell needs are passed through.
+        const env = {};
+        for (const k of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'USER', 'SHELL']) {
+          if (process.env[k]) env[k] = process.env[k];
+        }
+        env.TERM = process.env.TERM || 'xterm';
         const child = spawn('bash', ['-lc', String(args.command || '')], {
-          cwd: ctx.workspace, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: ctx.workspace, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env,
         });
         let out = '';
         const push = (d) => { if (out.length < 256 * 1024) out += d.toString('utf8'); };
@@ -239,25 +282,82 @@ export const TOOLS = [
           if (ctx.signal.aborted) killTree();
           else ctx.signal.addEventListener('abort', onAbort, { once: true });
         }
-        child.on('error', (e) => { clearTimeout(timer); resolve('failed to start: ' + e.message); });
+        child.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, output: 'failed to start: ' + e.message }); });
         child.on('close', (code) => {
           clearTimeout(timer);
           if (ctx.signal) ctx.signal.removeEventListener('abort', onAbort);
           const aborted = ctx.signal && ctx.signal.aborted;
-          resolve((aborted ? 'stopped by user — ' : code ? `exit ${code} — ` : '') + out.slice(0, 6000) || '(no output)');
+          const output = ((aborted ? 'stopped by user — ' : code ? `exit ${code} — ` : '') + out.slice(0, 6000)) || '(no output)';
+          resolve({ ok: !aborted && code === 0, output });
         });
       });
     },
   },
   {
     name: 'package_project',
-    description: 'Package the whole workspace into a downloadable deployment zip. Call this when the work is done and verified, as the final deliverable.',
+    description: 'Package the whole workspace into a downloadable deployment zip. Call this when the work is done and verified, as the final deliverable. Runs without approval (v0.12): it only zips your own workspace, and sensitive files (.env, keys, credentials) are excluded automatically and reported.',
     risk: 'safe',
+    preview(args) {
+      return 'Package the whole workspace into a deployment zip (.env / key / credential files are excluded automatically).';
+    },
     args: { name: 'string, optional package name' },
     async run(args, ctx) {
       const pkg = buildPackage(ctx, args.name);
-      return JSON.stringify({ package: pkg.file, size: pkg.size, files: pkg.files });
+      return JSON.stringify({ package: pkg.file, size: pkg.size, files: pkg.files, excluded: pkg.excluded });
     },
+  },
+  {
+    name: 'delete_file',
+    description: 'Delete one file from the workspace. Needs approval.',
+    risk: 'ask',
+    args: { path: 'string, relative to the workspace' },
+    preview(args, ctx) {
+      ensureWorkspace(ctx);
+      const full = inWorkspace(ctx, args.path);
+      let size = '?';
+      try { size = fs.statSync(full).size + ' bytes'; } catch { /* missing */ }
+      return `DELETE ${args.path} (${size})`;
+    },
+    async run(args, ctx) {
+      ensureWorkspace(ctx);
+      const full = inWorkspace(ctx, args.path);
+      if (!fs.statSync(full).isFile()) throw new Error('not a file: ' + args.path);
+      fs.unlinkSync(full);
+      return `deleted ${args.path}`;
+    },
+  },
+  {
+    name: 'rename_file',
+    description: 'Rename or move a file inside the workspace. Needs approval.',
+    risk: 'ask',
+    args: { from: 'string', to: 'string' },
+    preview(args) { return `RENAME ${args.from} -> ${args.to}`; },
+    async run(args, ctx) {
+      ensureWorkspace(ctx);
+      const from = inWorkspace(ctx, args.from);
+      const to = inWorkspace(ctx, args.to);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+      return `renamed ${args.from} -> ${args.to}`;
+    },
+  },
+  {
+    name: 'browse_page',
+    description: 'Open a web page and read it as text — your browser. Launches a local headless Chromium ON DEMAND when one is installed (renders JavaScript), otherwise falls back to a plain fetch + text extraction. Read-only; loopback and private-network addresses are refused (use run_shell for local services).',
+    risk: 'safe',
+    args: { url: 'string, http(s) URL' },
+    async run(args) { return browsePage(String(args.url || '')); },
+  },
+  {
+    name: 'ask_teammate',
+    description: 'Delegate a self-contained task to a teammate bot, addressed by name. The teammate works in its OWN workspace with its own model and tools, and returns its final summary as this tool\'s result. Good for work matching a teammate\'s specialty. One level deep: teammates cannot delegate further.',
+    risk: 'safe',
+    args: { bot: 'string, teammate name (see the team roster in the system context)', task: 'string, the complete, self-contained task brief' },
+    async run(args, ctx) {
+      if (!ctx.askTeammate) throw new Error('teammate delegation is not available here');
+      return ctx.askTeammate(args);
+    },
+    preview(args) { return `ask ${args.bot}: ${String(args.task || '').slice(0, 90)}`; },
   },
   {
     name: 'update_tasks',
@@ -288,6 +388,94 @@ export const TOOLS = [
     },
   },
 ];
+
+/* ------------------------- browse_page ------------------------- */
+// The agent's browser, on demand (v0.12): nothing stays resident.
+// When a Chromium-family binary exists on the host we spawn it
+// headless for this one page (JS rendered), then it exits. Without
+// one, a plain fetch + tag-strip extraction still reads most pages.
+// Private / loopback targets are refused: this tool reads the public
+// web; poking the host's own services is run_shell's job, with a
+// human approving.
+let chromiumBin = undefined; // undefined = not probed yet
+async function findChromium() {
+  if (chromiumBin !== undefined) return chromiumBin;
+  const candidates = ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome'];
+  for (const c of candidates) {
+    const found = await new Promise((resolve) => {
+      const p = spawn('which', [c], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      p.stdout.on('data', (d) => { out += d; });
+      p.on('error', () => resolve(''));
+      p.on('close', () => resolve(out.trim().split('\n')[0] || ''));
+    });
+    if (found) { chromiumBin = found; return chromiumBin; }
+  }
+  chromiumBin = null;
+  return null;
+}
+function assertPublicUrl(u) {
+  let url;
+  try { url = new URL(u); } catch { throw new Error('invalid URL'); }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('only http(s) URLs');
+  const host = url.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local') || host === '::1' || host === '0.0.0.0') {
+    throw new Error('loopback / local addresses are refused — use run_shell for local services');
+  }
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [+m[1], +m[2]];
+    if (a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) {
+      throw new Error('private-network addresses are refused — use run_shell for local services');
+    }
+  }
+  return url;
+}
+function htmlToText(html) {
+  const title = (String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+  let text = String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<(\/(p|div|li|tr|h[1-6]|section|article|header|footer)|br\s*\/?)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n\s*\n+/g, '\n\n')
+    .trim();
+  return { title: title.replace(/\s+/g, ' ').trim(), text };
+}
+async function browsePage(rawUrl) {
+  const url = assertPublicUrl(rawUrl);
+  const bin = await findChromium();
+  if (bin) {
+    const dom = await new Promise((resolve) => {
+      const child = spawn(bin, ['--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars', '--virtual-time-budget=9000', '--timeout=20000', '--dump-dom', url.href], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      child.stdout.on('data', (d) => { if (out.length < 1024 * 1024) out += d.toString('utf8'); });
+      const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } resolve(''); }, 30_000);
+      child.on('error', () => { clearTimeout(timer); resolve(''); });
+      child.on('close', () => { clearTimeout(timer); resolve(out); });
+    });
+    if (dom && dom.length > 200) {
+      const { title, text } = htmlToText(dom);
+      return `[browser: headless chromium] ${title || url.href}\n${url.href}\n\n${text.slice(0, 12000) || '(page rendered but no readable text)'}`;
+    }
+    // fall through to the fetch reader
+  }
+  const res = await fetch(url.href, {
+    headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', accept: 'text/html, text/plain, */*' },
+    signal: AbortSignal.timeout(15000), redirect: 'follow',
+  });
+  if (!res.ok) throw new Error('page returned HTTP ' + res.status);
+  const ct = String(res.headers.get('content-type') || '');
+  const body = (await res.text()).slice(0, 1024 * 1024);
+  if (ct.includes('html')) {
+    const { title, text } = htmlToText(body);
+    return `[browser: fetch] ${title || url.href}\n${res.url || url.href}\n\n${text.slice(0, 12000) || '(no readable text)'}`;
+  }
+  return `[browser: fetch] ${res.url || url.href} (${ct || 'unknown type'})\n\n${body.slice(0, 12000)}`;
+}
 
 export function getTool(name) {
   return TOOLS.find((t) => t.name === name) || null;

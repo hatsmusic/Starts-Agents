@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Complay Ai</title>
-<link rel="stylesheet" href="/style.css?v=72">
+<link rel="stylesheet" href="/style.css?v=120">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0f212e">
 <link rel="icon" type="image/png" href="/icon.png">
@@ -17,15 +17,54 @@
 <body data-view="team">
 <div id="lockScreen" hidden>
   <div class="lock-card">
-    <img class="lock-img" src="/complay-c.svg?v=72" alt="Complay" width="76" height="76">
+    <img class="lock-img" src="/complay-c.svg?v=120" alt="Complay" width="76" height="76">
     <h2>Complay Ai</h2>
-    <p class="lock-hint" id="lockHint" data-i18n="lockHintAcct">用你的账号登录。第一次使用时，先创建管理员账号。</p>
+    <p class="lock-hint" id="lockHint" data-i18n="lockHintAcct">用你的账号登录。</p>
+      <div id="ssoBox" hidden>
+        <a id="ssoBtn" class="sso-btn" href="#" data-i18n="ssoLogin">使用 Complay 登录</a>
+        <p class="sso-note" data-i18n="ssoNote">使用 egame.dev 的账号登录，无需单独注册。</p>
+        <button type="button" id="localToggle" class="lock-link" data-i18n="localLogin">本地账号登录（管理员）</button>
+      </div>
     <form id="lockForm">
-      <input id="lockName" type="text" data-i18n-ph="lockNamePh" placeholder="账号名" autocomplete="username">
-      <input id="lockPass" type="password" data-i18n-ph="lockPassPh" placeholder="密码（至少 8 位）" autocomplete="current-password">
-      <input id="lockToken" type="password" data-i18n-ph="lockPh" placeholder="访问口令" autocomplete="current-password" hidden>
+      <div class="fld" id="lfName"><label for="lockName" data-i18n="fldIdentifier">账号名或邮箱</label>
+        <input id="lockName" type="text" data-i18n-ph="lockNamePh" placeholder="账号名或邮箱" autocomplete="username"></div>
+      <div class="fld" id="lfPass"><label for="lockPass" data-i18n="fldPassword">密码</label>
+        <div class="pw-wrap"><input id="lockPass" type="password" data-i18n-ph="lockPassPh" placeholder="密码（至少 8 位）" autocomplete="current-password">
+        <button type="button" class="pw-toggle" data-pw="lockPass" aria-label="Show password"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+        <div class="pw-bar" id="pwBarWrap" hidden><div id="pwFill"></div></div>
+        <div class="fld-hint" id="pwHint"></div></div>
+      <div class="fld" id="lfRegEmail" hidden><label for="lockRegEmail" id="lockRegEmailLbl" data-i18n="fldEmailOpt">邮箱（可选，用于找回密码）</label>
+        <div class="fld-row"><input id="lockRegEmail" type="email" data-i18n-ph="regEmailPh" placeholder="you@example.com" autocomplete="email">
+        <button type="button" id="rgSend" class="mini-btn" data-i18n="sendCode" hidden>发送验证码</button></div></div>
+      <div class="fld" id="lfRegCode" hidden><label for="rgCode" data-i18n="fldCode">验证码</label>
+        <input id="rgCode" type="text" inputmode="numeric" maxlength="6" data-i18n-ph="codePh" placeholder="123456" autocomplete="one-time-code"></div>
+      <div class="fld" id="lfRegConfirm" hidden><label for="lockRegConfirm" data-i18n="fldConfirmPw">确认密码</label>
+        <input id="lockRegConfirm" type="password" data-i18n-ph="fldConfirmPh" placeholder="再输入一次密码" autocomplete="new-password"></div>
+      <div class="fld" id="lfToken" hidden><label for="lockToken" data-i18n="fldToken">访问口令</label>
+        <input id="lockToken" type="password" data-i18n-ph="lockPh" placeholder="访问口令" autocomplete="current-password">
+        <div class="fld-hint" id="tokenHint" data-i18n="tokenSetupHint" hidden>服务器设置了访问口令：创建第一个账号需要填它，用来证明这台服务器是你的。</div></div>
+      <div class="fld" id="lfEmail" hidden><label for="lockEmail" data-i18n="fldEmail">账号邮箱</label>
+        <input id="lockEmail" type="email" data-i18n-ph="emailPh" placeholder="you@example.com" autocomplete="email"></div>
+      <div class="fld" id="lfSendRow" hidden>
+        <button type="button" id="lockSendCode" class="lock-send" data-i18n="sendCode">发送验证码</button></div>
+      <div class="fld" id="lfCode" hidden><label for="lockCode" data-i18n="fldCode">验证码</label>
+        <input id="lockCode" type="text" inputmode="numeric" maxlength="6" data-i18n-ph="codePh" placeholder="123456" autocomplete="one-time-code"></div>
+      <div class="fld" id="lfNewPass" hidden><label for="lockNewPass" data-i18n="fldNewPass">新密码</label>
+        <div class="pw-wrap"><input id="lockNewPass" type="password" data-i18n-ph="pwNewPh" placeholder="新密码（至少 8 位）" autocomplete="new-password">
+        <button type="button" class="pw-toggle" data-pw="lockNewPass" aria-label="Show password"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+      <div class="fld" id="lfConfirm" hidden><label for="lockConfirm" data-i18n="fldConfirm">确认新密码</label>
+        <input id="lockConfirm" type="password" data-i18n-ph="fldConfirmPh" placeholder="再输入一次新密码" autocomplete="new-password"></div>
+      <div class="auth-links" id="lfForgotRow" hidden><button type="button" id="lockForgot" class="lock-link" data-i18n="forgotPw">忘记密码？</button></div>
+      <div id="authCap" hidden></div>
       <button type="submit" id="lockSubmit" data-i18n="loginBtn">登录</button>
+      <div id="socialRow" hidden>
+        <div class="social-or"><span data-i18n="socialOr">或</span></div>
+        <a id="googleBtn" class="social-btn" href="/api/auth/google/start" hidden><svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.9-.1-1.5-.3-2.2H12v4.3h6.5c-.1 1.1-.8 2.7-2.4 3.8l3.7 2.9c2.3-2.1 3.7-5.2 3.7-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 5.9-1.1 7.9-2.9l-3.7-2.9c-1 .7-2.4 1.2-4.2 1.2-3.2 0-5.9-2.2-6.9-5.1L1.3 17.2C3.3 21.2 7.3 24 12 24z"/><path fill="#FBBC05" d="M5.1 14.3c-.2-.7-.4-1.5-.4-2.3s.1-1.6.4-2.3L1.3 6.8C.5 8.4 0 10.1 0 12s.5 3.6 1.3 5.2l3.8-2.9z"/><path fill="#EA4335" d="M12 4.7c1.8 0 3 .8 3.7 1.4l3.3-3.2C17.9 1.1 15.2 0 12 0 7.3 0 3.3 2.8 1.3 6.8l3.8 2.9c1-2.9 3.7-5 6.9-5z"/></svg> <span data-i18n="googleGo">使用 Google 登录</span></a>
+        <div id="tgWrap" hidden></div>
+      </div>
+      <p class="lock-switch" id="lockSwitch" hidden><span id="lockSwitchTxt"></span> <button type="button" id="lockSwitchBtn" class="lock-link"></button></p>
     </form>
+    <button type="button" id="lockBack" class="lock-alt" data-i18n="backLogin" hidden>返回登录</button>
     <button type="button" id="lockAlt" class="lock-alt" hidden></button>
     <p id="lockError" class="lock-error"></p>
   </div>
@@ -33,7 +72,7 @@
 <div id="app">
   <aside id="roster">
     <header class="r-head">
-      <div class="logo"><img class="logo-img" src="/complay-c.svg?v=72" alt="" width="26" height="26"> Complay&#8202;·&#8202;Ai</div>
+      <div class="logo"><img class="logo-img" src="/complay-c.svg?v=120" alt="" width="26" height="26"> Complay&#8202;·&#8202;Ai</div>
       <div class="r-actions">
         <div class="lang-wrap">
           <button id="langBtn" class="icon-btn" title="Language"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.3 3.4 5.2 3.4 8.5s-1.1 6.2-3.4 8.5c-2.3-2.3-3.4-5.2-3.4-8.5S9.7 5.8 12 3.5Z"/></svg></button>
@@ -98,8 +137,8 @@
     <section class="view" id="view-settings" hidden>
       <div class="view-head"><h3 data-i18n="tabSettings">设置</h3></div>
 
-      <div class="set-card" id="acctCard">
-        <h4 data-i18n="acctTitle">账号</h4>
+      <details class="set-card" id="acctCard" open>
+        <summary><h4 data-i18n="acctTitle">账号</h4></summary>
         <div id="meInfo" class="pv-meta"></div>
         <form id="pwForm" class="mini-form">
           <input id="pwOld" type="password" data-i18n-ph="pwOldPh" placeholder="当前密码" autocomplete="current-password">
@@ -107,11 +146,22 @@
           <button type="submit" class="mini-btn" data-i18n="pwChange">修改密码</button>
           <span id="pwMsg" class="pv-meta"></span>
         </form>
+        <form id="profileForm" class="mini-form">
+          <input id="pfName" data-i18n-ph="dispNamePh" placeholder="显示名（可选）" maxlength="40">
+          <input id="pfEmail" type="email" data-i18n-ph="emailPh" placeholder="邮箱（用于登录与找回密码）">
+          <button type="submit" class="mini-btn" data-i18n="profSave">保存资料</button>
+          <span id="pfMsg" class="pv-meta"></span>
+        </form>
+        <div id="sessBox">
+          <h5 data-i18n="sessTitle">我的登录会话</h5>
+          <div id="sessList"></div>
+        </div>
         <div id="usersBox">
           <h5 data-i18n="usersTitle">账号管理（仅管理员）</h5>
           <div id="userList"></div>
           <form id="userForm" class="mini-form">
             <input id="uName" data-i18n-ph="lockNamePh" placeholder="账号名">
+            <input id="uEmail" type="email" data-i18n-ph="emailPh" placeholder="邮箱（可选）">
             <input id="uPass" type="password" data-i18n-ph="pwNewPh" placeholder="新密码（至少 8 位）" autocomplete="new-password">
             <select id="uRole">
               <option value="member" data-i18n="roleMember">成员</option>
@@ -124,10 +174,10 @@
           <span class="spacer"></span>
           <button type="button" id="logoutBtn" class="mini-btn danger-text" data-i18n="logout">退出登录</button>
         </div>
-      </div>
+      </details>
 
-      <div class="set-card" id="volCard">
-        <h4 class="h4-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7.2-4.6-7.2-10A4.3 4.3 0 0 1 12 7.4 4.3 4.3 0 0 1 19.2 10c0 5.4-7.2 10-7.2 10Z"/></svg> <span data-i18n="volTitle">志愿者计划</span></h4>
+      <details class="set-card" id="volCard">
+        <summary><h4 class="h4-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20s-7.2-4.6-7.2-10A4.3 4.3 0 0 1 12 7.4 4.3 4.3 0 0 1 19.2 10c0 5.4-7.2 10-7.2 10Z"/></svg> <span data-i18n="volTitle">志愿者计划</span></h4></summary>
         <p class="set-hint" data-i18n="volDesc">无报酬、无义务：想来就来，想走就走，不要求做任何事。加入的账号会预先记下「志愿者额度等级」——后面独立内置模型上线、开始计额度时，志愿者自动拥有更多额度。</p>
         <div id="volState" class="pv-meta"></div>
         <div class="dialog-actions">
@@ -135,10 +185,10 @@
           <button type="button" id="volLeaveBtn" class="mini-btn danger-text" data-i18n="volLeave" hidden>退出计划</button>
           <button type="button" id="volJoinBtn" class="mini-btn" data-i18n="volJoin">加入志愿者计划</button>
         </div>
-      </div>
+      </details>
 
-      <div class="set-card">
-        <h4 data-i18n="sTitle">模型供应商</h4>
+      <details class="set-card" open>
+        <summary><h4 data-i18n="sTitle">模型供应商</h4></summary>
         <p class="set-hint" data-i18n="sHint">密钥在服务器上加密保存，之后不再明文显示，只留掩码提示。强开源模型优先；所有预设都直连供应商，没有中间商。</p>
         <div id="providerList" class="provider-list"></div>
         <form id="providerForm">
@@ -146,14 +196,23 @@
           <p id="pHint" class="set-hint"></p>
           <label><span data-i18n="pLabel">名称</span> <input id="pLabel" data-i18n-ph="pLabelPh" placeholder="例如：我的 DeepSeek"></label>
           <label><span data-i18n="pBase">接口地址</span> <input id="pBaseUrl" placeholder="https://…/v1"></label>
-          <label><span data-i18n="pModel">模型</span> <input id="pModel" placeholder="模型 ID"></label>
+          <div class="fld"><span data-i18n="pModels">模型列表（第一个为默认）</span>
+            <div id="pModels" class="chips"></div>
+            <div class="medit-row">
+              <input id="pModelAdd" data-i18n-ph="mAddPh" placeholder="输入模型 ID">
+              <button type="button" id="pModelAddBtn" class="mini-btn" data-i18n="mAdd">添加</button>
+              <button type="button" id="pFetchBtn" class="mini-btn" data-i18n="mFetch">拉取模型</button>
+              <button type="button" id="pTestBtn" class="mini-btn" data-i18n="mTest">测试连接</button>
+            </div>
+            <div id="pTestOut" class="pv-meta"></div>
+          </div>
           <label><span data-i18n="pKey">API 密钥</span> <input id="pKey" type="password" data-i18n-ph="pKeyPh" placeholder="sk-…（本地 Ollama 可不填）" autocomplete="off"></label>
           <div class="dialog-actions">
             <span class="spacer"></span>
             <button type="submit" class="primary" data-i18n="addProv">添加供应商</button>
           </div>
         </form>
-      </div>
+      </details>
 
       <details class="set-card" id="lmDetails">
         <summary><h4 class="lm-sum" data-i18n="lmTitle">本地模型（Ollama）</h4></summary>
@@ -161,25 +220,30 @@
         <div id="localModels" class="provider-list"></div>
       </details>
 
-      <div class="set-card" id="teamSection">
-        <h4 data-i18n="teamTitle">团队</h4>
+      <details class="set-card" id="teamSection">
+        <summary><h4 data-i18n="teamTitle">团队</h4></summary>
         <div class="dialog-actions">
           <button id="importBtn" class="mini-btn" type="button" data-i18n="importTeam">导入团队</button>
           <a id="exportLink" class="mini-btn" href="/api/teams/export" download="team.md" data-i18n="exportTeam">导出</a>
           <input type="file" id="importFile" accept=".md,text/markdown,text/plain" hidden>
         </div>
-      </div>
+      </details>
 
-      <div class="set-card">
-        <h4 data-i18n="usageTitle">Token 用量</h4>
+      <details class="set-card">
+        <summary><h4 data-i18n="grantsTitle">永久允许清单</h4></summary>
+        <div id="grantsBox"></div>
+      </details>
+
+      <details class="set-card">
+        <summary><h4 data-i18n="usageTitle">Token 用量</h4></summary>
         <p class="set-hint" data-i18n="usageHint">由模型服务端上报的真实用量（输入 + 输出），不是估算；不返回用量的模型（如本地小模型）不会计入。</p>
         <div id="usageBox"></div>
-      </div>
+      </details>
 
-      <div class="set-card">
-        <h4 data-i18n="audit">最近动态</h4>
+      <details class="set-card">
+        <summary><h4 data-i18n="audit">最近动态</h4></summary>
         <div id="auditList" class="audit-list"></div>
-      </div>
+      </details>
     </section>
 
     <nav id="tabbar">
@@ -214,6 +278,30 @@
   </main>
 </div>
 
+<dialog id="providerDialog">
+  <form method="dialog" id="providerEditForm">
+    <h3 data-i18n="editProv">编辑供应商</h3>
+    <label><span data-i18n="pLabel">名称</span> <input id="eLabel" required maxlength="60"></label>
+    <label><span data-i18n="pBase">接口地址</span> <input id="eBaseUrl" placeholder="https://…/v1"></label>
+    <div class="fld"><span data-i18n="pModels">模型列表（第一个为默认）</span>
+      <div id="eModels" class="chips"></div>
+      <div class="medit-row">
+        <input id="eModelAdd" data-i18n-ph="mAddPh" placeholder="输入模型 ID">
+        <button type="button" id="eModelAddBtn" class="mini-btn" data-i18n="mAdd">添加</button>
+        <button type="button" id="eFetchBtn" class="mini-btn" data-i18n="mFetch">拉取模型</button>
+        <button type="button" id="eTestBtn" class="mini-btn" data-i18n="mTest">测试连接</button>
+      </div>
+      <div id="eTestOut" class="pv-meta"></div>
+    </div>
+    <label><span data-i18n="pKey">API 密钥</span> <input id="eKey" type="password" data-i18n-ph="keyKeepPh" placeholder="留空 = 不修改当前密钥" autocomplete="off"></label>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button type="button" id="eCancelBtn" data-i18n="cancel">取消</button>
+      <button type="submit" class="primary" data-i18n="save">保存</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="botDialog">
   <form method="dialog" id="botForm">
     <h3 id="dialogTitle">新建机器人</h3>
@@ -221,6 +309,7 @@
     <label><span data-i18n="fEngine">引擎</span> <select id="fEngine"></select></label>
     <label><span data-i18n="fProvider">模型供应商</span> <select id="fProvider"></select></label>
     <label><span data-i18n="fModel">模型</span> <input id="fModel" data-i18n-ph="fModelPh" placeholder="（用供应商默认）"></label>
+    <div id="fModelChips" class="chips"></div>
     <label><span data-i18n="fPersona">人设</span> <textarea id="fPersona" rows="5" data-i18n-ph="fPersonaPh" placeholder="这个机器人是谁？应该怎么干活？"></textarea></label>
     <div class="dialog-actions">
       <button type="button" id="deleteBotBtn" class="danger" hidden data-i18n="del">删除</button>
@@ -231,6 +320,18 @@
   </form>
 </dialog>
 
-<script type="module" src="/app.js?v=72"></script>
+<dialog id="fileViewer">
+  <div class="fv-head">
+    <span id="fvName" class="fv-name"></span>
+    <button type="button" id="fvClose" class="fv-x" aria-label="Close">&#10005;</button>
+  </div>
+  <div id="fvBody" class="fv-body"></div>
+  <div class="dialog-actions">
+    <span class="spacer"></span>
+    <button type="button" id="fvSave" class="primary" data-i18n="fvSave">保存</button>
+  </div>
+</dialog>
+
+<script type="module" src="/app.js?v=120"></script>
 </body>
 </html>

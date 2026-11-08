@@ -50,7 +50,8 @@ export function makeZip(entries) {
 
     const cen = Buffer.alloc(46);
     cen.writeUInt32LE(0x02014b50, 0);
-    cen.writeUInt16LE(20, 4);
+    cen.writeUInt16LE((3 << 8) | 20, 4); // version made by: Unix
+    cen.writeUInt32LE((0o100644 << 16) >>> 0, 38); // external attrs: regular file, rw-r--r-- (audit fix: extractions used to lose sane permissions)
     cen.writeUInt16LE(20, 6);
     cen.writeUInt16LE(0x0800, 8);
     cen.writeUInt16LE(8, 10);

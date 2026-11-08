@@ -12,24 +12,31 @@ const file = path.join(config.dataDir, 'state.json');
 let state = null;
 
 function blank() {
-  return { bots: [], messages: {}, providers: [] };
+  return { bots: [], messages: {}, providers: [], grants: [] };
 }
 
 export function load() {
   if (state) return state;
   fs.mkdirSync(config.dataDir, { recursive: true });
+  if (!fs.existsSync(file)) { state = blank(); return state; }
+  // Fail CLOSED on a corrupt store (audit fix): the old code silently
+  // substituted an empty roster — and the next save() then WROTE that
+  // emptiness over the only copy of the user's bots and providers.
+  // Preserve the damaged file for forensics and refuse to continue.
   try {
     state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!state || !Array.isArray(state.bots)) state = blank();
-  } catch {
-    state = blank();
+    if (!state || !Array.isArray(state.bots)) throw new Error('unexpected shape');
+  } catch (e) {
+    const backup = `${file}.corrupt-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`;
+    try { fs.copyFileSync(file, backup); } catch { /* best effort */ }
+    throw new Error(`state store is corrupt and cannot be read: ${file} (${e.message}). A copy was saved to ${backup}. Restore state.json from backup to continue. Refusing to start with an empty store.`);
   }
   return state;
 }
 
 export function save() {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 
@@ -69,6 +76,9 @@ export function removeBot(id) {
   s.bots = s.bots.filter((b) => b.id !== id);
   delete s.messages[id];
   save();
+  // The bot's workspace goes with it (audit fix) — orphaned project
+  // folders used to linger in data/projects forever.
+  try { fs.rmSync(path.join(config.dataDir, 'projects', id), { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
 export function getMessages(botId) {
@@ -116,14 +126,67 @@ export function updateProvider(id, patch) {
   return p;
 }
 
+/* --------------------- persistent grants --------------------- */
+// "Always allow" decisions (v0.12, user direction supersedes the
+// v0.8 session-only stance): scoped to the granting USER + bot +
+// tool, persisted, audited at grant time, revocable in Settings.
+export function listGrants(userId = null) {
+  const g = load().grants || [];
+  return userId ? g.filter((x) => x.userId === userId) : g.slice();
+}
+export function hasPersistentGrant(userId, botId, tool) {
+  if (!userId) return false;
+  return (load().grants || []).some((x) => x.userId === userId && x.botId === botId && x.tool === tool);
+}
+export function addGrant({ userId, botId, tool }) {
+  const s = load();
+  s.grants = s.grants || [];
+  if (!s.grants.some((x) => x.userId === userId && x.botId === botId && x.tool === tool)) {
+    s.grants.push({ userId, botId, tool, at: new Date().toISOString() });
+    save();
+  }
+}
+export function removeGrant(userId, botId, tool) {
+  const s = load();
+  const before = (s.grants || []).length;
+  s.grants = (s.grants || []).filter((x) => !(x.userId === userId && x.botId === botId && x.tool === tool));
+  if (s.grants.length !== before) save();
+  return s.grants.length !== before;
+}
+
 /* --------------------------- audit --------------------------- */
 // Append-only JSONL: every tool execution and every approval decision
 // lands here, so the human can always answer "what did the bot do?".
 const auditFile = path.join(config.dataDir, 'audit.log');
 
+/* The audit log is a record, not a vault: tool arguments can contain
+ * things that look like secrets (a shell command with a Bearer token,
+ * an api_key in a pasted snippet). Redact the obvious shapes before
+ * anything touches disk (audit fix). */
+const SECRET_SHAPES = [
+  /(Bearer\s+)[A-Za-z0-9._~+\/-]+/gi,
+  /\bsk-[A-Za-z0-9_-]{8,}/g,
+  /((?:api[_-]?key|access[_-]?token|password|secret)["'=: ]+)[^\s"',}]+/gi,
+];
+export function redactSecrets(value) { return redact(value, 0); }
+function redact(value, depth = 0) {
+  if (typeof value === 'string') {
+    let out = value;
+    for (const re of SECRET_SHAPES) out = out.replace(re, (m, p1) => (p1 || '') + '•••');
+    return out;
+  }
+  if (Array.isArray(value) && depth < 4) return value.map((v) => redact(v, depth + 1));
+  if (value && typeof value === 'object' && depth < 4) {
+    const o = {};
+    for (const [k, v] of Object.entries(value)) o[k] = redact(v, depth + 1);
+    return o;
+  }
+  return value;
+}
+
 export function audit(entry) {
   fs.mkdirSync(config.dataDir, { recursive: true });
-  fs.appendFileSync(auditFile, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n');
+  fs.appendFileSync(auditFile, JSON.stringify({ at: new Date().toISOString(), ...redact(entry) }) + '\n');
 }
 
 export function readAudit(limit = 100) {

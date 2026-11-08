@@ -1,1 +1,16 @@
-{"description":"A starter kit for a chat-shaped team of AI agents: one local harness, a roster of bots, pluggable engines, approval cards, teams as Markdown files.","engines":{"node":">=22"},"license":"MIT","name":"starts-agents","scripts":{"dev":"node --watch src/server.js","start":"node src/server.js"},"type":"module","version":"0.1.0"}
+{
+  "description": "A starter kit for a chat-shaped team of AI agents: one local harness, a roster of bots, pluggable engines, approval cards, teams as Markdown files.",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "name": "starts-agents",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/server.js && node --check src/auth.js && node --check src/tools.js && node --check src/engines.js && node --check src/store.js && node --check public/app.js"
+  },
+  "type": "module",
+  "version": "0.12.0"
+}

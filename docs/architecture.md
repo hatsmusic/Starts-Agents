@@ -45,7 +45,8 @@ in `ENGINES`. One file, one line.
 ## 3. Tools declare their risk; the broker enforces it
 
 Every tool in `src/tools.js` carries `risk: 'safe' | 'ask'`. Safe tools
-(read-only, confined to the sandbox) run immediately. Anything risky
+(read-only, confined to the bot's workspace — plus `update_tasks`,
+which only mutates the bot's own task list) run immediately. Anything risky
 pauses the turn and creates an approval card; a human resolves it, or
 a 5-minute timeout denies it. The model can *propose* — only a human
 can *permit*. Keep this line bright as you add tools: the day a
@@ -75,6 +76,10 @@ another person (or another model) to recreate the crew.
 
 ## Data
 
-`data/state.json` (roster + transcripts), `data/notes/<bot>.md`,
-`data/sandbox/` (the only place file tools may touch). Delete `data/`
-to start over.
+`data/state.json` (roster + transcripts + providers), `data/auth.json`
+(accounts + sessions), `data/projects/<botId>/` (each bot's workspace —
+the only place its file tools may touch), `data/packages/<botId>/`
+(built zips), `data/tasks/`, `data/usage.json`, `data/runs.json`,
+`data/audit.log`. Delete `data/` to start over (accounts included).
+The master key and share secret live OUTSIDE `data/` — see
+SECURITY.md before moving or restoring anything.
