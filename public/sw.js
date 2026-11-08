@@ -7,11 +7,11 @@
 // Freshness belt-and-braces (learned the hard way): Cloudflare puts a
 // 4-hour max-age on these files, which overrides the origin's
 // no-cache and can pin a phone to a days-old app.js. So (1) the shell
-// files carry a version query (?v=61 — bump it together with CACHE on
+// files carry a version query (?v=121 — bump it together with CACHE on
 // every release; a new URL is a new cache entry everywhere), and
 // (2) fetches here bypass the HTTP cache entirely.
-const CACHE = 'starts-agents-v14';
-const SHELL = ['/', '/index.html', '/style.css?v=120', '/app.js?v=120', '/i18n.js?v=120', '/manifest.webmanifest', '/icon.png', '/complay-c.svg?v=120'];
+const CACHE = 'starts-agents-v15';
+const SHELL = ['/', '/index.html', '/style.css?v=121', '/app.js?v=121', '/i18n.js?v=121', '/manifest.webmanifest', '/icon.png', '/complay-c.svg?v=121'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

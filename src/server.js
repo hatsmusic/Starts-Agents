@@ -1439,7 +1439,12 @@ const server = http.createServer(async (req, res) => {
           : `[The user attached ${saved.meta.length} file(s), saved in the workspace: ${listing}]`);
         storedText += (storedText ? '\n' : '') + (zh ? '附件：' : 'Files: ') + saved.meta.map((m) => m.name).join(', ');
       }
-      if (liveRuns.has(bot.id)) return json(res, 409, { error: 'this agent is already running a task' });
+      // Busy (v0.12.1): the error string stays for compatibility, but
+      // the body now also carries the live run's status so the client
+      // can phrase the deadlock accurately ('running' vs parked on an
+      // approval) and offer stop-and-resend instead of a futile retry.
+      const live0 = liveRuns.get(bot.id);
+      if (live0) return json(res, 409, { error: 'this agent is already running a task', status: live0.status });
       const controller = new AbortController();
       const run = startRun(bot, storedText);
       const usageAcc = { prompt: 0, completion: 0, total: 0 };

@@ -1,7 +1,7 @@
 // Starts-Agents web UI: roster + streaming chat + approval cards.
 // Talks only to the local harness API in src/server.js.
 // UI language: 15 languages via ./i18n.js, choice saved on this device.
-import { LANGS, getLang, makeT } from './i18n.js?v=120';
+import { LANGS, getLang, makeT } from './i18n.js?v=121';
 
 const $ = (s) => document.querySelector(s);
 const state = {
@@ -52,7 +52,7 @@ function el(tag, cls, text) {
 
 function botAvatar(cls) {
   const img = el('img', 'bot-av ' + (cls || ''));
-  img.src = '/complay-c.svg?v=120';
+  img.src = '/complay-c.svg?v=121';
   img.alt = '';
   // Dimension attributes are a hard floor: even if a stale cached
   // stylesheet (old PWA version) has no .bot-av rule, the SVG can
@@ -341,6 +341,10 @@ async function selectBot(id, enter = true) {
   box.innerHTML = '';
   const { messages } = await api('GET', `/api/bots/${id}/messages`);
   for (const m of messages) {
+    // Never resurrect an empty assistant bubble (v0.12.1): a stored
+    // contentless assistant message (failed turn, legacy data) would
+    // render as a blank bubble with just the AI footer.
+    if (m.role === 'assistant' && !String(m.text || '').trim() && !(m.attachments || []).length) continue;
     const atts = (m.attachments || []).map((a) => ({ name: a.name, mime: a.mime, src: `/api/bots/${id}/files/${encodeURI(a.rel)}` }));
     addMessage(m.role, m.text, m.at, atts);
   }
@@ -598,6 +602,12 @@ function addApprovalCard(card) {
   // looked exactly like a dead button. Now a tap visibly registers
   // at once, a 404 marks the card as gone, and any other failure is
   // shown on the card with the buttons restored for another tap.
+  // One error line per card, ever (v0.12.1): repeated failed taps
+  // used to APPEND a fresh .ap-err each time (five identical lines in
+  // the field) and the text never said WHY. The line is now reused and
+  // carries the real reason — the server's error text, the HTTP
+  // status, or the localized network message for a dead connection.
+  let errLine = null;
   const decide = (decision, label) => async () => {
     if (box.dataset.busy) return;
     box.dataset.busy = '1';
@@ -608,13 +618,16 @@ function addApprovalCard(card) {
     try {
       await api('POST', `/api/approvals/${card.id}`, { decision });
       note.remove();
+      if (errLine) { errLine.remove(); errLine = null; }
       finish(label);
     } catch (e) {
       note.remove();
       delete box.dataset.busy;
       if (String(e.message || '').includes('no pending approval')) { markGone(); return; }
       btns.forEach((b) => { b.disabled = false; });
-      box.append(el('div', 'ap-err', t('apDecideErr')));
+      const reason = friendlyErrText(e);
+      if (!errLine) { errLine = el('div', 'ap-err'); box.append(errLine); }
+      errLine.textContent = reason ? `${t('apDecideErr')} ${reason}` : t('apDecideErr');
     }
   };
   allow.onclick = decide('allow', t('okOnce'));
@@ -676,7 +689,16 @@ async function sendChat(text) {
     if (res.status === 401) { showLock(); throw new Error(t('sessExp')); }
     if (!String(res.headers.get('content-type') || '').includes('text/event-stream')) {
       const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || ('HTTP ' + res.status));
+      const err = new Error(data.error || ('HTTP ' + res.status));
+      // Busy deadlock (v0.12.1): a 409 here means a previous run is
+      // still live server-side (often parked on an approval whose
+      // stream died). Tag it so the catch can offer stop-and-resend
+      // instead of a retry that can only 409 again.
+      if (res.status === 409 && String(data.error || '').includes('already running')) {
+        err.code = 'busy';
+        err.runStatus = typeof data.status === 'string' ? data.status : null;
+      }
+      throw err;
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -711,7 +733,17 @@ async function sendChat(text) {
     delete state.wsCache[bot.id];
     loadBots().catch(() => {}); // refresh roster previews + status
   } catch (e) {
-    if (e.message !== 'locked') addErrorCard(e.message);
+    // Empty-bubble cleanup (v0.12.1): the end-of-stream path already
+    // drops a contentless assistant row, but a thrown error (dead
+    // stream, busy 409) skipped it — leaving a blank bubble with the
+    // AI footer floating above the error card. Same rule here: no
+    // text arrived, so the row goes; the error card carries the turn.
+    bubble.classList.remove('streaming');
+    if (!bubble.textContent) bubble.closest('.msg-row')?.remove();
+    if (e.message !== 'locked') {
+      if (e.code === 'busy') addErrorCard(e.message, { busy: true, runStatus: e.runStatus, botId: bot.id, resendText: text });
+      else addErrorCard(e.message);
+    }
   } finally {
     state.busy = false;
     $('#stopBtn').hidden = true;
@@ -732,13 +764,37 @@ function addToolLog(data) {
   scrollDown();
 }
 
+/* Raw engine/transport errors (v0.12.1): Safari's fetch failure is
+ * the bare string "Load failed", Chrome's is "Failed to fetch" — end
+ * users were shown those verbatim, unlocalized. Known network-shaped
+ * failures map to a localized message for DISPLAY; the raw text stays
+ * available through the card's Copy button. Anything else (a real
+ * server/engine message) passes through, sensibly shortened. */
+function isNetworkErr(raw) {
+  const s = String(raw?.message ?? raw ?? '');
+  return (raw instanceof TypeError) || /load failed|failed to fetch|networkerror|network request failed|fetch failed|the network connection was lost/i.test(s);
+}
+function friendlyErrText(raw) {
+  const s = String(raw?.message ?? raw ?? '').trim();
+  if (!s || s === 'locked') return ''; // 'locked' is api()'s internal 401 sentinel, not a reason
+  if (isNetworkErr(raw)) return t('errNetwork');
+  return s.length > 160 ? s.slice(0, 160) + '…' : s;
+}
+
 /* Failures get a real card: what happened, plus working Retry (resend
- * the last prompt) and Copy (clipboard) actions. */
-function addErrorCard(message) {
+ * the last prompt) and Copy (clipboard) actions. Copy always carries
+ * the RAW error text; the visible line is the friendly mapping.
+ * opts.busy (v0.12.1): the send hit a live run server-side — show the
+ * localized busy text and a third action, stop-and-resend, because a
+ * plain retry can only hit the same 409 while that run lives. */
+function addErrorCard(message, opts = {}) {
   const box = el('div', 'err-card');
   const errText = el('div', 'err-text');
   errText.innerHTML = icon('warn', 14);
-  errText.append(document.createTextNode(' ' + message));
+  const shown = opts.busy
+    ? (opts.runStatus === 'awaiting_approval' ? t('errBusyApproval') : t('errBusy'))
+    : friendlyErrText(message);
+  errText.append(document.createTextNode(' ' + shown));
   box.append(errText);
   const row = el('div', 'row');
   const retry = el('button', 'mini-btn', t('errRetry'));
@@ -748,6 +804,22 @@ function addErrorCard(message) {
     try { await navigator.clipboard.writeText(message); copy.textContent = t('errCopied'); } catch { /* clipboard unavailable */ }
   };
   row.append(retry, copy);
+  if (opts.busy && opts.botId) {
+    const stopResend = el('button', 'mini-btn', t('errStopResend'));
+    stopResend.onclick = async () => {
+      stopResend.disabled = true;
+      retry.disabled = true;
+      stopResend.textContent = t('errStopping');
+      // Abort the parked run, give the server a beat to release the
+      // live-run slot, then resend the same message exactly once. If
+      // it still collides, the fresh busy card offers this again.
+      try { await api('POST', `/api/bots/${opts.botId}/stop`); } catch { /* already stopped */ }
+      await new Promise((r) => setTimeout(r, 800));
+      box.remove();
+      if (opts.resendText) sendChat(opts.resendText);
+    };
+    row.append(stopResend);
+  }
   box.append(row);
   $('#messages').append(box);
   scrollDown();

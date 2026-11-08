@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.12.1 — 2026-11-08 (hotfix: four real-device defects from v0.12.0)
+
+- **Approval-card errors no longer stack.** A failed decision tap
+  appended a fresh generic error line every time (five identical
+  lines in the field) and never said why. Each card now keeps ONE
+  error line, reused across taps, carrying the real reason — the
+  server's error text, the HTTP status, or a localized network
+  message; a later success clears it.
+- **Busy deadlock broken.** A run parked on an approval holds the
+  bot; if the client's stream died, the chat lost its stop button
+  and every new message hit a 409 whose card offered only a futile
+  retry. The 409 body now also carries the live run's status
+  (`running` / `awaiting_approval`, error string unchanged), the
+  card shows a localized busy message, and a third action —
+  "Stop task & resend" — stops the parked run and resends the
+  message once.
+- **Raw engine errors are no longer shown verbatim.** Safari's
+  "Load failed" / Chrome's "Failed to fetch" and other
+  network-shaped failures now display as a localized
+  network-interruption message on error cards; the raw text remains
+  available via the card's Copy button only.
+- **No more empty AI bubbles.** A turn that died by stream error
+  before any content arrived left a blank assistant bubble with the
+  AI footer above the error card. The error path now applies the
+  same drop-if-empty cleanup the end-of-stream path already had,
+  and stored history rendering skips contentless assistant
+  messages so a blank bubble can't come back on reload.
+
 ## v0.12.0 — 2026-11-08 (real-device feedback batch, 11 items)
 
 Driven by the owner's first days of real use after the SSO launch.

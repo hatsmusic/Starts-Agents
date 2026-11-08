@@ -12,5 +12,5 @@
     "check": "node --check src/server.js && node --check src/auth.js && node --check src/tools.js && node --check src/engines.js && node --check src/store.js && node --check public/app.js"
   },
   "type": "module",
-  "version": "0.12.0"
+  "version": "0.12.1"
 }
