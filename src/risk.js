@@ -29,6 +29,7 @@
 // inside the workspace keep the old verb-only treatment.
 import path from 'node:path';
 import os from 'node:os';
+import fs from 'node:fs';
 
 const HIGH_SHELL = [
   // download piped straight into a shell / interpreter
@@ -154,6 +155,43 @@ export function classifyShellPaths(text, opts = {}) {
   const low = raw.toLowerCase();
   if (SENSITIVE_NEEDLES.some((n) => low.includes(n))) return 'sensitive';
   const ws = opts.workspace ? path.resolve(opts.workspace) : null;
+  /* Real-target judging (item 156 D-01): the lexical resolution
+   * above cannot see symlinks — a link inside the workspace can
+   * point at /etc or at a sensitive name outside it, and the old
+   * code cheerfully called that 'inside' (the read-only auto-pass
+   * then ran it card-free). When a workspace is known, every
+   * resolved target that EXISTS is also judged by its realpath:
+   * real-sensitive ⇒ 'sensitive', real-outside ⇒ 'outside'. Bare
+   * filenames (no slash) get the same treatment when a file of
+   * that name exists in the workspace — the shell's cwd is the
+   * workspace, so `cat x` reads ./x whatever x points at. Tokens
+   * naming nothing on disk keep the lexical verdict untouched. */
+  let realWs = null;
+  if (ws) { try { realWs = fs.realpathSync(ws); } catch { realWs = ws; } }
+  const judgeReal = (abs) => {
+    let real = null;
+    try { real = fs.realpathSync(abs); } catch { return null; }
+    if (tokenSensitive(real)) return 'sensitive';
+    // Intermediate links (same D-01 chain as the file tools): a
+    // chain can pass through a sensitive NAME on its way to an
+    // innocently-named final file — judge every symlink component
+    // by its own name and its one-step target too.
+    let cur = '';
+    for (const seg of abs.split(path.sep)) {
+      if (!seg) { cur = path.sep; continue; }
+      cur = cur === path.sep ? path.sep + seg : cur + path.sep + seg;
+      let st = null;
+      try { st = fs.lstatSync(cur); } catch { break; }
+      if (st.isSymbolicLink()) {
+        if (tokenSensitive(cur)) return 'sensitive';
+        let t = null;
+        try { t = fs.readlinkSync(cur); } catch { /* unreadable link */ }
+        if (t && tokenSensitive(path.resolve(path.dirname(cur), t))) return 'sensitive';
+      }
+    }
+    if (realWs && !(real === realWs || real.startsWith(realWs + path.sep))) return 'outside';
+    return null;
+  };
   let worst = 'inside';
   for (const tok of raw.split(/\s+/)) {
     if (!tok || tok.startsWith('-')) {
@@ -163,11 +201,28 @@ export function classifyShellPaths(text, opts = {}) {
     if (tokenSensitive(tok)) return 'sensitive';
     if (globSegmentHit(tok)) return 'sensitive';
     const resolved = resolveTokenPath(tok, ws);
-    if (resolved === null) continue;
+    if (resolved === null) {
+      if (ws && !tok.includes('/') && !/[*?]/.test(tok)) {
+        const bare = tok.replace(/^[A-Za-z_][A-Za-z0-9_]*=/, '').replace(/['"`]/g, '');
+        if (bare && bare !== '.' && bare !== '..') {
+          let exists = false;
+          try { exists = fs.existsSync(path.resolve(ws, bare)); } catch { exists = false; }
+          if (exists) {
+            const rj = judgeReal(path.resolve(ws, bare));
+            if (rj === 'sensitive') return 'sensitive';
+            if (rj === 'outside') worst = 'outside';
+          }
+        }
+      }
+      continue;
+    }
     if (resolved === '\0outside') { worst = 'outside'; continue; }
     if (resolved === '\0inside') continue;
     if (ws) {
       if (!(resolved === ws || resolved.startsWith(ws + path.sep))) worst = 'outside';
+      const rj = judgeReal(resolved);
+      if (rj === 'sensitive') return 'sensitive';
+      if (rj === 'outside') worst = 'outside';
     } else if (tok.startsWith('/') || tok.startsWith('~') || tok.startsWith('$HOME')) {
       worst = 'outside'; // no workspace context: absolute targets are unprovable
     }

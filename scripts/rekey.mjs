@@ -18,6 +18,14 @@
 // Providers live in data/app.db since v0.14 batch 5a; installs that
 // were never migrated (a state.json and no app.db) are still handled
 // through the legacy JSON path below.
+//
+// B-02 (audit r1): the DB path covers the FULL ciphertext
+// checklist (mirrors VAULT_CIPHER_SURFACES in src/vault.js):
+// providers keyEnc, site_logins.secret_enc, mcp_servers.secret_enc,
+// kv['platform:mcp_box'].secretEnc, kv['oauth_apps'].*.secretEnc.
+// Every face is decrypted with the OLD key and re-sealed with the
+// NEW key IN MEMORY first — any face the old key cannot open
+// aborts the run with zero rows changed.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -69,16 +77,57 @@ function rotateAll(providers) {
 
 const dbFile = path.join(dataDir, 'app.db');
 let rotated = 0, skipped = 0;
+const surfaceRotated = { site_logins: 0, mcp_servers: 0, platform_box: 0, oauth_apps: 0 };
 if (fs.existsSync(dbFile)) {
   const db = new DatabaseSync(dbFile);
   try {
     const rows = db.prepare('SELECT id, data FROM providers').all();
     const providers = rows.map((r) => JSON.parse(r.data));
     ({ rotated, skipped } = rotateAll(providers));
+    const tableExists = (name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?").get(name));
+    const planColumn = (table, column) => {
+      if (!tableExists(table)) return [];
+      return db.prepare(`SELECT id, ${column} AS enc FROM ${table}`).all()
+        .filter((r) => r.enc)
+        .map((r) => [r.id, encrypt(decrypt(r.enc, oldKey), newKey)]);
+    };
+    const sitePlan = planColumn('site_logins', 'secret_enc');
+    const mcpPlan = planColumn('mcp_servers', 'secret_enc');
+    let boxKv = null;
+    let oauthKv = null;
+    if (tableExists('kv')) {
+      const boxRow = db.prepare('SELECT value FROM kv WHERE key = ?').get('platform:mcp_box');
+      if (boxRow) {
+        const j = JSON.parse(boxRow.value);
+        if (j && j.secretEnc) { j.secretEnc = encrypt(decrypt(j.secretEnc, oldKey), newKey); boxKv = ['platform:mcp_box', JSON.stringify(j)]; surfaceRotated.platform_box = 1; }
+      }
+      const oauthRow = db.prepare('SELECT value FROM kv WHERE key = ?').get('oauth_apps');
+      if (oauthRow) {
+        const j = JSON.parse(oauthRow.value);
+        if (j && typeof j === 'object') {
+          for (const [provider, entry] of Object.entries(j)) {
+            if (entry && entry.secretEnc) { entry.secretEnc = encrypt(decrypt(entry.secretEnc, oldKey), newKey); surfaceRotated.oauth_apps += 1; }
+          }
+          if (surfaceRotated.oauth_apps) oauthKv = ['oauth_apps', JSON.stringify(j)];
+        }
+      }
+    }
+    surfaceRotated.site_logins = sitePlan.length;
+    surfaceRotated.mcp_servers = mcpPlan.length;
     const upd = db.prepare('UPDATE providers SET data = ? WHERE id = ?');
+    // Prepare lazily: a legacy/minimal DB may not carry every
+    // surface table at all (planColumn already returned [] for
+    // those), and prepare() itself throws on a missing table.
+    const updSite = sitePlan.length ? db.prepare('UPDATE site_logins SET secret_enc = ? WHERE id = ?') : null;
+    const updMcp = mcpPlan.length ? db.prepare('UPDATE mcp_servers SET secret_enc = ? WHERE id = ?') : null;
+    const updKv = (boxKv || oauthKv) ? db.prepare('UPDATE kv SET value = ? WHERE key = ?') : null;
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const p of providers) if (p.keyEnc) upd.run(JSON.stringify(p), p.id);
+      for (const [id, enc] of sitePlan) updSite.run(enc, id);
+      for (const [id, enc] of mcpPlan) updMcp.run(enc, id);
+      if (boxKv) updKv.run(boxKv[1], boxKv[0]);
+      if (oauthKv) updKv.run(oauthKv[1], oauthKv[0]);
       db.exec('COMMIT');
     } catch (e) { try { db.exec('ROLLBACK'); } catch { /* ignore */ } throw e; }
   } finally { db.close(); }
@@ -90,4 +139,4 @@ if (fs.existsSync(dbFile)) {
   fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
   fs.renameSync(tmp, stateFile);
 }
-console.log(`rekey complete: ${rotated} provider key(s) re-encrypted, ${skipped} without keys skipped. Now start the server with the NEW master key.`);
+console.log(`rekey complete: ${rotated} provider key(s) re-encrypted, ${skipped} without keys skipped, site_logins ${surfaceRotated.site_logins}, mcp_servers ${surfaceRotated.mcp_servers}, platform Box ${surfaceRotated.platform_box}, oauth_apps ${surfaceRotated.oauth_apps}. Now start the server with the NEW master key.`);

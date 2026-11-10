@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 // Avatars (v0.14.2, feedback item 44): one mechanism for bot and
 // account avatars. An avatar is { kind, value }:
 //   kind 'image'  — value is a file name under data/avatars/,
@@ -82,3 +85,19 @@ export function sniffImageExt(buf) {
   return null;
 }
 export const AVATAR_MIME = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
+
+/* Delete an image avatar's file (v0.21.0, audit F-12/F-26): the
+ * ONLY deletion path for avatar files — it re-validates through
+ * normalizeAvatar + AVATAR_FILE_RE, so a stored value can never be
+ * turned into a path traversal, and preset/letter avatars (no file)
+ * are a no-op. Best-effort: returns true only when a file was
+ * actually unlinked. Callers: bot deletion, account deletion, and
+ * any avatar-change path that replaces an image. */
+export function deleteAvatarImageFile(dataDir, avatar) {
+  const av = normalizeAvatar(avatar);
+  if (!av || av.kind !== 'image' || !dataDir) return false;
+  try {
+    fs.unlinkSync(path.join(dataDir, 'avatars', av.value));
+    return true;
+  } catch { return false; }
+}

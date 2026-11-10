@@ -11,10 +11,16 @@
 //      the same order, as src/vault.js.)
 //   2. Restart the server with ONLY the new key configured.
 //
-// The script re-encrypts every provider keyEnc in data/app.db
-// (plus a legacy state.json on never-migrated installs, plus any
-// "v1:" entries in a data/vault.json if one exists) under the
-// primary key. EVERY entry is decrypted and its replacement
+// The script re-encrypts EVERY vault ciphertext face in
+// data/app.db (plus a legacy state.json on never-migrated
+// installs, plus any "v1:" entries in a data/vault.json if one
+// exists) under the primary key. The face list is the B-02
+// full-ciphertext checklist (mirrors VAULT_CIPHER_SURFACES in
+// src/vault.js — keep the two in sync):
+//   providers.data keyEnc · site_logins.secret_enc ·
+//   mcp_servers.secret_enc · kv['platform:mcp_box'].secretEnc ·
+//   kv['oauth_apps'].*.secretEnc
+// EVERY entry is decrypted and its replacement
 // verified BEFORE anything is written: one entry no ring key can
 // open aborts the run with zero rows changed — a half-rotated
 // vault is worse than an unrotated one. The rotation is written
@@ -79,6 +85,8 @@ const vaultFile = path.join(dataDir, 'vault.json');
 let providersRotated = 0;
 let providersSkipped = 0;
 let vaultEntriesRotated = 0;
+const surfaceRotated = { site_logins: 0, mcp_servers: 0, platform_box: 0, oauth_apps: 0 };
+const tableExists = (db, name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?").get(name));
 
 function rotateProviders(providers, label) {
   const jobs = [];
@@ -97,6 +105,38 @@ if (fs.existsSync(dbFile)) {
     const rows = db.prepare('SELECT id, data FROM providers').all();
     const providers = rows.map((r) => JSON.parse(r.data));
     rotateProviders(providers, 'app.db');
+    /* B-02: the remaining ciphertext faces are planned in the
+     * SAME pass — every reseal happens in memory first, so a
+     * failure on any face leaves every table untouched. */
+    const planColumn = (table, column) => {
+      if (!tableExists(db, table)) return [];
+      return db.prepare(`SELECT id, ${column} AS enc FROM ${table}`).all()
+        .filter((r) => r.enc)
+        .map((r) => [r.id, reseal(r.enc, `app.db ${table} ${r.id}`)]);
+    };
+    const sitePlan = planColumn('site_logins', 'secret_enc');
+    const mcpPlan = planColumn('mcp_servers', 'secret_enc');
+    let boxKv = null; // [key, newValue] for kv platform Box
+    let oauthKv = null; // [key, newValue] for kv oauth_apps
+    if (tableExists(db, 'kv')) {
+      const boxRow = db.prepare('SELECT value FROM kv WHERE key = ?').get('platform:mcp_box');
+      if (boxRow) {
+        const j = JSON.parse(boxRow.value);
+        if (j && j.secretEnc) { j.secretEnc = reseal(j.secretEnc, 'app.db kv platform:mcp_box'); boxKv = ['platform:mcp_box', JSON.stringify(j)]; surfaceRotated.platform_box = 1; }
+      }
+      const oauthRow = db.prepare('SELECT value FROM kv WHERE key = ?').get('oauth_apps');
+      if (oauthRow) {
+        const j = JSON.parse(oauthRow.value);
+        if (j && typeof j === 'object') {
+          for (const [provider, entry] of Object.entries(j)) {
+            if (entry && entry.secretEnc) { entry.secretEnc = reseal(entry.secretEnc, `app.db kv oauth_apps ${provider}`); surfaceRotated.oauth_apps += 1; }
+          }
+          if (surfaceRotated.oauth_apps) oauthKv = ['oauth_apps', JSON.stringify(j)];
+        }
+      }
+    }
+    surfaceRotated.site_logins = sitePlan.length;
+    surfaceRotated.mcp_servers = mcpPlan.length;
     // vault.json entries are planned in the same pass — a failure
     // here must also leave the database untouched, so both targets
     // are fully resealed in memory before either is written.
@@ -116,11 +156,21 @@ if (fs.existsSync(dbFile)) {
       vaultDoc = walk(vaultDoc);
     }
     const upd = db.prepare('UPDATE providers SET data = ? WHERE id = ?');
+    // Prepare lazily: a legacy/minimal DB may not carry every
+    // surface table at all (planColumn already returned [] for
+    // those), and prepare() itself throws on a missing table.
+    const updSite = sitePlan.length ? db.prepare('UPDATE site_logins SET secret_enc = ? WHERE id = ?') : null;
+    const updMcp = mcpPlan.length ? db.prepare('UPDATE mcp_servers SET secret_enc = ? WHERE id = ?') : null;
+    const updKv = (boxKv || oauthKv) ? db.prepare('UPDATE kv SET value = ? WHERE key = ?') : null;
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const p of providers) if (p.keyEnc) upd.run(JSON.stringify(p), p.id);
+      for (const [id, enc] of sitePlan) updSite.run(enc, id);
+      for (const [id, enc] of mcpPlan) updMcp.run(enc, id);
+      if (boxKv) updKv.run(boxKv[1], boxKv[0]);
+      if (oauthKv) updKv.run(oauthKv[1], oauthKv[0]);
       const at = new Date().toISOString();
-      const entry = { at, kind: 'vault_rotate', by: 'cli:vault:rotate', providers: providersRotated, skipped: providersSkipped, vaultEntries: vaultEntriesRotated, ringSize: ring.length };
+      const entry = { at, kind: 'vault_rotate', by: 'cli:vault:rotate', providers: providersRotated, skipped: providersSkipped, vaultEntries: vaultEntriesRotated, surfaces: surfaceRotated, ringSize: ring.length };
       db.prepare('INSERT INTO audit_log (at, at_ms, kind, bot, data) VALUES (?, ?, ?, ?, ?)')
         .run(at, Date.parse(at) || Date.now(), entry.kind, '', JSON.stringify(entry));
       db.exec('COMMIT');
@@ -141,4 +191,4 @@ if (fs.existsSync(dbFile)) {
   console.error(`vault:rotate — no app.db or state.json under ${dataDir}. Nothing was changed.`);
   process.exit(1);
 }
-console.log(`vault:rotate complete: ${providersRotated} provider key(s) re-sealed under the primary key, ${providersSkipped} without keys skipped${vaultEntriesRotated ? `, ${vaultEntriesRotated} vault.json entr(ies) re-sealed` : ''}. Now restart the server with ONLY the new primary key configured.`);
+console.log(`vault:rotate complete: ${providersRotated} provider key(s) re-sealed under the primary key, ${providersSkipped} without keys skipped, site_logins ${surfaceRotated.site_logins}, mcp_servers ${surfaceRotated.mcp_servers}, platform Box ${surfaceRotated.platform_box}, oauth_apps ${surfaceRotated.oauth_apps}${vaultEntriesRotated ? `, ${vaultEntriesRotated} vault.json entr(ies) re-sealed` : ''}. Now restart the server with ONLY the new primary key configured.`);

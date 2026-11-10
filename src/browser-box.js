@@ -30,7 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as mcp from './mcp.js';
 import * as store from './store.js';
-import { setExternalControl, externalControlOf, saveStageFrame } from './browser-viewer.js';
+import { setExternalControl, externalControlOf, touchExternalControl, saveStageFrame } from './browser-viewer.js';
 
 function boxError(code, message) {
   const e = new Error(message);
@@ -98,14 +98,30 @@ export async function boxCapabilities(row, { fresh = false } = {}) {
   const tools = await mcp.mcpListTools(row, { timeoutMs: 12000 });
   const names = tools.map((t) => String(t?.name || '')).filter(Boolean);
   const pick = (n) => (names.includes(n) ? n : null);
+  const pickAny = (list) => list.find((n) => names.includes(n)) || null;
   const caps = {
     view: pick('box_view'),
     token: pick('box_view_token'),
     screenshot: pick('screenshot'),
     act: pick('computer_act'),
+    /* Session-reset capability (item 156 E-07): discovered by the
+     * same name-driven rule as every other cap — when the Box
+     * offers any known reset/logout/close-session tool, ending a
+     * card session calls it so the next lock holder does not
+     * inherit this holder's logged-in desktop. Absent → null and
+     * boxRelease records the gap honestly instead of pretending
+     * the shared desktop was wiped. */
+    reset: pickAny(['box_reset', 'box_logout', 'box_close_session', 'reset_session', 'end_session', 'close_session', 'logout', 'sign_out']),
     tools: names,
   };
   capsCache.set(key, { at: Date.now(), caps });
+  // Cache hygiene (E-22): expired entries are dropped on write so
+  // the map cannot grow a key per row ever seen.
+  if (capsCache.size > 64) {
+    for (const [k, v] of [...capsCache.entries()]) {
+      if (Date.now() - v.at >= CAPS_TTL_MS) capsCache.delete(k);
+    }
+  }
   return caps;
 }
 
@@ -114,12 +130,23 @@ export async function boxCapabilities(row, { fresh = false } = {}) {
  * is one shared computer). Memory state: { userId, botId,
  * stageId, acquiredAt, lastBeat }. Expiry is lazy — a lock whose
  * heartbeat is 90s stale is simply gone the next time anyone
- * looks. The bot's own Box tool calls never touch this lock. */
+ * looks. The bot's own Box tool calls do not ACQUIRE this lock,
+ * but the platform row's tool face is gated BY it for other
+ * actors (boxToolAccessFor above, item 156 E-05). */
 export const BOX_LOCK_IDLE_MS = 90_000;
 let boxLock = null;
 
 function pruneLock(now = Date.now()) {
-  if (boxLock && now - boxLock.lastBeat > BOX_LOCK_IDLE_MS) boxLock = null;
+  if (boxLock && now - boxLock.lastBeat > BOX_LOCK_IDLE_MS) {
+    const prev = boxLock;
+    boxLock = null;
+    /* The lock and the external-control record share one fate
+     * (item 156 E-06): a lock that lapses (holder vanished) takes
+     * its takeover record with it, so the ex-holder's bot is not
+     * parked forever and the ex-holder can no longer inject input
+     * into whoever holds the desktop next. */
+    try { setExternalControl(prev.userId, prev.botId, 'agent'); } catch { /* best effort */ }
+  }
   return boxLock;
 }
 
@@ -146,6 +173,10 @@ export function beatBoxLock(userId, botId, now = Date.now()) {
   const cur = pruneLock(now);
   if (!cur || cur.userId !== userId || cur.botId !== botId) return false;
   cur.lastBeat = now;
+  // The same heartbeat refreshes the takeover record (E-06): one
+  // clock governs both, so a live holder never ages out mid-drive
+  // and a dead holder loses both together.
+  try { touchExternalControl(userId, botId); } catch { /* best effort */ }
   return true;
 }
 
@@ -153,7 +184,38 @@ export function releaseBoxLock(userId, botId) {
   const cur = pruneLock();
   if (!cur || cur.userId !== userId || cur.botId !== botId) return false;
   boxLock = null;
+  try { setExternalControl(userId, botId, 'agent'); } catch { /* best effort */ }
   return true;
+}
+
+/* --------------------- tool-face entity gate ----------------------
+ * The card lock is an ENTITY lock (item 156 E-05): the platform
+ * Box is one shared computer, so while a card session holds it,
+ * MCP tool calls against the PLATFORM row from any OTHER
+ * (user, bot) actor are refused — another user's bot driving (or
+ * screenshotting) the desktop someone is watching was the leak.
+ * The lock HOLDER's own actor is unaffected (watching your own
+ * bot work is the card's main use), and BYO rows are never gated:
+ * a user's own Box is not the shared desktop. Enforcement rides
+ * the mcp.js gate hook (setBoxToolGate): the dyn-tool run path in
+ * server.js must pass actorUserId/actorBotId into mcpCallTool for
+ * this to bite — that wiring is the coordinator's half, recorded
+ * in the batch report; until then this function is the tested
+ * policy and internal card calls pass boxInternal explicitly. */
+export function boxToolAccessFor({ userId, botId, row } = {}) {
+  if (!row || row.id !== '__platform_box__') return { ok: true };
+  const lock = boxLockState();
+  if (!lock) return { ok: true };
+  if (lock.userId === userId && lock.botId === botId) return { ok: true };
+  return { ok: false, holderBotId: lock.botId };
+}
+if (typeof mcp.setBoxToolGate === 'function') {
+  mcp.setBoxToolGate(({ row, userId, botId }) => {
+    const access = boxToolAccessFor({ userId, botId, row });
+    if (!access.ok) {
+      throw boxError('errBrowserBoxBusy', 'the shared Box desktop is in use by another card session — its tools are paused until that session ends');
+    }
+  });
 }
 
 /* ------------------------- view extraction ------------------------ */
@@ -216,12 +278,18 @@ function audit(entry) {
  * box_view_token, and fold the pair into the session. Runs async
  * behind boxView's waking state; failures leave the session
  * unwoken so the next poll retries. */
+/* Box MCP calls share one timeout discipline (item 156 E-21):
+ * 25s, the same order as boxInput's 20s — a wake/token round used
+ * to inherit the server default of 120s per call (240s for the
+ * pair), wedging the card's renewal and heartbeat behind it. */
+const BOX_CALL_OPTS = { timeoutMs: 25_000, boxInternal: true };
+
 async function runWake(sess, row, caps) {
-  const viewRes = await mcp.mcpCallTool(row, caps.view, {});
+  const viewRes = await mcp.mcpCallTool(row, caps.view, {}, BOX_CALL_OPTS);
   let info = extractViewInfo(viewRes);
   if (caps.token) {
     try {
-      const tokRes = await mcp.mcpCallTool(row, caps.token, {});
+      const tokRes = await mcp.mcpCallTool(row, caps.token, {}, BOX_CALL_OPTS);
       const tinfo = extractViewInfo(tokRes);
       if (tinfo.token) info = { viewUrl: info.viewUrl || tinfo.viewUrl, token: tinfo.token };
       else if (!info.viewUrl && tinfo.viewUrl) info = { ...info, viewUrl: tinfo.viewUrl };
@@ -251,23 +319,49 @@ function startWake(sess, row, caps) {
  *   no view tool          → { state: 'unavailable' } (still frame fallback)
  *   wake in flight        → { state: 'waking', waitedMs }
  *   view ready            → { state: 'ready', viewUrl, expiresAt } */
+function sweepViewSessions(now = Date.now()) {
+  // E-22: view sessions (and the view tokens inside them) used to
+  // live in memory until an explicit end=true; expired, unpended
+  // sessions are now swept whenever the face is exercised.
+  for (const [k, s] of [...viewSessions.entries()]) {
+    if (!s.pending && s.expiresAt && now > s.expiresAt + 10 * 60 * 1000) viewSessions.delete(k);
+  }
+}
+
 export async function boxView({ userId, bot, stageId }) {
+  sweepViewSessions();
   const row = resolveBoxRow(userId);
   if (!row) return { state: 'nobox' };
   const acq = acquireBoxLock(userId, bot.id, stageId);
   if (!acq.ok) return { state: 'busy', holder: acq.holder };
   const caps = await boxCapabilities(row);
-  if (!caps.view) return { state: 'unavailable' };
+  if (!caps.view) {
+    /* No view tool: do not squat the lock (item 156 E-20) — the
+     * still-frame path re-acquires per call, and a permanent 90s
+     * busy for every other user was a false contention. The
+     * frame/token faces re-acquire on their own, so releasing
+     * here changes nothing for this caller. */
+    releaseBoxLock(userId, bot.id);
+    return { state: 'unavailable' };
+  }
   beatBoxLock(userId, bot.id);
   const key = viewKey(userId, bot.id);
   let sess = viewSessions.get(key);
-  if (!sess) { sess = { ready: false, pending: null, wakeStartedAt: 0, viewUrl: '', expiresAt: 0 }; viewSessions.set(key, sess); }
+  if (!sess) { sess = { ready: false, pending: null, wakeStartedAt: 0, viewUrl: '', expiresAt: 0, auditedState: '' }; viewSessions.set(key, sess); }
+  // Audit on state TRANSITIONS only (E-20): the client polls this
+  // face every 2s while waking and every 30s while live, and one
+  // audit row per poll is log inflation, not a trail.
+  const auditView = (state) => {
+    if (sess.auditedState === state) return;
+    sess.auditedState = state;
+    audit({ bot: bot.id, kind: 'browser_box_view', userId, host: hostOf(sess.viewUrl), state });
+  };
   if (sess.ready && sess.expiresAt > Date.now()) {
-    audit({ bot: bot.id, kind: 'browser_box_view', userId, host: hostOf(sess.viewUrl), state: 'ready' });
+    auditView('ready');
     return { state: 'ready', viewUrl: sess.viewUrl, expiresAt: sess.expiresAt };
   }
   if (!sess.pending) startWake(sess, row, caps);
-  audit({ bot: bot.id, kind: 'browser_box_view', userId, host: hostOf(sess.viewUrl), state: sess.ready ? 'ready' : 'waking' });
+  auditView(sess.ready ? 'ready' : 'waking');
   return { state: 'waking', waitedMs: Math.max(0, Date.now() - sess.wakeStartedAt) };
 }
 
@@ -308,7 +402,7 @@ export async function boxFrame({ userId, bot, stageId }) {
   if (!acq.ok) { const e = boxError('errBrowserBoxBusy', 'another Box card session is active'); e.holder = acq.holder; throw e; }
   beatBoxLock(userId, bot.id);
   const t0 = Date.now();
-  const result = await mcp.mcpCallTool(row, caps.screenshot, {});
+  const result = await mcp.mcpCallTool(row, caps.screenshot, {}, BOX_CALL_OPTS);
   const mat = mcp.materializeMcpResult(result, { workspace: store.workspaceOf(bot.id), slug: 'box' });
   const rel = (mat.images && mat.images[0]?.rel) || (mat.files && mat.files[0]) || '';
   if (!rel) throw boxError('errBrowserUnavailable', 'the Box screenshot returned no image');
@@ -341,15 +435,44 @@ export function boxTakeover({ userId, bot, stageId }) {
 /* Release: hand control back (wakes the parked tool gate); with
  * end=true the card session is over and the global lock goes
  * with it. Releasing a session you never held is a no-op ok —
- * the dispose path must not fail on an already-expired lock. */
-export function boxRelease({ userId, bot, end = false }) {
+ * the dispose path must not fail on an already-expired lock.
+ * All LOCAL cleanup happens synchronously, before any await, so
+ * callers that fire-and-forget the returned promise (the route,
+ * the client's dispose path) still free the lock and the gate in
+ * the same tick.
+ *
+ * Session-end hygiene (item 156 E-07): the platform Box is ONE
+ * shared desktop — without a reset, the next lock holder inherits
+ * this holder's logged-in sites and open pages. When the Box
+ * offers a discovered reset capability, end=true calls it (best
+ * effort, 25s discipline). When it offers none, the gap is
+ * audited as 'browser_box_reset_unavailable' rather than hidden:
+ * SA cannot wipe a desktop the remote exposes no wipe for, and
+ * the residual is a product-surface fact (the coordinator's
+ * report carries it), not a silent one. */
+export async function boxRelease({ userId, bot, end = false }) {
   setExternalControl(userId, bot.id, 'agent');
   if (end) {
     releaseBoxLock(userId, bot.id);
     viewSessions.delete(viewKey(userId, bot.id));
   }
   audit({ bot: bot.id, kind: 'browser_box_release', userId, end: Boolean(end) });
-  return { ok: true };
+  if (!end) return { ok: true, reset: 'not-ended' };
+  let reset = 'unavailable';
+  try {
+    const row = resolveBoxRow(userId);
+    if (row) {
+      const caps = await boxCapabilities(row);
+      if (caps.reset) {
+        await mcp.mcpCallTool(row, caps.reset, {}, BOX_CALL_OPTS);
+        reset = 'done';
+      }
+    }
+  } catch { reset = 'failed'; }
+  if (reset !== 'done') {
+    audit({ bot: bot.id, kind: 'browser_box_reset_' + reset, userId });
+  }
+  return { ok: true, reset };
 }
 
 /* Input translation (D7 assumptions, recorded): the card sends
@@ -363,7 +486,10 @@ export function translateBoxInput(input = {}) {
   const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
   switch (kind) {
     case 'click': return { action: 'click', x: Math.round(clamp01(input.nx) * BOX_DESKTOP.width), y: Math.round(clamp01(input.ny) * BOX_DESKTOP.height) };
-    case 'type': return { action: 'type', text: String(input.text ?? '') };
+    // Type text is capped like the host stage's type() (item 156
+    // E-19, the size half): one gesture never carries an unbounded
+    // string into a single computer_act call.
+    case 'type': return { action: 'type', text: String(input.text ?? '').slice(0, 1000) };
     case 'key': return { action: 'key', key: String(input.key ?? '') };
     case 'scroll': return { action: 'scroll', dy: Math.max(-5000, Math.min(5000, Number(input.dy) || 0)) };
     default: throw boxError('errBrowserInput', 'unknown Box input kind');
@@ -377,6 +503,18 @@ export async function boxInput({ userId, bot, input }) {
   if (externalControlOf(userId, bot.id) !== 'user') {
     throw boxError('errBrowserControl', 'the user does not hold control of this Box session — takeover first');
   }
+  /* The input must still be the LOCK HOLDER's (item 156 E-06):
+   * control record and lock used to be judged independently, so
+   * a stale record outliving its lock let an ex-holder keep
+   * injecting computer_act input into the NEXT holder's desktop.
+   * A record whose lock is gone or someone else's is stale by
+   * definition: clear it and refuse. */
+  const lock = boxLockState();
+  if (!lock || lock.userId !== userId || lock.botId !== bot.id) {
+    setExternalControl(userId, bot.id, 'agent');
+    if (lock) { const e = boxError('errBrowserBoxBusy', 'the Box card session now belongs to another holder'); e.holder = lock.botId; throw e; }
+    throw boxError('errBrowserControl', 'this Box session has ended — takeover again before sending input');
+  }
   const payload = translateBoxInput(input || {});
   const row = resolveBoxRow(userId);
   if (!row) throw boxError('errBrowserUnavailable', 'no Box channel is configured');
@@ -386,7 +524,7 @@ export async function boxInput({ userId, bot, input }) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 20_000);
   try {
-    await mcp.mcpCallTool(row, caps.act, payload, { signal: ctl.signal, timeoutMs: 20_000 });
+    await mcp.mcpCallTool(row, caps.act, payload, { signal: ctl.signal, timeoutMs: 20_000, boxInternal: true });
   } finally { clearTimeout(timer); }
   // Audit records the KIND only — typed text is the user's own
   // keystrokes on a shared machine and never lands in the log.

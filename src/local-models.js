@@ -184,7 +184,7 @@ export const LOCAL_MODELS = [
   },
   /* ---- general ---- */
   {
-    tag: 'llama3.2:3b', cat: 'general', name: 'Llama 3.2 3B', diskGB: 2, ramGB: 2.4, src: 'ollama', license: 'Llama 3.2 Community License',
+    tag: 'llama3.2:3b', cat: 'general', vision: false, name: 'Llama 3.2 3B', diskGB: 2, ramGB: 2.4, src: 'ollama', license: 'Llama 3.2 Community License',
     blurbZh: 'Meta 小杯：聊天、摘要、轻任务', blurbEn: 'Meta\'s small one: chat, summaries, light tasks',
   },
   {
@@ -256,7 +256,7 @@ export const LOCAL_MODELS = [
     blurbZh: 'Google 最小杯：极轻通用', blurbEn: 'Google\'s tiniest generalist',
   },
   {
-    tag: 'llama3.2:1b', cat: 'general', name: 'Llama 3.2 1B', diskGB: 1.3, ramGB: 1.7, src: 'ollama', license: 'Llama 3.2 Community License',
+    tag: 'llama3.2:1b', cat: 'general', vision: false, name: 'Llama 3.2 1B', diskGB: 1.3, ramGB: 1.7, src: 'ollama', license: 'Llama 3.2 Community License',
     blurbZh: 'Meta 最小杯：极轻，聊天小助手', blurbEn: 'Meta\'s tiniest: featherweight chat helper',
   },
   {
@@ -424,7 +424,7 @@ export const LOCAL_MODELS = [
     blurbZh: '上代通义小杯：轻任务顺手', blurbEn: 'Previous-gen Qwen small: handy for light tasks',
   },
   {
-    tag: 'gemma3:270m', cat: 'general', name: 'Gemma 3 270M', diskGB: 0.3, ramGB: 0.6, src: 'ollama', license: 'Gemma Terms',
+    tag: 'gemma3:270m', cat: 'general', vision: false, name: 'Gemma 3 270M', diskGB: 0.3, ramGB: 0.6, src: 'ollama', license: 'Gemma Terms',
     blurbZh: 'Google 极小杯：边缘设备与流程演示', blurbEn: 'Google\'s micro model: edge devices and flow demos',
   },
   {
@@ -883,4 +883,72 @@ export function fitFor(ramGB) {
   if (ramGB <= 2.6) return 'smooth';
   if (ramGB <= 4.2) return 'tight';
   return 'over';
+}
+
+/* Context window per model family (audit C-03): the catalog used
+ * to carry NO context-length data at all, while the harness
+ * budgeted every model at a fixed 120k tokens — small local
+ * windows overflowed or were silently left-truncated by Ollama.
+ * An entry may carry an explicit `ctx` (tokens); otherwise this
+ * family table answers. Values are deliberately CONSERVATIVE
+ * (at or below the family's native window: e.g. Qwen2.5/Qwen3
+ * are budgeted at their 32k base window, not at rope-extended
+ * marketing figures) — under-claiming costs extra compression,
+ * over-claiming costs overflow. Unknown families return null:
+ * unknown means the caller falls back to its own policy (the
+ * engine treats an unknown LOCAL model conservatively and an
+ * unknown cloud model as unbounded-by-catalog). */
+const CONTEXT_TOKENS_BY_TAG = [
+  [/^codegemma:/, 8192],
+  [/^gemma:/, 8192],
+  [/^gemma2:/, 8192],
+  [/^gemma3:(270m|1b)(-|$|:)/, 32768],
+  [/^gemma3:/, 131072],
+  [/^llama2:/, 4096],
+  [/^codellama:/, 16384],
+  [/^tinyllama:/, 2048],
+  [/^starcoder/, 16384],
+  [/^deepseek-coder:/, 16384],
+  [/^deepseek-coder-v2/, 131072],
+  [/^qwen2\.5/, 32768],
+  [/^qwen2:/, 32768],
+  [/^qwen3/, 32768],
+  [/^mistral-nemo/, 131072],
+  [/^mistral:/, 32768],
+  [/^ministral/, 131072],
+  [/^llama3/, 131072],
+  [/^llama4/, 131072],
+  [/^phi:/, 4096],
+  [/^phi3/, 4096],
+  [/^phi4/, 16384],
+  [/^smollm:/, 2048],
+  [/^smollm2/, 8192],
+  [/^smollm3/, 65536],
+  [/^granite:/, 131072],
+  [/^granite3/, 131072],
+  [/^exaone/, 32768],
+  [/^solar:/, 4096],
+];
+/* HF community GGUF tags (`hf.co/<user>/<repo>:<quant>`) do not
+ * start with the family name; a substring pass over the repo part
+ * covers the common families for those. */
+const CONTEXT_TOKENS_BY_SUBSTRING = [
+  ['codegemma', 8192],
+  ['gemma-2', 8192], ['gemma2', 8192],
+  ['gemma-3', 32768], ['gemma3', 32768],
+  ['qwen2.5', 32768], ['qwen3', 32768],
+  ['llama-3', 131072], ['llama3', 131072],
+  ['deepseek-coder', 16384],
+  ['starcoder', 16384],
+];
+export function localModelContextTokens(tag) {
+  const t = String(tag || '').trim().toLowerCase();
+  if (!t) return null;
+  const entry = getLocalModel(t) || getLocalModel(t.split('/').pop());
+  if (entry && Number.isFinite(entry.ctx) && entry.ctx > 0) return entry.ctx;
+  for (const [re, ctx] of CONTEXT_TOKENS_BY_TAG) if (re.test(t)) return ctx;
+  const base = t.split('/').pop();
+  for (const [re, ctx] of CONTEXT_TOKENS_BY_TAG) if (re.test(base)) return ctx;
+  for (const [sub, ctx] of CONTEXT_TOKENS_BY_SUBSTRING) if (base.includes(sub)) return ctx;
+  return null;
 }

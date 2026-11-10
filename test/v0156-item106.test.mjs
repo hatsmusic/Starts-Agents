@@ -93,9 +93,15 @@ async function githubRoundTrip(base, mockPort, deviceCookie = '') {
   assert.ok(loc.startsWith(`http://127.0.0.1:${mockPort}/login/oauth/authorize?`), loc);
   const state = new URL(loc).searchParams.get('state');
   assert.ok(state);
+  // A-03 (item 156): start binds the state to this browser via the
+  // sa_oauth_state cookie; the callback demands it back, alongside
+  // any device cookie the scenario presents.
+  const stateCookie = start.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('sa_oauth_state='));
+  assert.ok(stateCookie, 'start sets the sa_oauth_state binding cookie');
+  const cookie = [deviceCookie, stateCookie].filter(Boolean).join('; ');
   const cb = await fetch(`${base}/api/auth/github/callback?code=fakecode&state=${encodeURIComponent(state)}`, {
     redirect: 'manual',
-    headers: deviceCookie ? { cookie: deviceCookie } : {},
+    headers: cookie ? { cookie } : {},
   });
   assert.equal(cb.status, 302);
   assert.equal(cb.headers.get('location'), '/');

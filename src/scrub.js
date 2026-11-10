@@ -92,6 +92,16 @@ export function scrubText(input, { workspace = null, cls = 'other' } = {}) {
   // text is an error (scrubErrorMessage adds the marker — plain
   // scrubText just drops the lines).
   s = s.replace(/^\s+at\s+.*:\d+:\d+\)?\s*$/gm, '');
+  // B-24 (audit r1): Python traceback frame lines are NOT
+  // dropped (the item-83 corpus pins a relativized
+  // `File "tools/x.py", line 9` line as legitimate content) —
+  // but a File line whose path is STILL absolute at this point
+  // (outside the workspace and every known root, e.g.
+  // /usr/local/lib/…) collapses to its basename, R4-style.
+  s = s.replace(/^(\s*File\s+")([^"]+)(",\s+line\s+\d+.*)$/gm, (m, pre, p, post) => {
+    if (!p.startsWith('/') && !/^[A-Za-z]:\\/.test(p)) return m;
+    return pre + (p.split(/[\\/]/).pop() || '<server-path>') + post;
+  });
   // R8: internal hosts — URL hosts keep scheme/port/path, bare
   // private IPs collapse.
   s = s.replace(/(https?:\/\/)([^\s/'")]+)/g, (full, scheme, hostport) => {
@@ -99,22 +109,47 @@ export function scrubText(input, { workspace = null, cls = 'other' } = {}) {
     return isPrivateHost(host) ? scheme + '<internal-host>' + hostport.slice(host.length) : full;
   });
   s = s.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, (ip) => (isPrivateHost(ip) ? '<internal-host>' : ip));
+  // B-24: bare private IPv6 literals outside URLs (the URL pass
+  // above only reaches hosts in host position). Link-local and
+  // ULA forms only — global IPv6 addresses stay readable.
+  s = s.replace(/\bfe80(?::[0-9a-fA-F]{0,4}){1,7}\b/gi, '<internal-host>');
+  s = s.replace(/\b(?:fc|fd)[0-9a-fA-F]{2}(?::[0-9a-fA-F]{0,4}){2,7}\b/gi, '<internal-host>');
+  s = s.replace(/(?<![0-9a-fA-F:])::1(?![0-9a-fA-F:])/g, '<internal-host>');
   // R5: home-relative forms.
   s = s.replace(/(^|[\s"'])(?:~|\$HOME|%USERPROFILE%)\/[^\s'")\]]*/g, '$1<server-path>');
   // R4: generic absolute paths under the usual system roots —
   // strict shape (known first segment, at least one more
   // segment, no spaces); file-looking tails keep their basename
   // so prose about code stays readable.
-  s = s.replace(/(?<![\w./-])\/(root|home|Users|var|etc|opt|srv|tmp|mnt|data)(\/[\w.@+-]+)+\/?/g, (full) => {
+  s = s.replace(/(?<![\w./-])\/(root|home|Users|var|etc|opt|srv|tmp|mnt|data|usr|private|proc)(\/[\w.@+-]+)+\/?/g, (full) => {
     const base = full.replace(/\/$/, '').split('/').pop() || '';
     return /\.[a-z0-9]{1,8}$/i.test(base) ? base : '<server-path>';
   });
   s = s.replace(/\b[A-Za-z]:\\(?:[\w.@+-]+\\)*[\w.@+-]*/g, '<server-path>');
   // R9: the app's own prefixed id tokens standing in prose.
   s = s.replace(/\b(?:bot|prov|mcp|run|ap|srv|ws)_[a-f0-9]{8,}\b/g, '<id>');
-  // R10: env/config names in text surfaces.
+  // R10: env/config names in text surfaces. B-03 (audit r1): the
+  // ASSIGNMENT form goes first and takes its value with it —
+  // `SA_VAULT_KEY=<base64>` used to keep the value verbatim (the
+  // vault master key itself) while only the name was tokenized.
+  // (redactSecrets now catches the value too; this keeps the
+  // surface clean even if a future shape regresses.)
+  s = s.replace(/\b(?:START_AGENTS|SA)_[A-Z][A-Z0-9_]*\s*[:=]\s*[^\s"',}]+/g, '<config>=•••');
   s = s.replace(/\b(?:START_AGENTS|SA)_[A-Z][A-Z0-9_]+\b/g, '<config>');
   return s;
+}
+
+/* B-04 (audit r1): the redaction to apply to USER-authored text
+ * before it is persisted or sedimented (transcript rows,
+ * MEMORY.md). Deliberately redactSecrets ONLY — not the full
+ * scrubText table: the user's own paths and prose are their
+ * content and stay readable to them; only secret SHAPES are cut,
+ * the same shapes the assistant side already loses. Call sites
+ * (server.js user-message store, memory.js append/sediment) are
+ * listed in the fix report for the coordinator to wire. */
+export function redactUserText(text) {
+  if (text == null) return text;
+  return redactSecrets(String(text));
 }
 
 /** Error-shaped text: scrubText + version trivia (R11). */

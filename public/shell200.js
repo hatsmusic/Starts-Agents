@@ -10,6 +10,11 @@
 // Defensive by contract: any failed fetch leaves its block empty or
 // hidden; nothing in here may throw out to the console.
 
+/* Liveness flag for app.js's watchdog (item 156 G-04): set before
+ * anything in this module can fail, so "module absent" is the only
+ * state the watchdog has to detect. */
+window.__saShell = true;
+
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 function el(tag, cls, text) {
@@ -65,6 +70,7 @@ const FALLBACK = {
   dwBrowserHint: 'When an agent opens a page, the live view appears here.',
   dwOpenChat: 'Open chat',
   dwRunningNone: 'Nothing is running right now.',
+  dwDataPartial: "Some data couldn't be loaded — the figures below may be incomplete.",
   dwApprNone: 'No pending approvals.',
   dwHandle: 'Review',
   dwUsageNote: 'Counts only the usage visible to the current account.',
@@ -90,25 +96,25 @@ function bootLangCode() {
 let lang = bootLangCode();
 let t = fallbackT;
 try {
-  const mod = await import('./i18n-pack-' + lang + '.js?v=200');
+  const mod = await import('./i18n-pack-' + lang + '.js?v=210');
   t = mod.makeT(lang);
 } catch { t = fallbackT; }
 
-/* Language switch: app.js lazy-imports the new pack itself; mirror
- * it here 600ms after a #langMenu pick, keyed off the NEW stored
- * value, then re-render our dynamic surfaces from the last data. */
-document.addEventListener('click', (e) => {
-  if (!e.target.closest || !e.target.closest('#langMenu')) return;
-  setTimeout(async () => {
-    try {
-      const code = localStorage.getItem('sa-lang');
-      if (!code || !/^[a-z]{2}$/.test(code) || code === lang) return;
-      const mod = await import('./i18n-pack-' + code + '.js?v=200');
-      lang = code;
-      t = mod.makeT(code);
-      if (lastData) renderAll(lastData);
-    } catch { /* keep the current language; surfaces stay as-is */ }
-  }, 600);
+/* Language switch (item 156 G-07): app.js is the single source of
+ * truth — it commits the switch only after the pack loads, then
+ * dispatches sa:lang. This module simply follows the event. The old
+ * shape (watch #langMenu clicks, guess with a fixed 600ms timer,
+ * read storage independently) raced the app's own load and could
+ * leave the two halves of the UI in different languages. */
+document.addEventListener('sa:lang', async (e) => {
+  const code = e.detail && e.detail.code;
+  if (!code || !/^[a-z]{2}$/.test(code) || code === lang) return;
+  try {
+    const mod = await import('./i18n-pack-' + code + '.js?v=210');
+    lang = code;
+    t = mod.makeT(code);
+    if (lastData) renderAll(lastData);
+  } catch { /* keep the current language; surfaces stay as-is */ }
 });
 
 /* ---------------- api (app.js api() semantics, GET-only mini) ---------------- */
@@ -135,13 +141,31 @@ function openChat() {
   if (cur) { cur.click(); return; }
   clickTab('home');
 }
-/* Roster order == /api/bots order (the roster renders that array in
- * sequence), so index i in our data is index i in #botList. Every
- * index-based jump in this module relies on that one invariant. */
-function openBotByIndex(i) {
-  const items = $$('#botList .bot-item .bot-main');
-  if (items[i]) items[i].click();
-  else openChat();
+/* Jumps address bots by ID, never by index (item 156 G-01): the
+ * roster re-sorts (running first, then most-recently-active) and
+ * can be filtered/searched, so a bot's position in #botList is NOT
+ * its position in /api/bots — an index jump could open the WRONG
+ * bot's conversation and send the user's next message into another
+ * bot's workspace. Cards and workspace chips carry data-bot-id;
+ * every jump in this module goes through it. */
+function openBotById(botId) {
+  const find = () => $$('#botList .bot-item').find((it) => it.dataset && it.dataset.botId === botId);
+  let card = find();
+  if (!card) {
+    // The target may be hidden by the roster's own search text or
+    // status filter chip (audit R2-06): reset both to the full
+    // list and look again. The old fallback opened the CURRENT
+    // bot instead — in this narrow corner that is exactly the
+    // wrong-bot failure G-01 exists to prevent.
+    const search = $('#botSearch');
+    if (search && search.value) { search.value = ''; search.dispatchEvent(new Event('input', { bubbles: true })); }
+    const allChip = $$('#filterChips .chip').find((c) => c.dataset && c.dataset.f === 'all');
+    if (allChip && !allChip.classList.contains('on')) allChip.click();
+    card = find();
+  }
+  const main = card ? card.querySelector('.bot-main') : null;
+  if (main) main.click();
+  else clickTab('home');
 }
 function botNameOf(d, botId) {
   return d.botsArr.find((b) => b.id === botId)?.name || botId || '';
@@ -164,6 +188,9 @@ async function loadAll() {
   const rs = await Promise.allSettled(paths.map(([, p]) => api(p)));
   const d = {};
   paths.forEach(([k], i) => { d[k] = rs[i].status === 'fulfilled' ? rs[i].value : null; });
+  // Which sources FAILED rides along (item 156 G-06): a rejected
+  // source must never render as a confident zero/empty below.
+  d.failed = paths.filter(([,], i) => rs[i].status === 'rejected').map(([k]) => k);
   d.botsArr = Array.isArray(d.bots?.bots) ? d.bots.bots : [];
   d.live = Array.isArray(d.tasks?.live) ? d.tasks.live : [];
   d.runs = Array.isArray(d.tasks?.runs) ? d.tasks.runs : [];
@@ -222,16 +249,16 @@ function renderSidebar(d) {
     badge.textContent = String(d.live.length);
     badge.hidden = d.live.length === 0;
   }
-  /* recent group: /api/bots order == #botList order (see openBotByIndex) */
+  /* recent group: rows jump by bot id (see openBotById) */
   const recent = $('#snRecent');
   if (recent) {
     recent.innerHTML = '';
-    d.botsArr.forEach((bot, i) => {
+    d.botsArr.forEach((bot) => {
       const row = el('button', 'sn-recent-item');
       row.type = 'button';
       const dot = el('span', 'sn-dot ' + (DOT_CLASS[bot.status] || 'off'));
       row.append(dot, el('span', 'sn-tx', bot.name || bot.id || ''));
-      row.onclick = () => openBotByIndex(i);
+      row.onclick = () => openBotById(bot.id);
       recent.append(row);
     });
   }
@@ -283,6 +310,20 @@ function emptyRow(text) { return el('div', 'ov-empty', text); }
 function renderOverview(d) {
   if (!$('#view-home')) return;
   setText('#ovSub', t('dwSubLine', { bots: d.botsArr.length, running: d.live.length, pending: d.pending.length }));
+  /* Partial-failure banner (item 156 G-06): any rejected source
+   * gets named at the top instead of its panel quietly rendering
+   * the empty state — "no pending approvals" must mean it. */
+  const home = $('#view-home');
+  let banner = home.querySelector('.ov-partial-note');
+  if (d.failed && d.failed.length) {
+    if (!banner) {
+      banner = el('div', 'team-empty ov-partial-note');
+      const head = home.querySelector('.dw-head') || home.firstElementChild;
+      if (head && head.nextSibling) home.insertBefore(banner, head.nextSibling); else home.prepend(banner);
+    }
+    banner.textContent = t('dwDataPartial');
+    banner.hidden = false;
+  } else if (banner) banner.hidden = true;
 
   /* metrics x4 */
   const metrics = $('#ovMetrics');
@@ -342,12 +383,59 @@ function renderOverview(d) {
       dot.dataset.status = bot.status || 'offline';
       act.append(dot, document.createTextNode(statusWord(bot)));
       row.append(av, mid, act);
-      row.onclick = () => openBotByIndex(i);
+      row.onclick = () => openBotById(bot.id);
       teamBody.append(row);
     });
   }
   const teamAll = $('#ovTeamAll');
   if (teamAll) teamAll.onclick = () => clickTab('team');
+
+  /* workspace panel (item 154): the workspace view lost its
+   * bottom-bar tab in v0.20.0, so the overview carries its
+   * explicit mobile door. A row opens the workspace view and
+   * then picks that bot's chip there — addressed by data-bot-id,
+   * never by position (item 156 G-01). */
+  const wsAll = $('#ovWsAll');
+  if (wsAll) wsAll.onclick = () => clickTab('workspace');
+  const wsBody = $('#ovWsBody');
+  if (wsBody) {
+    wsBody.innerHTML = '';
+    d.botsArr.forEach((bot) => {
+      const row = el('button', 'ov-arow');
+      row.type = 'button';
+      const av = el('span', 'ov-av');
+      if (bot.avatar?.kind === 'image' && bot.avatar.value) {
+        const img = el('img', 'ov-av-img');
+        img.src = '/api/avatars/' + bot.avatar.value;
+        img.alt = '';
+        av.append(img);
+      } else {
+        const [bg, fg] = paletteFor(bot.id);
+        av.style.background = bg;
+        av.style.color = fg;
+        av.textContent = (String(bot.name || '?').trim().charAt(0) || '?').toUpperCase();
+      }
+      const mid = el('div', '');
+      mid.append(el('div', 'ov-nm', bot.name || bot.id || ''), el('div', 'ov-ds', botSubLabel(bot)));
+      const act = el('span', 'ov-act');
+      act.append(el('span', 'ov-dot ' + (DOT_CLASS[bot.status] || 'off')), document.createTextNode(statusWord(bot)));
+      row.append(av, mid, act);
+      row.onclick = () => {
+        clickTab('workspace');
+        // The chips render after the workspace data lands, which a
+        // flat 90 ms guess kept missing on slow loads (audit
+        // R2-06): poll briefly for this bot's chip instead of
+        // silently staying on the default bot.
+        let tries = 0;
+        const iv = setInterval(() => {
+          const chip = $$('#wsBotChips .chip').find((c) => c.dataset && c.dataset.botId === bot.id);
+          if (chip) { clearInterval(iv); chip.click(); }
+          else if (++tries >= 20) clearInterval(iv);
+        }, 120);
+      };
+      wsBody.append(row);
+    });
+  }
   const imp = $('#ovImport');
   if (imp) imp.onclick = () => { const b = $('#importBtn'); if (b) b.click(); };
   const cre = $('#ovCreate');
@@ -387,8 +475,7 @@ function renderOverview(d) {
         const open = el('button', 'ov-btn sm', t('dwOpenChat'));
         open.type = 'button';
         open.onclick = () => {
-          const idx = d.botsArr.findIndex((b) => b.id === s.botId);
-          if (idx >= 0) openBotByIndex(idx); else openChat();
+          if (s.botId && d.botsArr.some((b) => b.id === s.botId)) openBotById(s.botId); else openChat();
         };
         row.append(live, mid, open);
         bb.append(row);
@@ -403,7 +490,7 @@ function renderOverview(d) {
   const runBody = $('#ovRunningBody');
   if (runBody) {
     runBody.innerHTML = '';
-    if (!d.live.length) runBody.append(emptyRow(t('dwRunningNone')));
+    if (!d.live.length) runBody.append(emptyRow(d.failed && d.failed.includes('tasks') ? t('dwDataPartial') : t('dwRunningNone')));
     for (const l of d.live) {
       const row = el('div', 'ov-row');
       const info = el('div', '');
@@ -424,7 +511,7 @@ function renderOverview(d) {
   const apprBody = $('#ovApprBody');
   if (apprBody) {
     apprBody.innerHTML = '';
-    if (!d.pending.length) apprBody.append(emptyRow(t('dwApprNone')));
+    if (!d.pending.length) apprBody.append(emptyRow(d.failed && d.failed.includes('approvals') ? t('dwDataPartial') : t('dwApprNone')));
     for (const card of d.pending.slice(0, 3)) {
       const row = el('div', 'ov-row');
       const info = el('div', '');

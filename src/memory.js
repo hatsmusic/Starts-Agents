@@ -23,6 +23,7 @@
 // rides along in package_project like any other workspace file.
 import fs from 'node:fs';
 import path from 'node:path';
+import { redactUserText } from './scrub.js';
 
 export const MEMORY_FILENAME = 'MEMORY.md';
 /* How much of the file is injected per turn (the file itself may
@@ -35,6 +36,44 @@ export const MEMORY_INJECT_CAP = 6000;
 export const MEMORY_FILE_CAP = 48 * 1024;
 
 const SEQ_MARKER_RE = /<!--\s*sa-compressed-through:\s*(\d+)\s*-->/g;
+/* Sediment identity ledger (audit C-06/C-10): alongside the seq
+ * watermark, every sediment block records a per-message identity
+ * key — `s<seq>.<hash>` for stored messages, `h<hash>` for
+ * seq-less ones, the hash over role + text. The watermark alone
+ * is a single monotone maximum: after a conversation is CLEARED,
+ * new messages reuse seqs from 1 and sat under the old watermark
+ * for hundreds of turns (sedimentation silently dead), and an
+ * out-of-order older seq was swallowed the same way. Identity
+ * keys do not care about seq ordering or reuse: a message is
+ * "already sedimented" only if ITS key is in the ledger. Files
+ * written before this ledger existed carry no keys; for those,
+ * the watermark filter still applies to seq'd messages on the
+ * first pass (no mass re-sedimentation of old stretches), and
+ * every block written from now on carries keys. */
+const KEYS_MARKER_RE = /<!--\s*sa-sediment-keys:\s*([a-z0-9.,]+)\s*-->/g;
+
+function messageHash(m) {
+  const s = `${m.role}\n${String(m.text ?? '')}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+
+function sedimentKeyOf(m) {
+  const seq = Number(m.seq);
+  const h = messageHash(m);
+  return Number.isFinite(seq) && seq > 0 ? `s${seq}.${h}` : `h${h}`;
+}
+
+/* All identity keys recorded in the file (empty for legacy files). */
+export function sedimentedKeys(workspace) {
+  const raw = readRaw(workspace);
+  const keys = new Set();
+  for (const m of raw.matchAll(KEYS_MARKER_RE)) {
+    for (const k of String(m[1]).split(',')) if (k) keys.add(k);
+  }
+  return keys;
+}
 
 export function memoryPath(workspace) {
 return path.join(String(workspace || ''), MEMORY_FILENAME);
@@ -58,7 +97,7 @@ return max;
 /* The injectable memory text: watermark comments stripped, capped
 * to the newest MEMORY_INJECT_CAP characters. '' when no memory. */
 export function readMemoryText(workspace) {
-const raw = readRaw(workspace).replace(SEQ_MARKER_RE, '').trim();
+const raw = readRaw(workspace).replace(SEQ_MARKER_RE, '').replace(/<!--\s*sa-sediment-keys:[^>]*-->/g, '').trim();
 if (!raw) return '';
 if (raw.length <= MEMORY_INJECT_CAP) return raw;
 return '…\n' + raw.slice(raw.length - MEMORY_INJECT_CAP);
@@ -70,9 +109,30 @@ export function memorySystemText(workspace, lang) {
 const text = readMemoryText(workspace);
 if (!text) return '';
 const zh = lang === 'zh' || lang === 'tw';
+/* Audit C-09 (顺手): the zh/tw branch used to return a bare
+ * newline — Chinese sessions (the primary language) got NO
+ * framing for what MEMORY.md is, where it lives, or how facts
+ * land in it, while English sessions got the full header. The
+ * Chinese headers below mirror the English one item for item. */
 return (zh
-? `\n`
+? (lang === 'tw'
+  ? `[長期記憶 — ${MEMORY_FILENAME}（此檔案位於你的工作區，每次對話開始時自動注入到上下文；值得長期保存的事實用 remember 工具寫入；上下文壓縮時，早期對話的要點也會沉澱進此檔案）]\n`
+  : `[长期记忆 — ${MEMORY_FILENAME}（此文件位于你的工作区，每次对话开始时自动注入到上下文；值得长期保存的事实用 remember 工具写入；上下文压缩时，早期对话的要点也会沉淀进此文件）]\n`)
 : `[Long-term memory — ${MEMORY_FILENAME} (this file lives in your workspace and is injected automatically at the start of every conversation; save durable facts with the remember tool)]\n`) + text;
+}
+
+/* Forget the sediment idempotency markers (item 156 C-06
+ * backstop): called when a conversation is CLEARED, so the fresh
+ * conversation's messages (seq restarting at 1) are not silently
+ * filtered by a watermark/ledger earned by the old one. The
+ * sedimented digest TEXT stays — it is the bot's long-term notes;
+ * only the "already sedimented" bookkeeping resets. */
+export function resetSedimentMarkers(workspace) {
+const file = memoryPath(workspace);
+let raw;
+try { raw = fs.readFileSync(file, 'utf8'); } catch { return; }
+const out = raw.replace(SEQ_MARKER_RE, '').replace(/<!--\s*sa-sediment-keys:[^>]*-->/g, '');
+if (out !== raw) { try { fs.writeFileSync(file, out); } catch { /* best effort */ } }
 }
 
 function trimFileIfNeeded(workspace) {
@@ -102,7 +162,10 @@ trimFileIfNeeded(workspace);
 * discipline, applied locally so this module stays dependency-free
 * of the harness). Returns the stored line. */
 export function appendMemory(workspace, text, { at = new Date()} = {}) {
-const clean = String(text || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
+/* Secret shapes are cut before anything lands in MEMORY.md
+ * (item 156 B-04/S-3): the remember tool's text often quotes the
+ * user's own words, and this file outlives the conversation. */
+const clean = redactUserText(String(text || '')).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
 if (!clean) throw new Error('nothing to remember — text is empty');
 const line = `- ${at.toISOString().slice(0, 10)} ${clean}\n`;
 // The very first entry gets a section header so the file reads
@@ -122,42 +185,77 @@ return clean;
 export function sedimentCompressed(workspace, dropped, { at = new Date()} = {}) {
 const all = (dropped || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant'));
 if (!all.length) return false;
-/* v0.15.2 (audit B-P1-4): filter by the watermark BEFORE
- * digesting — the old code only compared maxSeq, so once the
- * window stayed full, every turn re-sedimented the SAME oldest
- * 24 messages (the caller passes the whole dropped set each
- * turn), flooding MEMORY.md with duplicates and pushing the
- * deliberate ## Facts out through the head-trim. Only messages
- * past the watermark are new sediment. Messages without a seq
- * cannot be watermarked; they ride along only when nothing in
- * the batch carries a seq at all. */
+/* v0.15.2 (audit B-P1-4): filter BEFORE digesting — the old code
+ * only compared maxSeq, so once the window stayed full, every
+ * turn re-sedimented the SAME oldest messages (the caller passes
+ * the whole dropped set each turn), flooding MEMORY.md with
+ * duplicates and pushing the deliberate ## Facts out through the
+ * head-trim. v0.21.0 (audit C-06/C-10): the filter is now the
+ * per-message identity ledger (see sedimentKeyOf above); the
+ * seq watermark remains as the legacy fallback and as the
+ * human/tool-readable "compressed through" record. */
 const through = compressedThroughSeq(workspace);
-const hasSeqs = all.some((m) => Number.isFinite(Number(m.seq)) && Number(m.seq) > 0);
-const msgs = hasSeqs
-  ? all.filter((m) => Number.isFinite(Number(m.seq)) && Number(m.seq) > through)
-  : all;
+const ledger = sedimentedKeys(workspace);
+const hasLedger = ledger.size > 0;
+const seenInBatch = new Set();
+const msgs = [];
+for (const m of all) {
+  const key = sedimentKeyOf(m);
+  if (seenInBatch.has(key) || ledger.has(key)) continue;
+  /* Legacy files (no identity ledger yet): keep the watermark
+   * filter for seq'd messages so the first post-upgrade pass
+   * does not re-sediment every old stretch at once. Seq-less
+   * messages are judged by identity alone — the old code dropped
+   * them silently from mixed batches and re-sedimented them on
+   * repeat in seq-less batches (audit C-10); the key fixes both
+   * from the first pass on. */
+  if (!hasLedger && through > 0) {
+    const seq = Number(m.seq);
+    if (Number.isFinite(seq) && seq > 0 && seq <= through) continue;
+  }
+  seenInBatch.add(key);
+  msgs.push(m);
+}
 if (!msgs.length) return false;
-const seqs = msgs.map((m) => Number(m.seq)).filter((n) => Number.isFinite(n) && n > 0);
-const maxSeq = seqs.length? Math.max(...seqs): 0;
-if (maxSeq > 0 && through >= maxSeq) return false;
-const flat = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
-const bullets = [];
-let budget = 3000;
-for (const m of msgs) {
-if (bullets.length >= 24 || budget <= 0) break;
+const flat = (s, n) => redactUserText(String(s || '')).replace(/\s+/g, ' ').trim().slice(0, n);
+/* Audit C-05: the digest used to stop at 24 bullets / 3000 chars
+ * while a single compression can drop ~170 messages (page 200,
+ * window ~30) — the rest vanished while the heading (and the
+ * context marker) claimed the dropped messages' notes "were
+ * sedimented". Now EVERY newly-dropped message is written, in
+ * consecutive blocks of at most 40 bullets / ~4500 chars so no
+ * single block is a wall, and the first block's heading states
+ * the true total. The file's own 48KB ceiling still rotates the
+ * oldest content out over time — that is the file contract, and
+ * the full transcript remains in the store/export. */
+const entries = msgs.map((m) => {
 const who = m.role === 'user'
 ? (m.delegated? `delegated(${flat(m.delegated.fromBotName, 30) || 'teammate'})`: (m.by?.name? `user(${flat(m.by.name, 30)})`: 'user'))
 : 'assistant';
-const line = `- ${who}: ${flat(m.text, 140)}`;
-bullets.push(line);
-budget -= line.length;
+const seq = Number(m.seq);
+return { key: sedimentKeyOf(m), seq: Number.isFinite(seq) && seq > 0 ? seq : 0, line: `- ${who}: ${flat(m.text, 140)}` };
+});
+const chunks = [];
+let cur = [];
+let curLen = 0;
+for (const e of entries) {
+if (cur.length && (cur.length >= 40 || curLen + e.line.length + 1 > 4500)) { chunks.push(cur); cur = []; curLen = 0; }
+cur.push(e);
+curLen += e.line.length + 1;
 }
-if (!bullets.length) return false;
+if (cur.length) chunks.push(cur);
 const stamp = at.toISOString().slice(0, 10);
-const marker = maxSeq > 0? `\n<!-- sa-compressed-through: ${maxSeq} -->`: '';
+chunks.forEach((chunk, idx) => {
+const chunkMaxSeq = Math.max(0, ...chunk.map((e) => e.seq));
+const marker = chunkMaxSeq > 0? `\n<!-- sa-compressed-through: ${chunkMaxSeq} -->`: '';
+const keys = `\n<!-- sa-sediment-keys: ${chunk.map((e) => e.key).join(',')} -->`;
+const intro = idx === 0
+? `${msgs.length} earlier message(s) were compressed out of the live context window; extractive first-lines for ALL of them follow${chunks.length > 1? `, in ${chunks.length} consecutive sediment blocks`: ''} (details live in the full transcript export):`
+: `Sediment continued (${idx + 1}/${chunks.length}): ${chunk.length} more message(s) from the same compression:`;
 appendBlock(workspace,
-`\n## Compressed conversation sediment — ${stamp}${marker}\n`
-+ `${msgs.length} earlier message(s) were compressed out of the live context window; extractive first-lines follow (details live in the full transcript export):\n`
-+ bullets.join('\n') + '\n');
+`\n## Compressed conversation sediment — ${stamp}${marker}${keys}\n`
++ intro + '\n'
++ chunk.map((e) => e.line).join('\n') + '\n');
+});
 return true;
 }

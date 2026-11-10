@@ -298,6 +298,66 @@ export const S = {
     ar: 'النموذج المحلي "{model}" المستخدم حاليًا هو نموذج تضمين — ينتج المتجهات فقط ولا يستطيع إجراء محادثة، لذا لا يمكن تنفيذ هذه الجولة. اطلب من مسؤول الموقع التبديل إلى نموذج محادثة.',
     hi: 'वर्तमान में उपयोग हो रहा स्थानीय मॉडल "{model}" एक एम्बेडिंग मॉडल है — यह केवल वेक्टर बनाता है और बातचीत नहीं कर सकता, इसलिए यह दौर नहीं चल सकता। कृपया साइट व्यवस्थापक को चैट मॉडल चुनने के लिए बताएं।',
   },
+  // Item 154: the sibling class of notChat — the model reports the
+  // completion capability but ships a raw completion template (no
+  // chat turns; codegemma:2b's FIM template is the proven case), so
+  // it can only continue text. The wording names THIS class; the
+  // embedding wording above would be a wrong description here.
+  localModelCompletionOwner: {
+    zh: '本地模型「{model}」是代码补全类模型，没有对话模板，只能续写文本、不能对话，所以没法用它聊天。请到「设置 → 本地模型」换一个对话模型，或在机器人编辑里给它换模型。',
+    tw: '本地模型「{model}」是程式碼補全類模型，沒有對話範本，只能續寫文字、不能對話，所以沒法用它聊天。請到「設定 → 本地模型」換一個對話模型，或在機器人編輯裡給它換模型。',
+    en: 'The local model "{model}" is a code-completion model — it has no chat template and can only continue text, not hold a conversation, so it cannot chat. Switch to a chat model in Settings → Local models, or pick a different model in the bot editor.',
+    ja: 'ローカルモデル「{model}」はコード補完モデルで、チャット用テンプレートがなく、テキストを続けることしかできないため、チャットには使えません。「設定 → ローカルモデル」でチャット用モデルに切り替えるか、ボット編集で別のモデルを選んでください。',
+    ko: '로컬 모델 "{model}"은(는) 코드 완성 모델이라 대화 템플릿이 없고 텍스트를 이어 쓰기만 할 수 있어 채팅에 쓸 수 없습니다. 「설정 → 로컬 모델」에서 대화용 모델로 바꾸거나 봇 편집기에서 다른 모델을 선택하세요.',
+    es: 'El modelo local «{model}» es un modelo de compleción de código: no tiene plantilla de conversación y solo puede continuar texto, así que no sirve para chatear. Cambia a un modelo de chat en Ajustes → Modelos locales, o elige otro modelo en el editor del bot.',
+    fr: "Le modèle local « {model} » est un modèle de complétion de code : il n'a pas de gabarit de conversation et ne peut que continuer du texte, donc impossible de discuter avec lui. Choisissez un modèle de conversation dans Réglages → Modèles locaux, ou un autre modèle dans l'éditeur du bot.",
+    de: 'Das lokale Modell „{model}“ ist ein Code-Vervollständigungsmodell — es hat keine Chat-Vorlage und kann Text nur fortsetzen, keine Unterhaltung führen, also nicht chatten. Wechseln Sie unter Einstellungen → Lokale Modelle zu einem Chat-Modell oder wählen Sie im Bot-Editor ein anderes Modell.',
+    ru: 'Локальная модель «{model}» — это модель автодополнения кода: у неё нет шаблона диалога, она может только продолжать текст и не может вести диалог, поэтому общаться с ней нельзя. Выберите модель для чата в «Настройки → Локальные модели» или другую модель в редакторе бота.',
+    pt: 'O modelo local "{model}" é um modelo de compleção de código: ele não tem template de conversa e só continua texto, não consegue manter uma conversa, portanto não serve para conversar. Troque para um modelo de chat em Configurações → Modelos locais, ou escolha outro modelo no editor do bot.',
+    vi: 'Mô hình cục bộ "{model}" là mô hình hoàn thành mã — nó không có mẫu trò chuyện và chỉ có thể viết tiếp văn bản, không thể trò chuyện, nên không dùng để chat được. Hãy đổi sang mô hình trò chuyện trong Cài đặt → Mô hình cục bộ, hoặc chọn mô hình khác trong trình sửa bot.',
+    th: 'โมเดลในเครื่อง "{model}" เป็นโมเดลเติมโค้ด — ไม่มีแม่แบบสนทนาและทำได้แค่เขียนข้อความต่อ สนทนาไม่ได้ จึงใช้แชทไม่ได้ โปรดเปลี่ยนเป็นโมเดลสนทนาใน การตั้งค่า → โมเดลในเครื่อง หรือเลือกโมเดลอื่นในตัวแก้ไขบอต',
+    id: 'Model lokal "{model}" adalah model pelengkap kode — tidak punya templat percakapan dan hanya bisa meneruskan teks, tidak bisa bercakap-cakap, jadi tidak bisa dipakai untuk chat. Beralihlah ke model chat di Pengaturan → Model lokal, atau pilih model lain di editor bot.',
+    ar: 'النموذج المحلي "{model}" هو نموذج إكمال أكواد — ليست لديه قالب محادثة ولا يستطيع إلا متابعة النص، ولا يمكنه إجراء محادثة، لذا لا يمكن الدردشة معه. بدّل إلى نموذج محادثة من الإعدادات ← النماذج المحلية، أو اختر نموذجًا آخر في محرر البوت.',
+    hi: 'स्थानीय मॉडल "{model}" एक कोड-पूर्ति मॉडल है — इसमें चैट टेम्पलेट नहीं है और यह केवल टेक्स्ट आगे बढ़ा सकता है, बातचीत नहीं कर सकता, इसलिए इससे चैट नहीं हो सकती। सेटिंग्स → स्थानीय मॉडल में कोई चैट मॉडल चुनें, या बॉट संपादक में दूसरा मॉडल चुनें।',
+  },
+  localModelCompletionMember: {
+    zh: '当前使用的本地模型「{model}」是代码补全类模型，没有对话模板，只能续写文本、不能对话，所以这一轮没法进行。请告知站点管理员换一个对话模型。',
+    tw: '目前使用的本地模型「{model}」是程式碼補全類模型，沒有對話範本，只能續寫文字、不能對話，所以這一輪沒法進行。請告知站點管理員換一個對話模型。',
+    en: 'The local model "{model}" currently in use is a code-completion model — it has no chat template and can only continue text, not hold a conversation, so this turn cannot run. Please let the site admin know to switch to a chat model.',
+    ja: '現在使われているローカルモデル「{model}」はコード補完モデルで、チャット用テンプレートがなくテキストを続けることしかできないため、このターンは実行できません。サイト管理者にチャット用モデルへの切り替えをお知らせください。',
+    ko: '현재 사용 중인 로컬 모델 "{model}"은(는) 코드 완성 모델이라 대화 템플릿이 없고 텍스트를 이어 쓰기만 할 수 있어 이번 차례를 진행할 수 없습니다. 사이트 관리자에게 대화용 모델로 바꿔 달라고 알려 주세요.',
+    es: 'El modelo local «{model}» en uso es un modelo de compleción de código: no tiene plantilla de conversación y solo puede continuar texto, así que este turno no puede ejecutarse. Avisa al administrador del sitio para que cambie a un modelo de chat.',
+    fr: "Le modèle local « {model} » actuellement utilisé est un modèle de complétion de code : il n'a pas de gabarit de conversation et ne peut que continuer du texte, ce tour ne peut donc pas avoir lieu. Prévenez l'administrateur du site pour qu'il choisisse un modèle de conversation.",
+    de: 'Das aktuell verwendete lokale Modell „{model}“ ist ein Code-Vervollständigungsmodell — es hat keine Chat-Vorlage und kann Text nur fortsetzen, keine Unterhaltung führen, daher kann diese Runde nicht laufen. Bitte informieren Sie den Site-Administrator, damit er ein Chat-Modell einstellt.',
+    ru: 'Используемая сейчас локальная модель «{model}» — это модель автодополнения кода: у неё нет шаблона диалога, она может только продолжать текст и не может вести диалог, поэтому этот ход выполнить нельзя. Сообщите администратору сайта, чтобы он выбрал модель для чата.',
+    pt: 'O modelo local "{model}" em uso é um modelo de compleção de código: ele não tem template de conversa e só continua texto, então este turno não pode ser executado. Avise o administrador do site para trocar para um modelo de chat.',
+    vi: 'Mô hình cục bộ "{model}" đang dùng là mô hình hoàn thành mã — nó không có mẫu trò chuyện và chỉ có thể viết tiếp văn bản, nên lượt này không chạy được. Hãy báo cho quản trị viên trang web để đổi sang mô hình trò chuyện.',
+    th: 'โมเดลในเครื่อง "{model}" ที่ใช้อยู่เป็นโมเดลเติมโค้ด ไม่มีแม่แบบสนทนาและทำได้แค่เขียนข้อความต่อ รอบนี้จึงทำงานไม่ได้ โปรดแจ้งผู้ดูแลไซต์ให้เปลี่ยนเป็นโมเดลสนทนา',
+    id: 'Model lokal "{model}" yang sedang dipakai adalah model pelengkap kode — tidak punya templat percakapan dan hanya bisa meneruskan teks, jadi giliran ini tidak bisa berjalan. Beri tahu admin situs agar beralih ke model chat.',
+    ar: 'النموذج المحلي "{model}" المستخدم حاليًا هو نموذج إكمال أكواد — ليست لديه قالب محادثة ولا يستطيع إلا متابعة النص، لذا لا يمكن تنفيذ هذه الجولة. اطلب من مسؤول الموقع التبديل إلى نموذج محادثة.',
+    hi: 'वर्तमान में उपयोग हो रहा स्थानीय मॉडल "{model}" एक कोड-पूर्ति मॉडल है — इसमें चैट टेम्पलेट नहीं है और यह केवल टेक्स्ट आगे बढ़ा सकता है, बातचीत नहीं कर सकता, इसलिए यह दौर नहीं चल सकता। कृपया साइट व्यवस्थापक को चैट मॉडल चुनने के लिए बताएं।',
+  },
+  // Item 156 F-02: a volunteer's own endpoint is re-validated as a
+  // public address on EVERY serving turn (DNS can be re-pointed
+  // after registration); this is the refusal when the re-check
+  // fails. The endpoint is the speaker's own, so one variant.
+  volunteerEndpointNotPublic: {
+    zh: '你登记的自有端点「{host}」现在解析到的不是公网地址，这一轮已按安全规则停下。请检查该端点的域名解析，或在设置里改成公网可达的地址。',
+    tw: '你登記的自有端點「{host}」現在解析到的不是公網位址，這一輪已依安全規則停下。請檢查該端點的域名解析，或在設定裡改成公網可達的位址。',
+    en: 'Your registered endpoint "{host}" no longer resolves to a public address, so this turn was stopped by the safety rule. Check the endpoint\'s DNS, or set a publicly reachable address in Settings.',
+    ja: '登録済みの自分のエンドポイント「{host}」は現在パブリックアドレスに解決されないため、安全ルールによりこのターンを停止しました。エンドポイントのDNSを確認するか、設定でパブリックに到達可能なアドレスに変更してください。',
+    ko: '등록한 내 엔드포인트 "{host}"이(가) 현재 공용 주소로 확인되지 않아 안전 규칙에 따라 이번 차례를 중단했습니다. 엔드포인트의 DNS를 확인하거나 설정에서 공용으로 접근 가능한 주소로 바꾸세요.',
+    es: 'Tu endpoint registrado «{host}» ya no se resuelve a una dirección pública, así que este turno se detuvo por la regla de seguridad. Revisa el DNS del endpoint o pon una dirección pública alcanzable en Ajustes.',
+    fr: "Votre point de terminaison enregistré « {host} » ne se résout plus vers une adresse publique ; ce tour a donc été arrêté par la règle de sécurité. Vérifiez le DNS du point de terminaison ou définissez une adresse publique dans Réglages.",
+    de: 'Ihr registrierter Endpunkt „{host}“ löst derzeit nicht zu einer öffentlichen Adresse auf, daher wurde diese Runde von der Sicherheitsregel gestoppt. Prüfen Sie das DNS des Endpunkts oder stellen Sie unter Einstellungen eine öffentlich erreichbare Adresse ein.',
+    ru: 'Ваша зарегистрированная конечная точка «{host}» сейчас не разрешается в публичный адрес, поэтому этот ход остановлен правилом безопасности. Проверьте DNS конечной точки или укажите в настройках публично доступный адрес.',
+    pt: 'Seu endpoint registrado "{host}" não resolve mais para um endereço público, então este turno foi interrompido pela regra de segurança. Verifique o DNS do endpoint ou defina um endereço publicamente acessível em Configurações.',
+    vi: 'Endpoint bạn đã đăng ký "{host}" hiện không còn phân giải tới địa chỉ công khai, nên lượt này đã bị dừng theo quy tắc an toàn. Hãy kiểm tra DNS của endpoint, hoặc đặt một địa chỉ công khai truy cập được trong Cài đặt.',
+    th: 'ปลายทางที่คุณลงทะเบียน "{host}" ตอนนี้ไม่ชี้ไปยังที่อยู่สาธารณะอีกต่อไป รอบนี้จึงถูกหยุดตามกฎความปลอดภัย โปรดตรวจสอบ DNS ของปลายทาง หรือตั้งที่อยู่สาธารณะที่เข้าถึงได้ใน การตั้งค่า',
+    id: 'Endpoint terdaftar Anda "{host}" kini tidak lagi mengarah ke alamat publik, jadi giliran ini dihentikan oleh aturan keamanan. Periksa DNS endpoint, atau atur alamat yang dapat dijangkau publik di Pengaturan.',
+    ar: 'نقطة الاتصال المسجلة "{host}" لم تعد تُحل إلى عنوان عام، لذا أوقفت قاعدة الأمان هذه الجولة. تحقق من DNS الخاص بنقطة الاتصال، أو عيّن عنوانًا عامًا يمكن الوصول إليه في الإعدادات.',
+    hi: 'आपका पंजीकृत एंडपॉइंट "{host}" अब किसी सार्वजनिक पते पर नहीं जाता, इसलिए सुरक्षा नियम से यह दौर रोक दिया गया। एंडपॉइंट का DNS जांचें, या सेटिंग्स में सार्वजनिक रूप से पहुंच योग्य पता सेट करें।',
+  },
   // Item 150: the model chats but cannot call tools — the turn ran
   // as plain chat, and this line (appended to the stored reply)
   // says so instead of letting the user wonder where tools went.

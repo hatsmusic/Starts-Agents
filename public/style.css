@@ -1746,12 +1746,16 @@ html[lang="ar"] .pcat-tile, html[lang="ar"] .pconn-head { text-align: right; }
 /* ================= v0.20.0: desktop workbench shell ================= */
 /* Append-only layer: the desktop-first sketch (244px side nav,
  * overview home, centered chat column) expressed over the SAME
- * tokens as the rest of the file. Below 1024px nothing changes
+ * tokens as the rest of the file. Below 768px nothing changes
  * except the overview components' single-column base form and
- * the chat overlay reaching up to 1023px; the side nav exists
- * only at >=1024px (full 244 form, 76px icon rail at 1024-1279).
- * The side nav is an in-flow flex item of #app — it takes no
- * z-index and stays out of the v0.15.9 floating-layer contract. */
+ * the chat overlay; the side nav exists at >=768px (full 244
+ * form at >=1280, 76px icon rail at 768-1279). Band history:
+ * v0.20.0 shipped the shell at >=1024 with the overlay reaching
+ * 1023; item 154 (v0.21.0) re-cut the bands — landscape phones
+ * and small tablets (768-1023) were stranded in the phone shell
+ * with no sidebar at all. The side nav is an in-flow flex item
+ * of #app — it takes no z-index and stays out of the v0.15.9
+ * floating-layer contract. */
 
 /* ---- 1. Base (all widths): side nav hidden, overview pieces ---- */
 #sideNav { display: none; }
@@ -1827,8 +1831,8 @@ html[lang="ar"] .pcat-tile, html[lang="ar"] .pconn-head { text-align: right; }
   #roster .view { padding: 26px 34px; }
 }
 
-/* ---- 3. Desktop shell: side nav in flow, roster/chat swap ---- */
-@media (min-width: 1024px) {
+/* ---- 3. Side shell (>=768): side nav in flow, roster/chat swap ---- */
+@media (min-width: 768px) {
   #sideNav { display: flex; flex-direction: column; width: 244px; flex: 0 0 244px; background: var(--panel); border-right: 1px solid var(--line); padding: 20px 14px calc(14px + env(safe-area-inset-bottom)); gap: 16px; overflow-y: auto; }
   .sn-brand { display: flex; gap: 10px; align-items: center; min-width: 0; }
   .sn-logo { width: 36px; height: 36px; border-radius: 9px; flex: none; display: block; }
@@ -1885,8 +1889,8 @@ html[lang="ar"] .pcat-tile, html[lang="ar"] .pconn-head { text-align: right; }
   .browser-card:not(:fullscreen) .bc-viewport { height: 380px; }
 }
 
-/* ---- 4. Icon rail (1024-1279): glyphs stay, words go ---- */
-@media (min-width: 1024px) and (max-width: 1279px) {
+/* ---- 4. Icon rail (768-1279): glyphs stay, words go ---- */
+@media (min-width: 768px) and (max-width: 1279px) {
   #sideNav { width: 76px; flex-basis: 76px; padding: 20px 10px calc(14px + env(safe-area-inset-bottom)); }
   .sn-tx, .sn-bs, .sn-label, .sn-kbd, .sn-utx, .sn-cnt, .sn-usage-top, .sn-usage-foot { display: none; }
   .sn-brand, .sn-new, .sn-item, .sn-recent-item, .sn-user { justify-content: center; }
@@ -1897,8 +1901,8 @@ html[lang="ar"] .pcat-tile, html[lang="ar"] .pconn-head { text-align: right; }
   .ov-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* ---- 5. Below desktop: single column, chat is a full overlay ---- */
-@media (max-width: 1023px) {
+/* ---- 5. Phone shell (<=767): single column, chat is a full overlay ---- */
+@media (max-width: 767px) {
   #roster { width: 100%; flex: 1 1 auto; border-right: 0; }
   #chatPane { position: fixed; inset: 0; background: var(--bg); transform: translateX(100%); transition: transform var(--t-slow) var(--e-spring); z-index: 10; }
   body.in-chat #chatPane { transform: none; }
@@ -1917,4 +1921,26 @@ html[lang="ar"] .pcat-tile, html[lang="ar"] .pconn-head { text-align: right; }
 /* ---- 7. Reduced motion: the new shell's feedback goes still ---- */
 @media (prefers-reduced-motion: reduce) {
   .sn-item, .sn-recent-item, .sn-new, .sn-user, .ov-btn, .ov-arow, .dw-prog i { transition: none; }
+}
+
+/* ================= v0.21.0 (item 154): shell hotfix ================= */
+/* Hidden actuator tabs must never paint: the team / workspace
+ * buttons stay in the tab bar's DOM because app.js binds EVERY
+ * .tab and shell200 drives views by clicking them — but the base
+ * `#tabbar .tab { display: flex }` author rule outranks the UA
+ * stylesheet's [hidden] rule, so in v0.20.0 they rendered as two
+ * bare text tabs (no icon) next to the four real ones. The views
+ * themselves keep their non-tab doors (overview panels, roster
+ * workspace card, sidebar) — see the reachability matrix in the
+ * item-154 batch report. */
+#tabbar .tab[hidden] { display: none; }
+
+/* Model chip: the full model name must survive in the chat head.
+ * The bot name ellipsizes first (.head-main is flex:1 with
+ * min-width:0), so the chip may claim the larger share at a
+ * slightly smaller face instead of truncating the model id
+ * ("…Ollama · c…" for codegemma:2b, item 154). */
+#chatHead .modelchip { max-width: 60%; font-size: 11px; }
+@media (max-width: 640px) {
+  #chatHead .modelchip { max-width: 66%; }
 }

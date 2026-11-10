@@ -65,6 +65,22 @@ export function oauthAppStatus(provider) {
   return { clientId: '', hasSecret: false, source: null };
 }
 
+/* Boot health for the rotation checklist (B-02, audit r1):
+ * trial-decrypt every stored settings-channel secret. Provider
+ * names only, never content. The kv 'oauth_apps' face is part of
+ * vault.VAULT_CIPHER_SURFACES and of both rotation scripts. */
+export function oauthSecretHealth() {
+  const bad = [];
+  let checked = 0;
+  const all = readAll();
+  for (const [provider, entry] of Object.entries(all)) {
+    if (!entry || !entry.secretEnc) continue;
+    checked++;
+    try { decrypt(entry.secretEnc); } catch { bad.push(provider); }
+  }
+  return { checked, bad };
+}
+
 /* Write the settings channel. clientSecret === undefined or ''
  * keeps the stored secret (the UI's password field starts empty
  * and "save" must not erase what it cannot show); an empty

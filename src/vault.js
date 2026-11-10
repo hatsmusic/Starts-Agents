@@ -52,21 +52,53 @@ function migrateLegacyKeyFile(target) {
 let keyRingCache = null;
 let keySource = '';
 
+/* The full ciphertext surface (B-02, audit r1): EVERY store in
+ * the product that holds vault ciphertext. The rotation scripts
+ * (scripts/rotate-vault.mjs, scripts/rekey.mjs — standalone, they
+ * carry their own copy of this list) and the boot trial-decrypt
+ * check must cover exactly these faces; a face missing from the
+ * list is silently destroyed by a master-key rotation.
+ *   - providers:            providers.data JSON, keyEnc
+ *   - site_logins:          site_logins.secret_enc
+ *   - mcp_servers:          mcp_servers.secret_enc
+ *   - kv platform Box:      kv['platform:mcp_box'] JSON secretEnc
+ *   - kv oauth_apps:        kv['oauth_apps'] JSON, per-provider secretEnc */
+export const VAULT_CIPHER_SURFACES = [
+  'providers.keyEnc',
+  'site_logins.secret_enc',
+  'mcp_servers.secret_enc',
+  'kv:platform:mcp_box.secretEnc',
+  'kv:oauth_apps.secretEnc',
+];
+
 const deriveKey = (value) => {
   const raw = Buffer.from(String(value), 'base64');
   return raw.length === 32 ? raw : crypto.createHash('sha256').update(String(value)).digest();
 };
+/* B-13 (audit r1, P2): an env value that is NOT a 32-byte base64
+ * key is SHA-256'd into a key — a short human string therefore
+ * becomes a low-entropy master key whose GCM tag is an offline
+ * guessing oracle. Refusing to boot would brick existing deploys,
+ * so a short env key at least screams at boot. */
+function warnWeakEnvKey(sourceName, value) {
+  const raw = Buffer.from(String(value), 'base64');
+  if (raw.length !== 32 && String(value).length < 32) {
+    console.error(`[vault] WARNING: ${sourceName} is a short non-base64 value (${String(value).length} chars); it is hashed into the master key and is weak against offline guessing if any ciphertext leaks. Use a random 32-byte base64 key.`);
+  }
+}
 
 function loadKeyRing() {
   if (keyRingCache) return keyRingCache;
   const multi = String(process.env.SA_VAULT_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (multi.length) {
+    multi.forEach((v) => warnWeakEnvKey('SA_VAULT_KEYS entry', v));
     keyRingCache = multi.map(deriveKey);
     keySource = `env SA_VAULT_KEYS (${keyRingCache.length} key${keyRingCache.length > 1 ? 's' : ''})`;
     return keyRingCache;
   }
   const single = process.env.SA_VAULT_KEY || process.env.START_AGENTS_MASTER_KEY || '';
   if (single) {
+    warnWeakEnvKey(process.env.SA_VAULT_KEY ? 'SA_VAULT_KEY' : 'START_AGENTS_MASTER_KEY', single);
     // Environment key wins over the file key — that priority is
     // explicit (v0.7); the file stays as the fallback.
     keyRingCache = [deriveKey(single)];
@@ -75,7 +107,12 @@ function loadKeyRing() {
   }
   const keyFile = keyFilePath();
   migrateLegacyKeyFile(keyFile);
-  fs.mkdirSync(path.dirname(keyFile), { recursive: true });
+  // B-14 (audit r1, P2): the key directory is created 0700 like
+  // the migration path already did, and an existing directory is
+  // tightened once — the file itself is 0600, but a listable
+  // directory still maps the vault's neighbourhood.
+  fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
+  try { if ((fs.statSync(path.dirname(keyFile)).mode & 0o077) !== 0) fs.chmodSync(path.dirname(keyFile), 0o700); } catch { /* best effort */ }
   let fileKey = null;
   let rawText = null;
   try {
@@ -158,9 +195,13 @@ export function decrypt(payload) {
   throw lastErr || new Error('vault decrypt failed');
 }
 
-// mask('sk-abcdef…') -> 'sk-a••••••' for display; never the full key.
+// mask(secret) -> '••••••cdef' for display; never the full key.
+// B-15 (audit r1, P2): the old head-4+tail-2 shape gave away over
+// half of a short key on metadata surfaces that need no unlock.
+// Now a FIXED tail-4 only, and nothing at all for short secrets.
 export function mask(secret) {
   const s = String(secret || '');
   if (!s) return '';
-  return s.slice(0, 4) + '••••••' + (s.length > 8 ? s.slice(-2) : '');
+  if (s.length <= 8) return '••••••';
+  return '••••••' + s.slice(-4);
 }

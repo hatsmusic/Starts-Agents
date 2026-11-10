@@ -99,7 +99,10 @@ const store = await import('../src/store.js');
 
 test('redact: Telegram bot token, PEM block, AKIA, ghp_/gho_, padded Bearer', async () => {
   const tg = '123456789:' + 'A'.repeat(35);
-  assert.equal(store.redactSecrets(`bot token is ${tg} ok`), 'bot token is ••• ok');
+  // Item 156 (F-13): the bare `token:`/`token ` key-name shape now
+  // also fires, so the word after "token" is redacted as well —
+  // the Telegram token itself was already fully cut before.
+  assert.equal(store.redactSecrets(`bot token is ${tg} ok`), 'bot token ••• ••• ok');
   const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\nsecretlines\n-----END RSA PRIVATE KEY-----';
   assert.equal(store.redactSecrets(`key:\n${pem}\ndone`), 'key:\n•••\ndone');
   assert.equal(store.redactSecrets('aws AKIAIOSFODNN7EXAMPLE end'), 'aws ••• end');

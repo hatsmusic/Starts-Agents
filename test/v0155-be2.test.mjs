@@ -34,6 +34,7 @@ delete process.env.GITHUB_CLIENT_SECRET;
 const { base32Decode, hotp, totp, totpCandidates, totpVerify } = await import('../src/totp.js');
 const approvals = await import('../src/approvals.js');
 const sitelogin = await import('../src/sitelogin.js');
+const store = await import('../src/store.js');
 const oauthApps = await import('../src/oauth-apps.js');
 const { getDb } = await import('../src/db.js');
 getDb(); // run migrations in this process too
@@ -135,6 +136,12 @@ describe('approvals broker: input cards (item 97)', () => {
 
 describe('sitelogin store layer (item 97)', () => {
   test('CRUD, grants, hints, secret rotation', () => {
+    // Item 156 (B-05/B-06): grants are validated against the bots
+    // table (the bot must exist and belong to the entry owner) and
+    // lookups are owner-scoped — seed real bots first: bot_a is
+    // owner1's, bot_b belongs to another account entirely.
+    store.addBot({ id: 'bot_a', name: 'A', engine: 'echo', ownerId: 'owner1', model: '', persona: '', createdAt: new Date().toISOString() });
+    store.addBot({ id: 'bot_b', name: 'B', engine: 'echo', ownerId: 'owner2', model: '', persona: '', createdAt: new Date().toISOString() });
     const row = sitelogin.createSiteLogin('owner1', {
       label: 'Mail', siteUrl: 'https://mail.example.com/login', username: 'boss@example.com',
       password: 'p@ss', totpSecret: 'JBSWY3DPEHPK3PXP', note: 'main mailbox', botIds: ['bot_a'],
@@ -147,9 +154,13 @@ describe('sitelogin store layer (item 97)', () => {
     assert.deepEqual(pub.grants, ['bot_a']);
     assert.equal(sitelogin.loginsGrantedTo('bot_a').length, 1);
     assert.equal(sitelogin.loginsGrantedTo('bot_b').length, 0);
-    assert.equal(sitelogin.findLoginByRef('mail').id, row.id);
-    assert.equal(sitelogin.findLoginByRef(row.id).id, row.id);
-    assert.equal(sitelogin.findLoginByRef('nope'), null);
+    assert.throws(() => sitelogin.createSiteLogin('owner1', {
+      label: 'X', siteUrl: 'https://x.example.com/', username: 'u', password: 'p', botIds: ['bot_b'],
+    }), /grant|bot/, 'granting a foreign bot is refused at write time (B-06)');
+    assert.equal(sitelogin.findLoginByRef('mail', 'owner1').id, row.id);
+    assert.equal(sitelogin.findLoginByRef(row.id, 'owner1').id, row.id);
+    assert.equal(sitelogin.findLoginByRef('mail', 'owner2'), null, 'a foreign account never even confirms the entry exists (B-05)');
+    assert.equal(sitelogin.findLoginByRef('nope', 'owner1'), null);
     const secret = sitelogin.siteLoginSecret(row);
     assert.equal(secret.username, 'boss@example.com');
     assert.equal(secret.password, 'p@ss');
@@ -271,9 +282,17 @@ describe('HTTP: vault logins + oauth apps (items 97/102)', () => {
   });
 
   test('vault logins: create/list metadata-only, reveal behind the unlock window', async () => {
+    // Item 156 (B-06): grants must name the owner's REAL bots —
+    // create two through the API and grant against their ids.
+    const botA = await api('/api/bots', { method: 'POST', body: { name: 'VaultA', engine: 'echo' } });
+    const botB = await api('/api/bots', { method: 'POST', body: { name: 'VaultB', engine: 'echo' } });
+    assert.ok([200, 201].includes(botA.status), JSON.stringify(botA.data));
+    assert.ok([200, 201].includes(botB.status), JSON.stringify(botB.data));
+    const botAId = botA.data.bot?.id || botA.data.id;
+    const botBId = botB.data.bot?.id || botB.data.id;
     const created = await api('/api/vault/logins', {
       method: 'POST',
-      body: { label: 'Mail', siteUrl: 'https://mail.example.com/login', username: 'boss@example.com', password: 'p@ss w0rd!', totpSecret: 'JBSWY3DPEHPK3PXP', botIds: ['bot_a'] },
+      body: { label: 'Mail', siteUrl: 'https://mail.example.com/login', username: 'boss@example.com', password: 'p@ss w0rd!', totpSecret: 'JBSWY3DPEHPK3PXP', botIds: [botAId] },
     });
     assert.equal(created.status, 201);
     assert.ok(!created.text.includes('p@ss'), 'create response must not echo the password');
@@ -281,7 +300,7 @@ describe('HTTP: vault logins + oauth apps (items 97/102)', () => {
     assert.equal(entry.domain, 'mail.example.com');
     assert.equal(entry.hasTotp, true);
     assert.equal(entry.usernameHint, 'bo•••@example.com');
-    assert.deepEqual(entry.grants, ['bot_a']);
+    assert.deepEqual(entry.grants, [botAId]);
 
     const list = await api('/api/vault/logins');
     assert.equal(list.data.logins.length, 1);
@@ -309,9 +328,10 @@ describe('HTTP: vault logins + oauth apps (items 97/102)', () => {
     assert.equal(mine[0].detail, 'kind=login');
     assert.ok(!JSON.stringify(audit.data).includes('p@ss'));
 
-    // PATCH grants + rotate the password
-    const patched = await api(`/api/vault/logins/${entry.id}`, { method: 'PATCH', body: { botIds: ['bot_b'], password: 'r0tated!' } });
-    assert.deepEqual(patched.data.login.grants, ['bot_b']);
+    // PATCH grants + rotate the password (secret-bearing, rides
+    // the unlock window opened above — item 156 A-10)
+    const patched = await api(`/api/vault/logins/${entry.id}`, { method: 'PATCH', body: { botIds: [botBId], password: 'r0tated!' } });
+    assert.deepEqual(patched.data.login.grants, [botBId]);
     const reveal2 = await api(`/api/vault/logins/${entry.id}/reveal`, { method: 'POST', body: {} });
     assert.equal(reveal2.data.password, 'r0tated!');
 
@@ -434,7 +454,12 @@ describe('HTTP: github sign-in against a mock GitHub (item 103)', () => {
     assert.equal(authUrl.searchParams.get('redirect_uri'), `${BASE}/api/auth/github/callback`);
     const state = authUrl.searchParams.get('state');
     assert.ok(state);
-    const cb = await fetch(`${BASE}/api/auth/github/callback?code=fakecode&state=${encodeURIComponent(state)}`, { redirect: 'manual' });
+    // A-03 (item 156): the start response binds the state to this
+    // browser via the sa_oauth_state cookie; a real browser carries
+    // it to the callback, and so must this round trip.
+    const stateCookie = start.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('sa_oauth_state='));
+    assert.ok(stateCookie, 'start sets the sa_oauth_state binding cookie');
+    const cb = await fetch(`${BASE}/api/auth/github/callback?code=fakecode&state=${encodeURIComponent(state)}`, { redirect: 'manual', headers: { cookie: stateCookie } });
     assert.equal(cb.status, 302);
     assert.equal(cb.headers.get('location'), '/');
     const cookies = cb.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ');

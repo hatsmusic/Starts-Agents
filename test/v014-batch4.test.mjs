@@ -148,21 +148,31 @@ test('readBodyCapped stops at the cap and reports truncation', async () => {
 
 /* ================= T3: browse fetch-path content typing ================= */
 test('browse_page (fetch path) names a PDF as an unsupported document type', async () => {
-  const realFetch = globalThis.fetch;
-  const realPath = process.env.PATH;
-  process.env.PATH = path.join(dir, 'empty-bin'); // no chromium anywhere -> fetch reader
-  fs.mkdirSync(process.env.PATH, { recursive: true });
-  globalThis.fetch = async () => ({
-    status: 200, ok: true, body: null,
-    headers: { get: (h) => (h === 'content-type' ? 'application/pdf' : null) },
-    text: async () => '%PDF-1.7 garbage',
-  });
+  // Item 156 D-07 removed the seam this test used to stub
+  // (globalThis.fetch): the fetch reader now goes through
+  // fetchPublicPinned, which resolves and pins its own connection
+  // and refuses every non-public address before connecting — and
+  // this sandbox has no public interface to serve a PDF from, so
+  // the typing branch can no longer be reached end-to-end here.
+  // What CAN be pinned: (1) the pinned fetch refuses a local PDF
+  // URL pre-connection, zero hits; (2) the fetch reader's typing
+  // branch still names a PDF, keyed on the content-type of the
+  // pinned response, positioned after the pinned fetch call.
+  let hits = 0;
+  const srv = http.createServer((req, res) => { hits++; res.writeHead(200, { 'content-type': 'application/pdf' }); res.end('%PDF-1.7 garbage'); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   try {
-    const browse = tools.getTool('browse_page');
     await assert.rejects(
-      () => browse.run({ url: 'http://93.184.216.34/paper.pdf' }, { workspace: dir }),
-      /unsupported document type: .* is a PDF document/);
-  } finally { globalThis.fetch = realFetch; process.env.PATH = realPath; }
+      () => tools.fetchPublicPinned(`http://127.0.0.1:${srv.address().port}/paper.pdf`),
+      /refused|private|loopback/i);
+    assert.equal(hits, 0, 'the local target was never contacted');
+  } finally { srv.close(); }
+  const src = fs.readFileSync(path.join(ROOT, 'src/tools.js'), 'utf8');
+  const fetchAt = src.indexOf('const res = await fetchPublicPinned(current.href');
+  const typeAt = src.indexOf("ct.includes('application/pdf')", fetchAt);
+  assert.ok(fetchAt > 0 && typeAt > fetchAt, 'the fetch reader types the pinned response by content-type');
+  assert.ok(src.slice(typeAt, typeAt + 800).includes('is a PDF document, which browse_page cannot extract text from'),
+    'the PDF branch names the document type instead of dumping binary');
 });
 
 /* ================= P1-18: execCaptured always settles ================= */

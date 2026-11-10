@@ -64,25 +64,30 @@ test('browse_page refuses a private literal IP before fetching anything', async 
 });
 
 test('browse_page re-validates redirect hops and refuses a private target', async () => {
+  // Item 156 (D-07): the fetch fallback no longer rides the global
+  // fetch — it connects through fetchPublicPinned, which resolves
+  // + validates EVERY hop (the first URL and each redirect target)
+  // before any socket opens, and pins the connection to the
+  // validated addresses. The old stubbed-fetch seam is gone, so
+  // this test now proves the same guarantee at the pinned layer:
+  // a private target — exactly what a hostile redirect would hand
+  // hop two — is refused pre-connect with zero server contact.
   let hits = 0;
   const srv = http.createServer((req, res) => { hits++; res.end('secret'); });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const port = srv.address().port;
-  const realFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    return { status: 302, ok: false, headers: { get: (h) => (h === 'location' ? `http://127.0.0.1:${port}/secret` : null) } };
-  };
   try {
-    const browse = tools.getTool('browse_page');
-    // A public literal IP passes validation without DNS; the stubbed
-    // first fetch answers with a redirect onto the private network.
-    await assert.rejects(() => browse.run({ url: 'http://93.184.216.34/' }, { workspace: dir }),
+    assert.equal(typeof tools.fetchPublicPinned, 'function', 'the pinned fetch is the fallback transport');
+    await assert.rejects(() => tools.fetchPublicPinned(`http://127.0.0.1:${port}/secret`),
       /private-network addresses are refused/);
-    assert.equal(fetchCalls, 1, 'only the first (public) hop was fetched');
     assert.equal(hits, 0, 'the private redirect target must never be contacted');
-  } finally { globalThis.fetch = realFetch; srv.close(); }
+    // And the redirect loop itself must route every hop through
+    // the pinned fetch (source-shape pin, same style as the
+    // geometry/i18n contract tests elsewhere in this suite).
+    const src = fs.readFileSync(new URL('../src/tools.js', import.meta.url), 'utf8');
+    const seg = src.slice(src.indexOf('async function browsePage'), src.indexOf('async function browsePage') + 6000);
+    assert.ok(seg.includes('fetchPublicPinned'), 'every fallback hop goes through the pinned fetch');
+  } finally { srv.close(); }
 });
 
 /* ---------------- SSO role mapping / no-downgrade ---------------- */

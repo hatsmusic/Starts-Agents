@@ -16,16 +16,16 @@ const bootLang = (() => {
   if (nav.startsWith('zh')) return 'zh';
   return nav.split('-')[0] || 'en';
 })();
-const { LANGS, getLang, makeT } = await import(`./i18n-pack-${bootLang}.js?v=200`);
+const { LANGS, getLang, makeT } = await import(`./i18n-pack-${bootLang}.js?v=210`);
 let makeTCur = makeT;
 const loadedPacks = new Set(['en', bootLang]);
 async function ensureLangPack(code) {
   if (loadedPacks.has(code)) return;
-  const mod = await import(`./i18n-pack-${code}.js?v=200`);
+  const mod = await import(`./i18n-pack-${code}.js?v=210`);
   makeTCur = mod.makeT;
   loadedPacks.add(code);
 }
-import { redactForDisplay, createToastStack, createMsgQueue, staggerDelay, filterModels, createModelSelection, renderMd, modelChipWindow, keepDefaultOnly, removeModels, shellAction, SPRING_PARAMS, createSpring, stepSpring, springSamples } from './ui-utils.js?v=200';
+import { redactForDisplay, createToastStack, createMsgQueue, staggerDelay, filterModels, createModelSelection, renderMd, modelChipWindow, keepDefaultOnly, removeModels, shellAction, SPRING_PARAMS, createSpring, stepSpring, springSamples } from './ui-utils.js?v=210';
 
 const $ = (s) => document.querySelector(s);
 const state = {
@@ -220,7 +220,7 @@ function avatarEl(entity, cls = '', opts = {}) {
   }
   if (opts.bot) {
     const img = el('img', 'av-img');
-    img.src = '/botwork-logo.png?v=200';
+    img.src = '/botwork-logo.png?v=210';
     img.alt = '';
     // Dimension attributes are a hard floor: even if a stale cached
     // stylesheet (old PWA version) has no .av rule, the SVG can
@@ -339,16 +339,13 @@ function closeSheet(instant = false) {
   if (sheetReturnFocus && document.contains(sheetReturnFocus)) { try { sheetReturnFocus.focus(); } catch { /* detached */ } }
   sheetReturnFocus = null;
 }
-/* Pop-family mutual exclusion (v0.15.9, item 133 — Rule 4 of the
- * stacking contract in style.css): at most ONE pop surface is open
- * at any moment. The families that keep their own module-level
- * closer (bot switcher, bot menu, card menu, the dropdown family's
- * openDdClose, the language menu) are bridged here; families with
- * per-instance closers (comboboxes, the slash panel) register
- * while open. Every pop opener calls closeAllPops() first, and
- * openSheet() closes the whole family — a sheet never opens over
- * a dangling pop. Toasts are NOT pops: they are the contract's
- * standing top-layer exception and are never closed from here. */
+/* Pop-family mutual exclusion (item 133, stacking contract
+ * Rule 4): at most ONE pop surface open at a time. Module-level
+ * closers (bot switcher/menu, card menu, dropdowns, language
+ * menu) are bridged here; per-instance closers (comboboxes,
+ * slash panel) register while open. Every opener calls
+ * closeAllPops() first; openSheet() closes the whole family.
+ * Toasts are NOT pops and are never closed from here. */
 const popRegistry = new Set();
 function registerPop(close) { popRegistry.add(close); }
 function unregisterPop(close) { popRegistry.delete(close); }
@@ -397,17 +394,12 @@ function openSheet(title, build, { bare = false } = {}) {
   overlay.append(panel);
   root.append(overlay);
   overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) closeSheet(); });
-  /* v7 drawer physics, item 86 mechanics: the grab handle drags
-   * the sheet with the finger — downward follows 1:1, upward
-   * rubber-bands (×0.32, capped) — and release decides by
-   * displacement AND velocity: past ~34% of the panel or a fast
-   * flick closes, otherwise the sheet springs home. The scrim
-   * thins as the sheet travels. v0.15.3: move events only record
-   * the latest position — the style write happens once per rAF
-   * frame, velocity is an EMA over recent FRAMES, and the
-   * release spring starts at the finger's actual velocity
-   * instead of from rest (the old CSS-transition snap restarted
-   * at zero every time, which read as a hitch). */
+  /* v7 drawer physics (item 86): drag follows 1:1 down, rubber-
+   * bands up (×0.32); release closes past ~34% or on a fast flick,
+   * else springs home; scrim thins with travel. Move events only
+   * record position — one style write per rAF, velocity is an EMA
+   * over frames, and the release spring starts at the finger's
+   * actual velocity (never from rest). */
   if (motionOK()) {
     let drag = null;
     const dragFrame = () => {
@@ -534,14 +526,17 @@ function buildLangMenu() {
   for (const [code, label] of LANGS) {
     const b = el('button', 'lang-item' + (code === state.lang ? ' on' : ''), label);
     b.onclick = async () => {
+      menu.hidden = true;
+      // Commit only after the pack loads (item 156 G-07): writing
+      // state+storage first split app/shell/storage three ways on
+      // failure. The shell follows via the sa:lang event.
+      try { await ensureLangPack(code); }
+      catch { toast(t('errGeneric')); return; }
       state.lang = code;
       localStorage.setItem('sa-lang', code);
-      menu.hidden = true;
-      // Item 122: fetch this language's pack before re-rendering
-      // (already-loaded packs resolve instantly).
-      try { await ensureLangPack(code); } catch { /* keep the current pack; missing keys fall back to English */ }
       applyLang();
       buildLangMenu();
+      document.dispatchEvent(new CustomEvent('sa:lang', { detail: { code } }));
     };
     menu.append(b);
   }
@@ -678,6 +673,7 @@ function renderRoster() {
   for (const bot of bots) {
     const status = bot.status || 'idle';
     const item = el('div', 'bot-item botcard st-' + status + (state.current === bot.id ? ' on' : ''));
+    item.dataset.botId = bot.id;
     item.style.setProperty('--d', Math.min(idx++, 8) * 24 + 'ms');
     const actions = el('div', 'swipe-actions');
     const editB = el('button', 'sw-act edit', t('editAct'));
@@ -1196,16 +1192,12 @@ async function loadEarlierMessages() {
 }
 
 /* v7 container transform (FLIP): the chat pane grows out of the
- * tapped roster card and shrinks back into it — transform +
- * border-radius + opacity only, on the single pane element, so
- * the 450-message scroll budget is untouched. flipSource is set
- * by the card's own click and consumed here; flipReturn keeps
- * the rect for the back trip.
+ * tapped roster card and back — transform + radius + opacity
+ * only, on the single pane element. flipSource is set by the
+ * card's click; flipReturn keeps the rect for the back trip.
  * Item 86: the flight is a spring over progress p ∈ [0,1] (the
- * shared solver), not a fixed CSS clock. A back-tap mid-flight
- * simply retargets the SAME spring to 0 — position and velocity
- * carry over, so the pane turns around where it is instead of
- * jumping to an endpoint and replaying. */
+ * shared solver); a back-tap mid-flight retargets the SAME
+ * spring to 0 — position and velocity carry over. */
 let flipSource = null;
 let flipReturn = null;
 let flipAnim = null; // { s, handle, pane, r, pw, ph, done, shadow, roster }
@@ -1450,15 +1442,12 @@ function clearDraft(botId) {
   try { localStorage.removeItem(DRAFT_PREFIX + botId); } catch { /* ignore */ }
 }
 
-/* Composer auto-height (v0.15.5, item 94): the old listener reset
- * height to 'auto' on EVERY keystroke — collapsing the box to one
- * line and clearing the textarea's internal scroll, so the caret
- * visibly jumped while typing. Now: growing reads scrollHeight
- * directly (no collapse), an unchanged target height writes
- * nothing at all, and the one 'auto' re-measure happens only when
- * the text actually shrank (restoring scrollTop in the same task,
- * before any paint). During IME composition nothing is resized —
- * the candidate window owns the field until compositionend. */
+/* Composer auto-height (item 94): growing reads scrollHeight
+ * directly (no 'auto' collapse — that jumped the caret), an
+ * unchanged target height writes nothing, and the one 'auto'
+ * re-measure happens only when the text shrank (scrollTop
+ * restored in the same task). No resizing during IME
+ * composition — the candidate window owns the field. */
 let composerComposing = false;
 let composerLastLen = -1;
 function fitComposerHeight(force = false) {
@@ -3052,16 +3041,13 @@ function addToolChip(name, args) {
   let group = null;
   for (const child of msgs.children) if (child.classList.contains('tool-group')) group = child;
   if (!group) {
-    /* v0.17.0 batch 4 (redo ruling, sketch frame 3): the group is
-     * born FOLDED — one summary line per group, tap the head to
-     * expand to the full-height step rows. This REVERSES the
-     * v0.15.4 D2 default-open state (the flex-crush half of D2 —
-     * rows may never be shrunk — is untouched: expanded rows still
-     * render at full height). This is the ONLY group creation
-     * point: run replay / re-attach streams land here too via the
-     * same SSE handlers, and stored transcripts never persist tool
-     * rows, so no second path needs the class. File cards are NOT
-     * .tool-wrap children of the fold — deliverables stay visible. */
+    /* v0.17.0 batch 4 (sketch frame 3): the group is born FOLDED —
+     * one summary line, tap the head to expand; expanded rows
+     * still render at full height (never shrunk). This is the
+     * ONLY group creation point: replay / re-attach land here via
+     * the same SSE handlers, and transcripts never persist tool
+     * rows. File cards are NOT fold children — deliverables stay
+     * visible. */
     group = el('div', 'tool-group folded');
     const head = el('div', 'tool-group-head');
     head.append(el('span', 'tool-group-ic', ''), el('span', 'tool-group-count', ''), el('span', 'tool-group-sum', ''), el('span', 'tool-group-tag', ''), el('span', 'tool-group-chev', '▾'));
@@ -3129,10 +3115,9 @@ function addApprovalCard(card, mount) {
   const detail = el('div', 'ap-detail');
   detail.hidden = !(card.input && card.input.kind === 'code');
   box.append(detail);
-  /* Taint banner (v0.15, item B4): when this turn has already read
-   * outside content, a warning strip sits at the very top of the
-   * card — above the summary — not buried under it. It stays on
-   * the face: a safety warning is not a foldable parameter. */
+  /* Taint banner (item B4): when this turn has read outside
+   * content, the warning strip sits at the very top of the card,
+   * on the face — a safety warning is not a foldable parameter. */
   if (card.tainted) face.append(el('div', 'ap-taint ap-risk high', t('apTaintWarn')));
   if (sum) {
     face.append(el('p', 'ap-action', t(sum.action, sum.params || {})));
@@ -6035,17 +6020,23 @@ function renderAcctDataBox(st) {
   nameIn.type = 'text';
   nameIn.placeholder = user.name;
   nameIn.autocomplete = 'off';
+  // Password re-verification (item 156 A-09): the server enforces;
+  // password-less (social/SSO) accounts just leave it empty.
+  const pwIn = document.createElement('input');
+  pwIn.type = 'password';
+  pwIn.placeholder = t('pwOldPh');
+  pwIn.autocomplete = 'current-password';
   const fire = el('button', 'mini-btn danger-text', t('acctDelete'));
   fire.type = 'button';
   fire.disabled = true;
   nameIn.addEventListener('input', () => { fire.disabled = nameIn.value.trim() !== user.name; });
   fire.onclick = async () => {
     try {
-      await api('DELETE', '/api/auth/me', { name: nameIn.value.trim() });
+      await api('DELETE', '/api/auth/me', { name: nameIn.value.trim(), password: pwIn.value });
       doLogout();
     } catch (e) { toast(friendlyErrText(e) || t('errGeneric')); }
   };
-  confirmBox.append(nameIn, fire);
+  confirmBox.append(nameIn, pwIn, fire);
   delBtn.onclick = () => { confirmBox.hidden = !confirmBox.hidden; if (!confirmBox.hidden) nameIn.focus(); };
   wrap.append(delBtn, confirmBox);
   box.append(wrap);
@@ -7064,6 +7055,9 @@ function animateViewIn(sec) {
 }
 
 function switchView(v) {
+  // Guard (item 156 G-03): 'chat' is a tab action, not a view (no
+  // #view-chat) — never let an unknown view hide every section.
+  if (!document.getElementById('view-' + v)) return;
   state.view = v;
   document.body.dataset.view = v;
   /* Frame ⑤/⑦ (v0.15.1): the profile and vault pages own the
@@ -7241,11 +7235,17 @@ async function renderVaultLogins(body) {
     row.append(ed);
     const del = el('button', 'mini-btn danger', t('del'));
     del.type = 'button';
-    del.onclick = async () => {
-      if (!(await confirmDanger(e.label || e.siteUrl || ''))) return;
+    // Deletion is unlock-gated server-side (item 156 A-10): a
+    // locked vault gets the unlock sheet and a retry, not a raw
+    // 'vaultLocked' toast (same shape as the reveal gate).
+    const doDel = async () => {
       try { await api('DELETE', `/api/vault/logins/${e.id}`); toast(t('profSaved')); loadVault().catch(() => {}); }
-      catch (err) { toast(friendlyErrText(err) || t('errGeneric')); }
+      catch (err) {
+        if (err && err.message === 'vaultLocked') { vaultStatusCache = { ...(vaultStatusCache || {}), locked: true }; openVaultUnlockSheet(doDel); return; }
+        toast(friendlyErrText(err) || t('errGeneric'));
+      }
     };
+    del.onclick = async () => { if (await confirmDanger(e.label || e.siteUrl || '')) doDel(); };
     row.append(del);
     list.append(row);
   }
@@ -7459,7 +7459,20 @@ function fmtDur(ms) {
   return s < 60 ? s + 's' : Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's';
 }
 async function loadTaskCenter() {
-  const data = await api('GET', '/api/tasks');
+  let data;
+  try { data = await api('GET', '/api/tasks'); }
+  catch {
+    // Failure must not impersonate emptiness (item 156 G-05).
+    const wrap = $('#taskGroups');
+    if (wrap) {
+      wrap.innerHTML = '';
+      const b = el('button', 'mini-btn', t('loadFailedRetry'));
+      b.type = 'button';
+      b.onclick = () => loadTaskCenter().catch(() => {});
+      wrap.append(b);
+    }
+    return;
+  }
   // Item 119: the approvals aggregate rides the same refresh —
   // every pending card across all bots, decidable from here.
   try {
@@ -7558,11 +7571,25 @@ async function loadWorkspace() {
   chips.innerHTML = '';
   for (const b of state.bots) {
     const c = el('button', 'chip' + (b.id === botId ? ' on' : ''), b.name);
+    c.dataset.botId = b.id;
     c.onclick = () => { state.wsBot = b.id; loadWorkspace(); };
     chips.append(c);
   }
   if (!botId) return;
-  const ws = await api('GET', `/api/bots/${botId}/workspace`);
+  let ws;
+  try { ws = await api('GET', `/api/bots/${botId}/workspace`); }
+  catch {
+    // Same rule (item 156 G-05): never render failure as empty.
+    const tot = $('#wsTotals');
+    if (tot) {
+      tot.innerHTML = '';
+      const b = el('button', 'mini-btn', t('loadFailedRetry'));
+      b.type = 'button';
+      b.onclick = () => loadWorkspace().catch(() => {});
+      tot.append(b);
+    }
+    return;
+  }
   state.wsCache[botId] = ws;
   renderWsCard();
   $('#wsTotals').textContent = t('wsTotals', { files: ws.files, size: fmtSize(ws.bytes) })
@@ -8053,8 +8080,10 @@ async function init() {
   buildLangMenu();
   applyLang();
   loadAvatarMeta();
-  const { engines } = await api('GET', '/api/engines');
-  state.engines = engines;
+  // Boot single point removed (item 156 G-02): one engines 500 used
+  // to abort init before ANY binding ran. Degrade to an empty table.
+  try { state.engines = (await api('GET', '/api/engines')).engines || []; }
+  catch { state.engines = []; }
   /* Populate state.auth up front (v0.14.2): the top-bar avatar and
    * the account sheet read it from the team page, long before the
    * settings view's own loadAccount would have run. It is AWAITED
@@ -8480,3 +8509,13 @@ async function init() {
 }
 
 init().catch((e) => { if (e.message !== 'locked') addMessage('system', redactForDisplay(e.message)); });
+/* Watchdog (item 156 G-04): if shell200.js (rail + overview) fails
+ * to load, say so visibly instead of leaving dead buttons silent.
+ * shell200 sets window.__saShell at its top. */
+setTimeout(() => {
+  if (window.__saShell) return;
+  const home = document.getElementById('view-home');
+  if (!home || home.querySelector('.shell-missing-note')) return;
+  const note = el('div', 'team-empty shell-missing-note', t('dwShellMissing'));
+  home.prepend(note);
+}, 2500);

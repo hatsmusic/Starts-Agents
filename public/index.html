@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Bot Work</title>
-<link rel="stylesheet" href="/style.css?v=200">
+<link rel="stylesheet" href="/style.css?v=210">
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#0f212e">
 <link rel="icon" type="image/png" href="/icon.png">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=200">
-<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=200">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=210">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png?v=210">
 <link rel="apple-touch-icon" href="/icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -19,7 +19,7 @@
 <body data-view="home">
 <div id="lockScreen" hidden>
   <div class="lock-card">
-    <img class="lock-img" src="/botwork-logo.png?v=200" alt="Bot Work" width="76" height="76">
+    <img class="lock-img" src="/botwork-logo.png?v=210" alt="Bot Work" width="76" height="76">
     <h2>Bot Work</h2>
     <p class="lock-hint" id="lockHint" data-i18n="lockHintAcct">用你的账号登录。</p>
       <div id="ssoBox" hidden>
@@ -75,7 +75,7 @@
 <div id="app">
   <aside id="sideNav">
   <div class="sn-brand">
-    <img class="sn-logo" src="/botwork-logo.png?v=200" alt="" width="34" height="34">
+    <img class="sn-logo" src="/botwork-logo.png?v=210" alt="" width="34" height="34">
     <div class="sn-brand-tx"><div class="sn-bn">Bot Work</div><div class="sn-bs" data-i18n="dwBrandSub">Agent 工作台</div></div>
   </div>
   <button id="snNew" class="sn-new" type="button"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span class="sn-tx" data-i18n="dwNewChat">新建对话</span><span class="sn-kbd">⌘N</span></button>
@@ -162,6 +162,10 @@
       <section class="ov-panel">
         <div class="ov-ph"><h2 data-i18n="dwUsageTitle">用量概览</h2></div>
         <div id="ovUsageBody"></div>
+      </section>
+      <section class="ov-panel">
+        <div class="ov-ph"><h2 data-i18n="tabWs">工作区</h2><button class="ov-more" id="ovWsAll" type="button"><span data-i18n="wsOpen">打开</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m9 5 7 7-7 7"/></svg></button></div>
+        <div id="ovWsBody"></div>
       </section>
     </div>
   </div>
@@ -599,7 +603,7 @@
 <input type="file" id="avatarFile" class="vh" accept="image/png,image/jpeg,image/webp">
 <div id="sheetRoot"></div>
 <div id="toasts" aria-live="polite"></div>
-<script type="module" src="/app.js?v=200"></script>
-<script type="module" src="/shell200.js?v=200"></script>
+<script type="module" src="/app.js?v=210"></script>
+<script type="module" src="/shell200.js?v=210"></script>
 </body>
 </html>

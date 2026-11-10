@@ -730,7 +730,11 @@ describe('item 118-4: GitHub email-merge never lands on the owner row', () => {
     const start = await fetch(BASE + '/api/auth/github/start', { redirect: 'manual' });
     assert.equal(start.status, 302);
     const state = new URL(start.headers.get('location')).searchParams.get('state');
-    const cb = await fetch(`${BASE}/api/auth/github/callback?code=fakecode&state=${encodeURIComponent(state)}`, { redirect: 'manual' });
+    // A-03 (item 156): the callback requires the sa_oauth_state
+    // cookie the start response set — carry it like a browser.
+    const stateCookie = start.headers.getSetCookie().map((c) => c.split(';')[0]).find((c) => c.startsWith('sa_oauth_state='));
+    assert.ok(stateCookie, 'start sets the sa_oauth_state binding cookie');
+    const cb = await fetch(`${BASE}/api/auth/github/callback?code=fakecode&state=${encodeURIComponent(state)}`, { redirect: 'manual', headers: { cookie: stateCookie } });
     return cb;
   }
   test('GitHub sign-in with the OWNER email fails closed — no session is minted', async () => {

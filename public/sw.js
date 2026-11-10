@@ -7,7 +7,7 @@
 // Freshness belt-and-braces (learned the hard way): Cloudflare puts a
 // 4-hour max-age on these files, which overrides the origin's
 // no-cache and can pin a phone to a days-old app.js. So (1) the shell
-// files carry a version query (?v=200 — bump it together with CACHE on
+// files carry a version query (?v=210 — bump it together with CACHE on
 // every release; a new URL is a new cache entry everywhere), and
 // (2) fetches here bypass the HTTP cache entirely.
 //
@@ -16,8 +16,8 @@
 // successful (res.ok) response. Server-rendered surfaces — the /s/
 // share landings above all — are NEVER cached and never answered
 // with the app shell; an offline share link is simply offline.
-const CACHE = 'starts-agents-v39';
-const SHELL = ['/', '/index.html', '/style.css?v=200', '/app.js?v=200', '/i18n.js?v=200', '/ui-utils.js?v=200', '/shell200.js?v=200', '/manifest.webmanifest', '/icon.png', '/icon-192.png', '/icon-maskable-512.png', '/favicon-32.png', '/favicon-16.png', '/botwork-logo.png?v=200'];
+const CACHE = 'starts-agents-v41';
+const SHELL = ['/', '/index.html', '/style.css?v=210', '/app.js?v=210', '/i18n.js?v=210', '/ui-utils.js?v=210', '/shell200.js?v=210', '/manifest.webmanifest', '/icon.png', '/icon-192.png', '/icon-maskable-512.png', '/favicon-32.png', '/favicon-16.png', '/botwork-logo.png?v=210'];
 const SHELL_PATHS = new Set(['/', '/index.html', '/style.css', '/app.js', '/i18n.js', '/ui-utils.js', '/shell200.js', '/manifest.webmanifest', '/icon.png', '/icon-192.png', '/icon-maskable-512.png', '/favicon-32.png', '/favicon-16.png', '/botwork-logo.png', '/sw.js']);
 
 self.addEventListener('install', (e) => {

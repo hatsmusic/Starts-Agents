@@ -123,9 +123,14 @@ test('137 storage point: chatTurn cleans the reply before pushMessage', () => {
   const server = read('src/server.js');
   assert.ok(server.includes("import { scrubText, scrubValue, scrubErrorMessage, cleanReplyText } from './scrub.js';"), 'server imports cleanReplyText');
   const cleanAt = server.indexOf('assistant = cleanReplyText(assistant);');
-  const pushAt = server.indexOf('store.pushMessage(bot.id, { role: \'assistant\', text: scrubText(assistant', cleanAt);
   assert.ok(cleanAt > 0, 'cleaning is applied inside chatTurn');
-  assert.ok(pushAt > cleanAt, 'the assistant pushMessage stores the cleaned text');
+  // Item 156 (item 154 fix): the stored message is built as a
+  // storedMsg object so an aborted turn can be marked on it; the
+  // pinned shape is that object's construction + push, in order.
+  const storeAt = server.indexOf("const storedMsg = { role: 'assistant', text: scrubText(assistant", cleanAt);
+  const pushAt = server.indexOf('store.pushMessage(bot.id, storedMsg)', storeAt);
+  assert.ok(storeAt > cleanAt, 'the stored assistant text is the cleaned text');
+  assert.ok(pushAt > storeAt, 'the assistant pushMessage stores the cleaned text');
 });
 
 /* ---------------- 136: dayKey semantics ---------------- */

@@ -196,10 +196,11 @@ test('startup snapshot exists in data/backups and opens as a valid database', as
   try {
     const tables = snap.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((x) => x.name);
     for (const t of ['bots', 'messages', 'users', 'sessions', 'audit_log']) assert.ok(tables.includes(t), 'snapshot has table ' + t);
-    // Current schema version: 8 since v0.15.5 added site_logins
-    // (migration v7) and users.github_id (migration v8; v6 was
-    // v0.15.2's users unique indexes, v5 was v0.15's mcp_servers).
-    assert.equal(snap.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get().value, '8');
+    // Current schema version: 9 since v0.21.0 (item 156) added
+    // usage_dedup (migration v9); 8 was v0.15.5's users.github_id
+    // (v8; site_logins was v7, v6 was v0.15.2's users unique
+    // indexes, v5 was v0.15's mcp_servers).
+    assert.equal(snap.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get().value, '9');
   } finally { snap.close(); }
 });
 

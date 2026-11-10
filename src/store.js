@@ -14,9 +14,21 @@ import crypto from 'node:crypto';
 import { config } from './config.js';
 import { getDb } from './db.js';
 import { log } from './log.js';
-import { normalizeAvatar, parseStoredAvatar } from './avatars.js';
+import { normalizeAvatar, parseStoredAvatar, deleteAvatarImageFile, AVATAR_FILE_RE } from './avatars.js';
 
 const db = () => getDb();
+
+/* List-read tolerance (v0.21.0, audit F-22, P2 same-file): one
+ * unparseable `data` row used to 500 the whole roster for everyone.
+ * List paths skip the bad row and log it structurally; single-row
+ * getters keep failing loudly, where the caller asked for exactly
+ * that row. */
+function parseRowData(json, label, id) {
+  try { return JSON.parse(json); } catch (e) {
+    log.error('skipping unparseable stored row', { label, id: id || '', error: e.message });
+    return null;
+  }
+}
 
 /* Compat shims for the old load/save shape: state is always live in
  * the database now — load() materializes a snapshot for any caller
@@ -58,12 +70,16 @@ function botRowValues(bot) {
 export function listBots() {
   const rows = db().prepare('SELECT id, data, avatar FROM bots ORDER BY rowid').all();
   const lastStmt = db().prepare('SELECT data FROM messages WHERE bot_id = ? ORDER BY seq DESC LIMIT 1');
-  return rows.map((r) => {
-    const b = botFromRow(r.data, r.avatar);
+  const out = [];
+  for (const r of rows) {
+    let b = null;
+    try { b = botFromRow(r.data, r.avatar); } catch (e) { log.error('skipping unparseable stored row', { label: 'bots', id: r.id, error: e.message }); }
+    if (!b) continue;
     const lastRow = lastStmt.get(r.id);
-    const last = lastRow ? JSON.parse(lastRow.data) : null;
-    return { ...b, lastMessage: last ? { text: String(last.text).slice(0, 120), at: last.at } : null };
-  });
+    const last = lastRow ? parseRowData(lastRow.data, 'messages', r.id) : null;
+    out.push({ ...b, lastMessage: last ? { text: String(last.text).slice(0, 120), at: last.at } : null });
+  }
+  return out;
 }
 
 export function getBot(id) {
@@ -93,6 +109,26 @@ export function addBot(bot) {
   return bot;
 }
 
+/* All-or-nothing bulk insert (v0.21.0, audit F-10): team import
+ * used to insert bots one by one from the route, so a mid-import
+ * failure left a half-created team with no rollback. The route
+ * should hand the whole parsed team to this one call. NOTE: this
+ * opens its own transaction — callers must not already be inside
+ * one (the import route is not). */
+export function addBots(bots) {
+  const list = Array.isArray(bots) ? bots : [];
+  const d = db();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    for (const b of list) addBot(b);
+    d.exec('COMMIT');
+  } catch (e) {
+    try { d.exec('ROLLBACK'); } catch { /* already settled */ }
+    throw e;
+  }
+  return list;
+}
+
 export function updateBot(id, patch) {
   const bot = getBot(id);
   if (!bot) return null;
@@ -105,13 +141,65 @@ export function updateBot(id, patch) {
 /* DB half of removeBot (v0.15.2, audit BC-P1-3): split out so the
  * deleteUser cascade can run every DB delete inside ONE
  * transaction and only touch the filesystem after commit. */
+/* Scrub a bot id out of every site_logins grant list (v0.21.0,
+ * audit F-12): grant lists are JSON arrays of bot ids on the entry
+ * row; a deleted bot used to linger there forever as a dead
+ * reference an auditor could no longer resolve. Returns the number
+ * of entries changed. Plain statements only — safe inside the
+ * deleteUser transaction, like the rest of removeBotDb. */
+export function scrubBotFromSiteLoginGrants(botId) {
+  if (!botId) return 0;
+  let changed = 0;
+  try {
+    const rows = db().prepare('SELECT id, grants FROM site_logins').all();
+    const upd = db().prepare('UPDATE site_logins SET grants = ? WHERE id = ?');
+    for (const r of rows) {
+      let grants = null;
+      try { grants = JSON.parse(r.grants || '[]'); } catch { grants = null; }
+      if (!Array.isArray(grants) || !grants.includes(botId)) continue;
+      upd.run(JSON.stringify(grants.filter((g) => g !== botId)), r.id);
+      changed += 1;
+    }
+  } catch { /* pre-v7 database in a unit harness — nothing to scrub */ }
+  return changed;
+}
+
 export function removeBotDb(id) {
   // Messages and grants cascade (FK ON DELETE CASCADE); usage rows
   // for the bot go too (the /api/usage route's "no residue" rule).
+  // v0.21.0 (audit F-12): remember the image avatar's file name
+  // BEFORE the row goes — after deletion it is unrecoverable, and
+  // removeBotFiles (which runs after commit in the deleteUser
+  // cascade) needs it to unlink the file. The pending marker rides
+  // in kv inside the same transaction, so a rolled-back delete
+  // leaves no marker behind.
+  try {
+    const bot = getBot(id);
+    if (bot?.avatar?.kind === 'image' && AVATAR_FILE_RE.test(String(bot.avatar.value || ''))) {
+      setKv('pending-avatar-delete:' + id, bot.avatar.value);
+    }
+  } catch { /* unreadable bot row — the delete itself still proceeds */ }
+  scrubBotFromSiteLoginGrants(id);
   db().prepare('DELETE FROM bots WHERE id = ?').run(id);
   clearBotUsage(id);
 }
 export function removeBotFiles(id) {
+  // Image avatar file (v0.21.0, audit F-12): the bot's uploaded
+  // avatar used to survive deletion in data/avatars/ and stayed
+  // fetchable by anyone who had ever seen its (roster-published)
+  // file name. Source of the name, in order: the bot row itself
+  // (plain removeBot path — row already gone, so usually absent),
+  // then the pending marker removeBotDb left.
+  try {
+    let avatar = null;
+    try { avatar = getBot(id)?.avatar || null; } catch { avatar = null; }
+    if (!avatar) {
+      const pending = getKv('pending-avatar-delete:' + id);
+      if (pending && AVATAR_FILE_RE.test(pending)) avatar = { kind: 'image', value: pending };
+    }
+    if (avatar) deleteAvatarImageFile(config.dataDir, avatar);
+    deleteKv('pending-avatar-delete:' + id);
+  } catch { /* best effort */ }
   // The bot's workspace goes with it (audit fix) — orphaned project
   // folders used to linger in data/projects forever.
   try { fs.rmSync(path.join(config.dataDir, 'projects', id), { recursive: true, force: true }); } catch { /* best effort */ }
@@ -224,7 +312,8 @@ export function dayKey(d = new Date()) {
 // A provider is a named OpenAI-compatible endpoint. Its API key lives
 // ONLY in `keyEnc` (vault ciphertext) — see src/vault.js.
 export function listProviders() {
-  return db().prepare('SELECT data FROM providers ORDER BY rowid').all().map((r) => JSON.parse(r.data));
+  return db().prepare('SELECT id, data FROM providers ORDER BY rowid').all()
+    .map((r) => parseRowData(r.data, 'providers', r.id)).filter(Boolean);
 }
 
 export function getProvider(id) {
@@ -238,7 +327,27 @@ export function addProvider(provider) {
 }
 
 export function removeProvider(id) {
+  /* v0.21.0 (audit F-12): a deleted provider used to leave every
+   * referencing bot with a dangling providerId (silently offline
+   * via resolveProvider→null, no signal anywhere) and every OTHER
+   * user's defaultProviderId kv pointing at the corpse (the delete
+   * route only cleared the deleter's own). Now: referencing bots
+   * are unlinked (providerId → '', i.e. "use default" — the least
+   * surprising landing spot) and ALL defaultProviderId kv rows
+   * naming this provider are cleared. Plain statements, no
+   * transaction of our own: deleteUser calls this inside ITS
+   * transaction. Returns the unlink count for audit callers. */
+  let botsUnlinked = 0;
+  try {
+    for (const b of listBots()) {
+      if (b.providerId === id) { updateBot(b.id, { providerId: '' }); botsUnlinked += 1; }
+    }
+  } catch { /* roster unreadable — the delete itself still proceeds */ }
+  try {
+    db().prepare("UPDATE kv SET value = '' WHERE key LIKE 'defaultProviderId:%' AND value = ?").run(id);
+  } catch { /* kv not ready */ }
   db().prepare('DELETE FROM providers WHERE id = ?').run(id);
+  return { botsUnlinked };
 }
 
 export function updateProvider(id, patch) {
@@ -282,15 +391,89 @@ const usageUpsert = () => db().prepare(`INSERT INTO usage_daily (scope, day, bot
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
   ON CONFLICT (scope, day, bot_id, user_id, provider_id)
   DO UPDATE SET prompt = prompt + excluded.prompt, completion = completion + excluded.completion, total = total + excluded.total, turns = turns + 1`);
+/* Usage value hygiene (v0.21.0, audit F-17, P2 same-function):
+ * usage numbers come from provider responses — a volunteer endpoint
+ * is a user-controlled server and could report a negative total
+ * (erasing its own userday, dodging the cap) or an astronomical one
+ * (poisoning the shared day/bot buckets). Every component is
+ * therefore required to be a finite, non-negative integer and is
+ * clamped to a per-record ceiling of 10× the run budget (with a
+ * 10M floor for when the budget knob is off). */
+function usageCeiling() {
+  return Math.max(10_000_000, 10 * (Number(config.runTokenBudget) || 0), 10 * (Number(config.contextTokenBudget) || 0));
+}
+function clampUsageComponent(v, cap) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.floor(n), cap);
+}
+let usageDedupReady = false;
+function ensureUsageDedupTable(d) {
+  if (usageDedupReady) return;
+  // Migration v9 creates this; the CREATE IF NOT EXISTS here is
+  // the belt-and-braces for a store opened against a pre-v9 file
+  // by a unit harness that bypassed getDb's migration path.
+  d.exec(`CREATE TABLE IF NOT EXISTS usage_dedup (
+    dedup_key TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    at_ms INTEGER NOT NULL DEFAULT 0
+  )`);
+  usageDedupReady = true;
+}
+/* Returns true when the usage was recorded, false when it was
+ * skipped (no usable total, duplicate dedup key, or the bot no
+ * longer exists). Callers historically ignored the return value;
+ * it exists for the finishRun settled-guard wiring (audit F-03).
+ *
+ * Idempotency (audit F-03): pass opts.runId / opts.turnId /
+ * opts.dedupKey — the key is claimed inside the SAME transaction
+ * as the bucket upserts, so a finishRun fault path that re-enters
+ * (recordUsage committed, a later step threw, the catch re-called
+ * finishRun) charges exactly once. Without a key the call keeps
+ * its legacy accumulate-always behavior, so existing callers and
+ * tests are untouched.
+ *
+ * Orphan guard (audit F-03 tail): if the bot was deleted while its
+ * turn was settling, recording would resurrect bot/botday rows
+ * that nothing ever cleans again — skip instead. */
 export function recordUsage(botId, u, userId = null, opts = {}) {
-  if (!u || !u.total) return;
+  if (!u) return false;
+  const cap = usageCeiling();
+  const prompt = clampUsageComponent(u.prompt, cap);
+  const completion = clampUsageComponent(u.completion, cap);
+  let total = clampUsageComponent(u.total, cap);
+  if (!total && prompt + completion > 0) total = prompt + completion;
+  if (!total) return false;
+  if (prompt + completion > total) total = Math.min(prompt + completion, cap);
+  if (Number(u.total) !== total || Number(u.prompt || 0) !== prompt || Number(u.completion || 0) !== completion) {
+    log.warn('recordUsage clamped out-of-range usage values', { botId: botId || '', reportedTotal: u.total ?? null, recordedTotal: total });
+  }
+  let bot = null;
+  if (botId) {
+    try { bot = getBot(botId); } catch { bot = null; }
+    if (!bot) {
+      log.warn('recordUsage skipped: bot no longer exists', { botId });
+      return false;
+    }
+  }
   const day = dayKey();
-  const providerId = opts.providerId ?? (getBot(botId)?.providerId || '');
-  const vals = [u.prompt || 0, u.completion || 0, u.total || 0];
+  const providerId = opts.providerId ?? (bot?.providerId || '');
+  const vals = [prompt, completion, total];
+  const dedupKey = String(opts.runId || opts.turnId || opts.dedupKey || '').slice(0, 128);
   const up = usageUpsert();
   const d = db();
+  ensureUsageDedupTable(d);
   d.exec('BEGIN IMMEDIATE');
   try {
+    if (dedupKey) {
+      const claim = d.prepare('INSERT OR IGNORE INTO usage_dedup (dedup_key, bot_id, user_id, at_ms) VALUES (?, ?, ?, ?)')
+        .run(dedupKey, botId || '', userId || '', Date.now());
+      if (!Number(claim.changes)) {
+        d.exec('COMMIT');
+        return false; // already recorded under this key
+      }
+    }
     up.run('bot', '', botId, '', '', ...vals);
     up.run('day', day, '', '', '', ...vals);
     up.run('botday', day, botId, '', providerId, ...vals);
@@ -305,6 +488,7 @@ export function recordUsage(botId, u, userId = null, opts = {}) {
       up.run('userday', day, '', userId, '', ...vals);
     }
     d.exec('COMMIT');
+    return true;
   } catch (e) {
     try { d.exec('ROLLBACK'); } catch { /* already settled */ }
     throw e;
@@ -375,7 +559,8 @@ export function getRun(id) {
   return r ? JSON.parse(r.data) : null;
 }
 export function listRuns(limit = RUN_CAP) {
-  return db().prepare('SELECT data FROM run_history ORDER BY n DESC LIMIT ?').all(limit).map((r) => JSON.parse(r.data));
+  return db().prepare('SELECT id, data FROM run_history ORDER BY n DESC LIMIT ?').all(limit)
+    .map((r) => parseRowData(r.data, 'run_history', r.id)).filter(Boolean);
 }
 export function countRunsForBot(botId) {
   const d = db();
@@ -414,6 +599,35 @@ export function getKv(key) {
 export function setKv(key, value) {
   db().prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value));
 }
+export function deleteKv(key) {
+  try { return Number(db().prepare('DELETE FROM kv WHERE key = ?').run(key).changes) > 0; } catch { return false; }
+}
+
+/* Per-user owned-row purge (v0.21.0, audit F-05): the rows a
+ * deleteUser cascade must NOT leave behind — MCP server configs
+ * (vault-encrypted OAuth tokens), site-login entries (vault-
+ * encrypted credentials; a surviving entry granted to someone
+ * else's bot stayed USABLE after its owner was deleted), the
+ * user's run history (titles + prompt text), and their per-user
+ * kv keys (defaultProviderId:, livemonitor:). Plain statements
+ * only, no transaction of its own: auth.deleteUser calls this
+ * inside its single cascade transaction, and the counts merge
+ * into its cascade receipt. Wired: auth.deleteUser calls this
+ * inside its cascade transaction (item 156 F-05). The user's
+ * AVATAR FILE is filesystem, not DB: auth must capture the avatar
+ * before dropUser and call deleteAvatarImageFile (avatars.js)
+ * after commit, exactly like removeBotFiles does for bots. */
+export function purgeUserOwnedRows(userId) {
+  const counts = { mcpServers: 0, siteLogins: 0, runHistory: 0, kv: 0 };
+  if (!userId) return counts;
+  const d = db();
+  const del = (sql, ...args) => { try { return Number(d.prepare(sql).run(...args).changes) || 0; } catch { return 0; } };
+  counts.mcpServers = del('DELETE FROM mcp_servers WHERE user_id = ?', userId);
+  counts.siteLogins = del('DELETE FROM site_logins WHERE owner_id = ?', userId);
+  counts.runHistory = del('DELETE FROM run_history WHERE user_id = ?', userId);
+  counts.kv = del('DELETE FROM kv WHERE key IN (?, ?)', 'defaultProviderId:' + userId, 'livemonitor:' + userId);
+  return counts;
+}
 
 /* ------------------------------ audit ----------------------------- */
 // Append-only audit: every tool execution and every approval
@@ -447,26 +661,132 @@ const SECRET_SHAPES = [
   // ids, any-scheme Authorization headers, JWTs, and
   // credential-bearing URL parameters.
   /\bgh[po]_[A-Za-z0-9]{20,}/,
+  /\bgh[su]_[A-Za-z0-9]{20,}/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}/,
   /\bAKIA[0-9A-Z]{16}\b/,
   /(Authorization:\s*)(?!Bearer\b)[^\s"',}]+(?:\s[^\s"',}]+)?/,
   /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/,
   /([?&](?:key|token|api_key|access_token)=)[^&\s"']+/,
-  /((?:api[_-]?key|access[_-]?token|password|secret)["'=: ]+)[^\s"',}]+/,
+  /* B-03 (audit r1): vendor prefixes the first table missed —
+   * xAI, Xiaomi Token Plan (the catalog's own hint names tp-),
+   * Google API keys, npm tokens, GitLab PATs. */
+  /\bxai-[A-Za-z0-9_-]{8,}/,
+  /\btp-[A-Za-z0-9_-]{8,}/,
+  /\bAIza[A-Za-z0-9_-]{10,}/,
+  /\bnpm_[A-Za-z0-9]{20,}/,
+  /\bglpat-[A-Za-z0-9_-]{15,}/,
+  /* F-13 (audit r1): Slack tokens and Stripe secret/restricted
+   * keys — the underscore forms (sk_live_…) never matched the
+   * hyphen sk- shape above. */
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
+  /\b[rs]k_(?:live|test)_[A-Za-z0-9]{8,}/,
+  /* B-03: a bare 64-char hex string is the shape of a vault
+   * master key / SHA-256 fingerprint standing alone in a log or
+   * tool result. (On non-owner surfaces a genuine sha256 hash
+   * discussed in chat is redacted too — the owner view keeps
+   * full fidelity; that trade is deliberate, see fix report.) */
+  /\b[0-9a-fA-F]{64}\b/,
+  /* B-03: generic assignment shapes do NOT live in this table —
+   * SECRET_RE is case-insensitive, which would silently demote
+   * an ALL-CAPS-only env shape (SMTP_PASS=) into matching the
+   * "key" inside "monkey=". They run as case-sensitive
+   * pre-passes in redactGenericAssignments below. */
+  /* F-13: key-name alternation learns bare `token:` and
+   * `x-api-key:` — the B-03 generic-assignment pre-pass covers
+   * the `name=` form, but the colon/space prose form of a bare
+   * token fell through both tables. */
+  /((?:api[_-]?key|x-api-key|access[_-]?token|token|password|passwd|secret)["'=: ]+)[^\s"',}]+/,
 ];
 const SECRET_RE = new RegExp(SECRET_SHAPES.map((re) => re.source).join('|'), 'gi');
 export function redactSecrets(value) { return redact(value, 0); }
+/* B-03 shapes that need more than one kept fragment (URL
+ * userinfo: scheme+user kept, password cut, @host kept) or a line
+ * anchor (Cookie headers) run as small pre-passes — the combined
+ * SECRET_RE contract allows only ONE capture group per shape. */
+function redactUserinfoAndCookies(s) {
+  let out = s.replace(/((?:https?|ftp):\/\/[^\s/:@'"]+:)[^\s/@'"]+(@)/g, '$1•••$2');
+  out = out.replace(/^([ \t]*(?:Set-)?Cookie:[ \t]*)[^\r\n]+/gim, '$1•••');
+  // F-13: a Cookie header embedded mid-string (a JSON tool-arg
+  // blob, a pasted header block after other text) is not at a
+  // line start — catch the unanchored form too.
+  out = out.replace(/((?:Set-)?Cookie:[ \t]*)[^\r\n]+/gi, '$1•••');
+  return out;
+}
+/* B-03: the any-case `name=value` assignment form (sa_session=,
+ * _authToken=, client_secret=) lives here, not in SECRET_SHAPES,
+ * because a regex cannot tell a keyword SEGMENT from a substring:
+ * the value is cut only when the name carries a keyword as a
+ * whole [_.-]-separated segment or a whole camelCase hump —
+ * monkey=, keyboard= and theme= therefore survive verbatim. */
+const ASSIGN_KEYWORDS = new Set(['key', 'token', 'secret', 'passwd', 'password', 'pass', 'session', 'cookie', 'auth', 'credential', 'credentials']);
+function nameHasSecretSegment(name) {
+  const parts = String(name).split(/[_\-.]+/).flatMap((seg) => seg.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/).map((x) => x.toLowerCase()));
+  return parts.some((p) => ASSIGN_KEYWORDS.has(p));
+}
+function redactGenericAssignments(s) {
+  // Env form (case-SENSITIVE on purpose): ALL-CAPS names carrying
+  // a keyword segment, with ':' or '=' (SMTP_PASS=hunter2,
+  // SA_VAULT_KEY=…, API_TOKEN: …). Lowercase prose names can
+  // never match this one.
+  let out = s.replace(/\b([A-Z][A-Z0-9_.-]{1,64})(\s*[:=]\s*["']?)([^\s"',}]+)/g, (m, name, sep, val) => {
+    if (!nameHasSecretSegment(name)) return m;
+    // A bare "PASS: all tests passed" is status prose, not an
+    // assignment: the colon form only fires on COMPOUND names
+    // (API_TOKEN:, SMTP_PASS:) — single-word password:/secret:
+    // lines stay with the legacy shape in SECRET_SHAPES.
+    if (sep.includes(':') && !/[_\-.]/.test(name)) return m;
+    return name + sep + '•••';
+  });
+  out = out.replace(/\b([A-Za-z0-9_.-]{1,64})(\s*=\s*["']?)([^\s"',};&]+)/g, (m, name, sep, val) => (
+    nameHasSecretSegment(name) ? name + sep + '•••' : m
+  ));
+  return out;
+}
+/* B-03, conservative bare-base64 pass: a STANDALONE token only
+ * counts when it is long (≥40), mixes upper+lower+digit, and
+ * either carries base64 padding / a '+' or contains no '/' at
+ * all (a '/'-heavy token with neither is read as a path and kept,
+ * so long file paths and ordinary identifiers survive). */
+function looksLikeBareBase64Secret(tok) {
+  const core = tok.replace(/=+$/, '');
+  if (core.length < 40) return false;
+  if (!/[a-z]/.test(core) || !/[A-Z]/.test(core) || !/[0-9]/.test(core)) return false;
+  if (tok.includes('/') && !tok.includes('+') && !tok.endsWith('=')) return false;
+  return true;
+}
 function redactString(s) {
-  return s.replace(SECRET_RE, (m, ...rest) => {
+  let out = redactUserinfoAndCookies(String(s));
+  out = redactGenericAssignments(out);
+  out = out.replace(SECRET_RE, (m, ...rest) => {
     const groups = rest.slice(0, -2);
     const keep = groups.find((g) => typeof g === 'string');
     return (keep || '') + '•••';
   });
+  out = out.replace(/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, (tok, offset, whole) => {
+    // A data: URI payload is content, not a loose secret.
+    if (whole.slice(Math.max(0, offset - 7), offset) === 'base64,') return tok;
+    return looksLikeBareBase64Secret(tok) ? '•••' : tok;
+  });
+  return out;
 }
+/* F-13: the recursion ceiling used to be 4, and past it the RAW
+ * value was returned — a secret nested 5 levels deep in model-
+ * controlled tool args landed in the audit log verbatim. The
+ * ceiling is now 10, and past it a container is replaced by a
+ * truncation marker instead of its raw contents (strings are
+ * redacted at ANY depth: the string case below runs before the
+ * depth check on containers). Audit entries are evidence, not a
+ * data channel — losing a pathologically deep subtree is the
+ * right trade. */
+const REDACT_MAX_DEPTH = 10;
 function redact(value, depth = 0) {
   if (typeof value === 'string') return redactString(value);
-  if (Array.isArray(value) && depth < 4) return value.map((v) => redact(v, depth + 1));
-  if (value && typeof value === 'object' && depth < 4) {
+  if (Array.isArray(value)) {
+    if (depth >= REDACT_MAX_DEPTH) return '[redacted: nesting too deep]';
+    return value.map((v) => redact(v, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    if (depth >= REDACT_MAX_DEPTH) return '[redacted: nesting too deep]';
     const o = {};
     // Keys pass through the same redaction (audit A1): an argument
     // object can carry a secret in a key name, not just in values.

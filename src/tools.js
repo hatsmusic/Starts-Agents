@@ -22,6 +22,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import dns from 'node:dns';
+import http from 'node:http';
+import https from 'node:https';
 import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { makeZip } from './zip.js';
@@ -321,6 +323,44 @@ export function isSensitiveFile(rel) {
   return false;
 }
 
+/* Real-target sensitive guard (item 156 D-01): the lexical check
+ * judges the name the caller TYPED; a symlink inside the workspace
+ * can wear an innocent name while its bytes live in a sensitive
+ * file (innocent.txt -> .env read straight through). Every read
+ * surface therefore ALSO judges the path the bytes actually live
+ * at — the target's realpath run through the same isSensitiveFile
+ * (its segments and basename are what get matched, so an absolute
+ * real path judges exactly like a relative one). A target that
+ * does not exist has no bytes to protect: the lexical check has
+ * already run and creation-side rules govern writes. */
+export function assertNotSensitiveReal(ctx, full) {
+  const refuse = () => { throw new Error('refused: this path resolves to a sensitive file (env / keys / credentials) — sensitive files are never read through the agent. Ask the owner to handle it directly on the server.'); };
+  let real = null;
+  try { real = fs.realpathSync(full); } catch { real = null; }
+  if (real && isSensitiveFile(real)) refuse();
+  // Intermediate links: realpath collapses a chain to its final
+  // name, but the chain can pass THROUGH a sensitive name on the
+  // way (innocent.txt -> .env -> realenv: the bytes are .env's
+  // content whatever the final file is called). Walk the lexical
+  // components; every symlink component is judged by its own name
+  // and by the name of its one-step target.
+  const base = path.resolve(ctx.workspace);
+  const rel = path.relative(base, full);
+  if (!rel || rel.startsWith('..')) return;
+  let cur = base;
+  for (const seg of rel.split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, seg);
+    let st = null;
+    try { st = fs.lstatSync(cur); } catch { break; }
+    if (st.isSymbolicLink()) {
+      if (isSensitiveFile(path.relative(base, cur))) refuse();
+      let target = null;
+      try { target = fs.readlinkSync(cur); } catch { /* unreadable link — the final-realpath verdict above stands */ }
+      if (target && isSensitiveFile(path.resolve(path.dirname(cur), target))) refuse();
+    }
+  }
+}
+
 /* Execution-layer sensitive-path hard block (v0.15, sweep P0-1 /
  * P1-8): the file tools refuse sensitive files, but the shell is a
  * side door around that list — an APPROVED `cat <vault key>` used
@@ -404,6 +444,25 @@ function assertNoSensitiveExecPathsReal(raw, ctx, dd, own) {
       }
     }
     const landed = real ? path.normalize(real + rest) : abs;
+    // Intermediate-link names (item 156 D-01): a symlink chain can
+    // pass through a sensitive name on its way to an innocently
+    // named final file (innocent.txt -> .env -> realenv) — judge
+    // every link component by its own name and its one-step
+    // target, not only the two endpoints.
+    {
+      let cur = path.parse(abs).root;
+      for (const seg of abs.split(path.sep).filter(Boolean)) {
+        cur = path.join(cur, seg);
+        let st = null;
+        try { st = fs.lstatSync(cur); } catch { break; }
+        if (st.isSymbolicLink()) {
+          if (isSensitiveFile(path.relative('/', cur))) refuseSensitive();
+          let t = null;
+          try { t = fs.readlinkSync(cur); } catch { /* unreadable link */ }
+          if (t && isSensitiveFile(path.resolve(path.dirname(cur), t))) refuseSensitive();
+        }
+      }
+    }
     for (const p of [abs, landed]) {
       if (own.some((o) => under(p, o))) continue; // own areas are judged by the file tools' rules, not this block
       if (/^\/proc\/(\d+|self|thread-self)\/environ$/.test(p)) refuseSensitive();
@@ -433,7 +492,19 @@ function assertNoSensitiveExecPathsReal(raw, ctx, dd, own) {
       if (tok.split('/').includes('..') || isSensitiveFile(tail)) refuseSensitive();
       continue;
     }
-    if (!tok.includes('/') && tok !== '.' && tok !== '..') continue; // not path-shaped
+    if (!tok.includes('/') && tok !== '.' && tok !== '..') {
+      // Bare filename (item 156 D-01): "not path-shaped" used to
+      // skip it entirely — but the shell's cwd IS the workspace, so
+      // a bare name that exists there is a path, and if it is a
+      // symlink its real target is what gets read. Judge the ones
+      // that exist; command names and plain words do not exist as
+      // workspace files and pass untouched.
+      const cand = path.resolve(ws, tok);
+      let exists = false;
+      try { exists = fs.existsSync(cand); } catch { exists = false; }
+      if (exists) judge(cand);
+      continue;
+    }
     if (/[*?]/.test(tok)) {
       for (const hit of expandGlobToken(tok, ws)) judge(hit);
       continue;
@@ -499,8 +570,36 @@ export function scanGitConfigText(text) {
   }
   return false;
 }
+/* Global / system gitconfig scan (item 156 D-08): git obeys MORE
+ * than the repo config — the system file and the user's global
+ * files carry the same exec-capable keys (core.fsmonitor runs on
+ * `git status`, diff.external/textconv on `git diff`, with NO
+ * command-line switch for the gate to block), and the sandbox
+ * child's HOME is the server process's HOME (sandboxEnv copies it),
+ * so a poisoned ~/.gitconfig hijacked auto-passed git verbs even
+ * with a spotless repo config. The scan set mirrors exactly what
+ * that child reads: system /etc/gitconfig (+ the /usr/local prefix
+ * variant), global $HOME/.gitconfig and $HOME/.config/git/config
+ * (the XDG location; the child's env carries no XDG_CONFIG_HOME or
+ * GIT_CONFIG_* overrides — the sandbox whitelist strips them — so
+ * the filesystem defaults ARE the child's view). Scanning, not env
+ * neutering: approved git work legitimately needs global identity
+ * config, so GIT_CONFIG_GLOBAL=/dev/null was rejected — a poisoned
+ * global file costs git its auto-pass (one card), nothing more. */
+function gitConfigFileRisk(file) {
+  try { return scanGitConfigText(fs.readFileSync(file, 'utf8')); } catch { return false; }
+}
+function globalGitConfigRisk() {
+  const home = os.homedir();
+  const candidates = ['/etc/gitconfig', '/usr/local/etc/gitconfig'];
+  if (home) candidates.push(path.join(home, '.gitconfig'), path.join(home, '.config', 'git', 'config'));
+  return candidates.some((f) => gitConfigFileRisk(f));
+}
 export function gitConfigExecRisk(workspace) {
   try {
+    // Global/system risk stands on its own (D-08): it applies to
+    // every git run the sandbox makes, repo or no repo at the root.
+    if (globalGitConfigRisk()) return true;
     const ws = path.resolve(String(workspace || ''));
     let gitDir = path.join(ws, '.git');
     let st;
@@ -856,8 +955,23 @@ export const TOOLS = [
       if (isSensitiveFile(rel)) {
         throw new Error(`refused: ${rel.split(path.sep).join('/')} is a sensitive file (env / keys / credentials) — sensitive files are never read through the agent. Ask the owner to handle it directly on the server.`);
       }
-      const buf = fs.readFileSync(full);
-      return buf.subarray(0, 64 * 1024).toString('utf8');
+      assertNotSensitiveReal(ctx, full);
+      // Size gate BEFORE the read (item 156 D-06): the old code read
+      // the WHOLE file into memory and only then sliced 64 KB off —
+      // a multi-GB build artifact or log in the workspace was a
+      // zero-card single-process memory DoS. Stat first; an oversize
+      // file is read through an fd, first 64 KB only, and the result
+      // says it was truncated (D-19: a silent cut reads as the full
+      // file to the model).
+      const size = fs.statSync(full).size;
+      if (size <= 64 * 1024) return fs.readFileSync(full).toString('utf8');
+      const fd = fs.openSync(full, 'r');
+      try {
+        const buf = Buffer.alloc(64 * 1024);
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        return buf.subarray(0, n).toString('utf8') +
+          `\n\n[truncated — this file is ${Math.max(1, Math.round(size / 1024))} KB; only the first 64 KB is shown]`;
+      } finally { fs.closeSync(fd); }
     },
   },
   {
@@ -894,6 +1008,11 @@ export const TOOLS = [
           // real path still lives under the search root before reading.
           const real = fs.realpathSync(full);
           if (real !== realRoot && !real.startsWith(realRoot + path.sep)) continue;
+          // Size gate (item 156 D-06): the rg path caps files at
+          // --max-filesize 4M; this fallback used to read every file
+          // whole, so one huge artifact could blow the process up.
+          // Same 4 MB口径: oversize files are skipped, not read.
+          if (fs.statSync(full).size > 4 * 1024 * 1024) continue;
           text = fs.readFileSync(full, 'utf8');
         } catch { continue; }
         if (text.includes('�')) continue; // binary-ish, skip
@@ -1305,6 +1424,8 @@ export const TOOLS = [
       const ffprobe = modules.getBinary('ffprobe');
       if (!ffprobe) throw new Error('the media sandbox module is not installed');
       const full = inWorkspace(ctx, args.path);
+      if (isSensitiveFile(path.relative(path.resolve(ctx.workspace), full))) throw new Error('refused: sensitive file');
+      assertNotSensitiveReal(ctx, full);
       const r = await execCaptured(ffprobe, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', full],
         { cwd: ctx.workspace, signal: ctx.signal, timeoutMs: 30_000 });
       if (r.code !== 0) throw new Error('ffprobe failed: ' + r.out.slice(0, 300));
@@ -1366,10 +1487,16 @@ export const TOOLS = [
       ensureWorkspace(ctx);
       const full = inWorkspace(ctx, args.path);
       if (!fs.existsSync(full)) throw new Error('file not found: ' + args.path);
-      const head = fs.readFileSync(full).subarray(0, 5).toString('latin1');
-      if (head !== '%PDF-') throw new Error('not a PDF file: ' + args.path);
+      // Sensitivity is judged BEFORE any byte is read (audit
+      // R2-07 — the same judge-then-read order as read_file).
       const rel = path.relative(path.resolve(ctx.workspace), full);
       if (isSensitiveFile(rel)) throw new Error('refused: sensitive file');
+      assertNotSensitiveReal(ctx, full);
+      // Head probe reads 5 bytes, not the file (item 156 D-06 同型顺手):
+      // readFileSync().subarray() used to buffer the whole PDF first.
+      let head = '';
+      { const fd = fs.openSync(full, 'r'); try { const b = Buffer.alloc(5); head = b.subarray(0, fs.readSync(fd, b, 0, 5, 0)).toString('latin1'); } finally { fs.closeSync(fd); } }
+      if (head !== '%PDF-') throw new Error('not a PDF file: ' + args.path);
       const out = await runPyJson(PY_READ_PDF, { path: full, cap: 24000 }, ctx, 120_000);
       if (!out.chars) {
         return `PDF ${args.path}: ${out.pages} page(s), but NO extractable text — this is almost certainly a scanned/image PDF. Its content cannot be read as text; if page images exist in the workspace, run ocr_image on them, otherwise tell the user the PDF appears to be scans.`;
@@ -1389,6 +1516,8 @@ export const TOOLS = [
       if (!fs.existsSync(full)) throw new Error('file not found: ' + args.path);
       const ext = path.extname(String(args.path)).toLowerCase();
       if (!IMAGE_MIME_BY_EXT[ext]) throw new Error('ocr_image needs an image file (png, jpg, jpeg, gif, webp or bmp): ' + args.path);
+      if (isSensitiveFile(path.relative(path.resolve(ctx.workspace), full))) throw new Error('refused: sensitive file');
+      assertNotSensitiveReal(ctx, full);
       // First call loads the OCR models — give it real room.
       const out = await runPyJson(PY_OCR_IMAGE, { path: full }, ctx, 300_000);
       const lines = Array.isArray(out.lines) ? out.lines : [];
@@ -1409,6 +1538,8 @@ export const TOOLS = [
       ensureWorkspace(ctx);
       const full = inWorkspace(ctx, args.path);
       if (!fs.existsSync(full)) throw new Error('file not found: ' + args.path);
+      if (isSensitiveFile(path.relative(path.resolve(ctx.workspace), full))) throw new Error('refused: sensitive file');
+      assertNotSensitiveReal(ctx, full);
       const out = await runPyJson(PY_IMAGE, { path: full, op: 'info' }, ctx, 60_000);
       let size = 0;
       try { size = fs.statSync(full).size; } catch { /* raced away */ }
@@ -1465,12 +1596,16 @@ export const TOOLS = [
       const full = inWorkspace(ctx, args.path);
       const rel = path.relative(path.resolve(ctx.workspace), full).split(path.sep).join('/');
       if (isSensitiveFile(rel)) throw new Error('refused: sensitive file');
+      assertNotSensitiveReal(ctx, full);
       const mime = IMAGE_MIME_BY_EXT[path.extname(String(args.path)).toLowerCase()];
       if (!mime) throw new Error('view_image needs an image file (png, jpg, jpeg, gif, webp or bmp): ' + args.path);
-      const buf = fs.readFileSync(full);
-      if (buf.length > VIEW_IMAGE_MAX_BYTES) {
-        throw new Error(`image is ${(buf.length / 1048576).toFixed(1)} MB — too large to view (max 6 MB). Downscale it with process_image first, then view the smaller copy.`);
+      // Size gate BEFORE the read (item 156 D-06): the cap used to
+      // be checked on a buffer that already held the whole file.
+      const size = fs.statSync(full).size;
+      if (size > VIEW_IMAGE_MAX_BYTES) {
+        throw new Error(`image is ${(size / 1048576).toFixed(1)} MB — too large to view (max 6 MB). Downscale it with process_image first, then view the smaller copy.`);
       }
+      const buf = fs.readFileSync(full);
       return { ok: true, output: `image ${rel} (${Math.max(1, Math.round(buf.length / 1024))} KB)`, images: [{ mime, data: buf.toString('base64'), rel }] };
     },
   },
@@ -1545,7 +1680,25 @@ export function isPrivateIp(ip) {
   return true; // not a recognizable IP — fail closed
 }
 
-export async function assertPublicUrl(u) {
+/* Resolve + validate in ONE step (item 156 D-07): returns the
+ * parsed URL AND the exact address set that passed the private-
+ * range check. Callers that go on to CONNECT (the fetch reader)
+ * must pin this very set into the connection (fetchPublicPinned
+ * below) — validating here and letting the connector re-resolve
+ * on its own left a DNS-rebinding window between the two lookups
+ * (an attacker authority answering public-then-private). */
+/* Short-TTL resolution cache (item 156 D-02 companion): with the
+ * CDP Fetch net widened to every resource type, one page load can
+ * pause hundreds of same-host requests, each of which validates —
+ * without a cache that is a getaddrinfo storm against the stub
+ * resolver and loads start timing out. 30 s mirrors a typical DNS
+ * TTL; only VALIDATED PUBLIC sets are cached (a private answer is
+ * never remembered as anything but a refusal at its own instant),
+ * and the pinned fetch path pins the cached validated set exactly
+ * like a fresh one. */
+const PUBLIC_DNS_CACHE = new Map(); // host -> { at, addresses }
+const PUBLIC_DNS_TTL_MS = 30_000;
+export async function resolvePublicAddresses(u) {
   let url;
   try { url = new URL(u); } catch { throw new Error('invalid URL'); }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('only http(s) URLs');
@@ -1554,21 +1707,107 @@ export async function assertPublicUrl(u) {
     throw new Error('loopback / local addresses are refused — use run_shell for local services');
   }
   let addresses;
+  let freshLookup = false;
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) {
-    addresses = [host];
+    addresses = [{ address: host, family: host.includes(':') ? 6 : 4 }];
   } else {
-    let records;
-    try { records = await dns.promises.lookup(host, { all: true, verbatim: true }); }
-    catch { throw new Error('could not resolve host: ' + host); }
-    if (!records.length) throw new Error('could not resolve host: ' + host);
-    addresses = records.map((r) => r.address);
+    const hit = PUBLIC_DNS_CACHE.get(host);
+    if (hit && Date.now() - hit.at < PUBLIC_DNS_TTL_MS) {
+      addresses = hit.addresses;
+    } else {
+      let records;
+      try { records = await dns.promises.lookup(host, { all: true, verbatim: true }); }
+      catch { throw new Error('could not resolve host: ' + host); }
+      if (!records.length) throw new Error('could not resolve host: ' + host);
+      addresses = records.map((r) => ({ address: r.address, family: r.family || (String(r.address).includes(':') ? 6 : 4) }));
+      freshLookup = true;
+    }
   }
-  for (const addr of addresses) {
-    if (isPrivateIp(addr)) {
+  for (const { address } of addresses) {
+    if (isPrivateIp(address)) {
       throw new Error('private-network addresses are refused — use run_shell for local services');
     }
   }
+  // Cache only a FRESH lookup, and only after the whole set cleared
+  // the private-range check (a cache hit must not slide the TTL —
+  // the entry dies 30 s after it was resolved, hit or not).
+  if (freshLookup) {
+    if (PUBLIC_DNS_CACHE.size > 512) PUBLIC_DNS_CACHE.clear();
+    PUBLIC_DNS_CACHE.set(host, { at: Date.now(), addresses });
+  }
+  return { url, addresses };
+}
+
+export async function assertPublicUrl(u) {
+  const { url } = await resolvePublicAddresses(u);
   return url;
+}
+
+/* Pinned-connection fetch (item 156 D-07, fetch路): the DNS answer
+ * that PASSED the SSRF check is the answer the socket connects to
+ * — http(s).request gets a custom lookup that can only ever hand
+ * back the validated set, so a rebinding authority gets no second
+ * roll of the dice at connect time. TLS still authenticates the
+ * ORIGINAL hostname (servername pinned to it; Node validates the
+ * certificate against servername), and the Host header keeps the
+ * original name:port — pinning changes WHERE we connect, never WHO
+ * we believe we are talking to. Redirects are NOT followed here
+ * (the caller re-runs this function per hop, so every hop is
+ * validated + pinned independently). One honest limit: Happy
+ * Eyeballs inside net.connect may try the pinned addresses in its
+ * own order — all of them are from the validated set, which is the
+ * property that matters. */
+export function fetchPublicPinned(u, { headers = {}, signal = null, timeoutMs = 15000 } = {}) {
+  return (async () => {
+    const { url, addresses } = await resolvePublicAddresses(u);
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+    const lookup = (hostname, options, callback) => {
+      if (typeof options === 'function') { callback = options; options = {}; }
+      if (options && options.all) callback(null, addresses.map((a) => ({ ...a })));
+      else callback(null, addresses[0].address, addresses[0].family);
+    };
+    const lib = url.protocol === 'https:' ? https : http;
+    const res = await new Promise((resolve, reject) => {
+      const req = lib.request({
+        hostname: host,
+        port: url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80),
+        path: (url.pathname || '/') + (url.search || ''),
+        method: 'GET',
+        headers: { 'accept-encoding': 'identity', ...headers },
+        lookup,
+        ...(url.protocol === 'https:' && !isIpLiteral ? { servername: host } : {}),
+        ...(signal ? { signal } : {}),
+        timeout: timeoutMs,
+      }, resolve);
+      req.on('timeout', () => req.destroy(new Error('request timed out')));
+      req.on('error', reject);
+      req.end();
+    });
+    const headerGet = (name) => {
+      const v = res.headers[String(name).toLowerCase()];
+      return Array.isArray(v) ? v.join(', ') : (v ?? null);
+    };
+    return { status: res.statusCode || 0, ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300, headers: { get: headerGet }, stream: res, url };
+  })();
+}
+/* Capped body read for a Node stream — readBodyCapped's twin for
+ * the pinned path (same contract: stop at the cap, say so). */
+export async function readNodeStreamCapped(stream, capBytes = FETCH_PAGE_CAP_BYTES) {
+  const decoder = new TextDecoder();
+  let text = '';
+  let truncated = false;
+  for await (const chunk of stream) {
+    text += decoder.decode(chunk, { stream: true });
+    if (text.length > capBytes) {
+      truncated = true;
+      text = text.slice(0, capBytes);
+      try { stream.destroy(); } catch { /* already closed */ }
+      break;
+    }
+  }
+  text += decoder.decode();
+  return { text, truncated };
 }
 function htmlToText(html) {
   const title = (String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
@@ -1593,15 +1832,18 @@ function htmlToText(html) {
  *
  * This driver speaks CDP (DevTools protocol) over the browser's
  * debug socket (Node's built-in WebSocket — no new dependency) and
- * enables the Fetch domain: EVERY document navigation, redirect hop,
- * XHR/fetch and script request PAUSES before it is sent and is
- * re-validated with the same assertPublicUrl the fetch reader uses.
+ * enables the Fetch domain: EVERY request — document navigation,
+ * redirect hops, XHR/fetch, scripts AND (item 156 D-02) images,
+ * stylesheets, fonts, media, EventSource and WebSocket handshakes —
+ * PAUSES before it is sent and is re-validated with the same
+ * assertPublicUrl the fetch reader uses.
  * A non-public target is failed on the spot (ERR_BLOCKED_BY_CLIENT)
  * and never reaches the network. After load, the final landed URL
  * is validated once more before anything is read from the page.
- * Residual, same class as the fetch reader's: our DNS answer and
- * Chromium's can still differ (a rebinding window) — interception
- * re-validates every request, it does not pin the resolution.
+ * Residual (CDP路 only — the fetch reader's window is closed by
+ * fetchPublicPinned, item 156 D-07): our DNS answer and Chromium's
+ * can still differ (a rebinding window) — interception re-validates
+ * every request, it does not pin Chromium's resolution.
  *
  * The browser process is killed in a finally on every path —
  * success, timeout, abort, throw — so no orphan Chromium survives
@@ -1616,13 +1858,40 @@ export class SsrfBlockedError extends Error {
 
 /* Decide one paused request (exported for unit tests): browser-
  * internal schemes pass; everything else must clear the SAME public-
- * URL validation the fetch path uses. */
+ * URL validation the fetch path uses. ws:/wss: handshakes (item 156
+ * D-02) are judged by their http(s) twin — a PUBLIC socket target
+ * passes (pages legitimately socket to their own origin), a private
+ * one fails like any other private request; validating the raw ws:
+ * URL would have failed every socket outright, since the validator
+ * only speaks http(s). */
 export async function pausedRequestDecision(params, validate = assertPublicUrl) {
   const url = String(params?.request?.url || '');
   if (/^(about|data|blob|chrome|chrome-extension|devtools):/.test(url)) return { action: 'continue' };
-  try { await validate(url); return { action: 'continue' }; }
+  const judged = /^wss:/i.test(url) ? 'https:' + url.slice(4) : /^ws:/i.test(url) ? 'http:' + url.slice(3) : url;
+  try { await validate(judged); return { action: 'continue' }; }
   catch { return { action: 'fail', errorReason: 'BlockedByClient' }; }
 }
+
+/* Every CDP resource type worth pausing (item 156 D-02): the
+ * interception used to cover only Document/XHR/Fetch/Script, so
+ * images, media and fonts sailed straight at the private network —
+ * an <img> of an intranet snapshot rendered INTO screenshot_page's
+ * PNG. The list is the full CDP ResourceType enum; which of them
+ * a given Chromium build's Fetch filter actually accepts is
+ * negotiated at enable time in openCdpPage (several — WebSocket,
+ * EventSource, TextTrack, Prefetch, Manifest, SignedExchange,
+ * Preflight — are refused by current builds and cannot be paused
+ * by the Fetch domain at all; that is a protocol boundary, and
+ * navigate's final-URL validation remains the backstop for the
+ * document itself). Every paused request still ends in exactly
+ * one of continueRequest / failRequest in the pump below, so
+ * widening the net cannot stall a load the old net let through
+ * (a public target continues, byte for byte the old behaviour). */
+export const CDP_INTERCEPT_RESOURCE_TYPES = [
+  'Document', 'Stylesheet', 'Image', 'Media', 'Font', 'Script', 'TextTrack',
+  'XHR', 'Fetch', 'Prefetch', 'EventSource', 'WebSocket', 'Manifest',
+  'SignedExchange', 'Ping', 'CSPViolationReport', 'Preflight', 'Other',
+];
 
 /* Launch one Chromium page and hand back its controls plus an
  * idempotent close(). This is the driver's core; withCdpPage
@@ -1747,9 +2016,30 @@ async function openCdpPage(bin, { signal = null, viewport = null, validate = ass
     const attached = await send('Target.attachToTarget', { targetId, flatten: true });
     const sessionId = attached.result?.sessionId;
     if (!sessionId) throw new Error('CDP: could not attach to the page target');
-    await send('Fetch.enable', {
-      patterns: ['Document', 'XHR', 'Fetch', 'Script'].map((resourceType) => ({ urlPattern: '*', resourceType })),
-    }, sessionId);
+    // Negotiated interception (item 156, second-round correction):
+    // the Fetch domain's resource-type filter accepts only a SUBSET
+    // of the Network ResourceType enum, and the subset varies by
+    // Chromium build — current builds refuse 'TextTrack',
+    // 'Prefetch', 'EventSource', 'WebSocket', 'Manifest',
+    // 'SignedExchange' and 'Preflight' outright, and ONE unknown
+    // type makes Fetch.enable reject the WHOLE pattern set. The
+    // send() below never surfaces that error, so a naive one-shot
+    // enable silently disabled ALL interception (only navigate's
+    // final-URL backstop kept working). Grow the accepted set one
+    // type at a time instead: the guard always ends up running
+    // with the widest set this browser allows, and the refused
+    // types are a protocol boundary, not a code path — WebSocket
+    // and EventSource traffic simply cannot be paused by the
+    // Fetch domain on these builds.
+    {
+      const accepted = [];
+      for (const resourceType of CDP_INTERCEPT_RESOURCE_TYPES) {
+        const trial = [...accepted, resourceType].map((t) => ({ urlPattern: '*', resourceType: t }));
+        const r = await send('Fetch.enable', { patterns: trial }, sessionId);
+        if (!r.error) accepted.push(resourceType);
+      }
+      state.interceptTypes = accepted;
+    }
     await send('Page.enable', {}, sessionId);
     if (viewport) {
       await send('Emulation.setDeviceMetricsOverride',
@@ -1774,7 +2064,11 @@ async function openCdpPage(bin, { signal = null, viewport = null, validate = ass
       // anything out of the page.
       const loc = await send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId);
       const finalUrl = String(loc.result?.result?.value || '');
-      if (finalUrl && !finalUrl.startsWith('about:')) await validate(finalUrl);
+      if (finalUrl && !finalUrl.startsWith('about:')) {
+        // A refused landing is an SSRF block, whatever error shape
+        // the validator threw — callers branch on the code.
+        try { await validate(finalUrl); } catch { throw new SsrfBlockedError(finalUrl); }
+      }
       return finalUrl;
     };
     return {
@@ -2172,34 +2466,42 @@ async function browsePage(rawUrl) {
     // fall through to the fetch reader
   }
   // Fetch reader: redirects are followed MANUALLY (at most 5 hops)
-  // and every hop re-runs the full SSRF validation — a public page
-  // must not be able to bounce the reader onto the private network.
+  // and every hop is fetched through fetchPublicPinned (item 156
+  // D-07) — the hop's DNS resolution is validated AND pinned into
+  // that hop's connection in one step, so a public page can neither
+  // bounce the reader onto the private network via a redirect NOR
+  // via a rebinding second resolution. (The assertPublicUrl at the
+  // top of this function only gates entry; the connection never
+  // trusts a resolution it did not pin.)
   let current = url;
   for (let hop = 0; hop <= 5; hop++) {
-    const res = await fetch(current.href, {
+    const res = await fetchPublicPinned(current.href, {
       headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36', accept: 'text/html, text/plain, */*' },
-      signal: AbortSignal.timeout(15000), redirect: 'manual',
+      signal: AbortSignal.timeout(15000),
     });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
+      try { res.stream.destroy(); } catch { /* already closed */ }
       if (!loc) throw new Error('page returned HTTP ' + res.status);
       if (hop === 5) throw new Error('too many redirects');
-      current = await assertPublicUrl(new URL(loc, current).href);
+      current = new URL(loc, current);
       continue;
     }
-    if (!res.ok) throw new Error('page returned HTTP ' + res.status);
+    if (!res.ok) { try { res.stream.destroy(); } catch { /* already closed */ } throw new Error('page returned HTTP ' + res.status); }
     const ct = String(res.headers.get('content-type') || '');
     // Unsupported document types are NAMED, not dumped (v0.14 batch
     // 4): a PDF used to come back as kilobytes of binary garbage
     // indistinguishable from a broken page. Download-and-process is
     // the honest path for these.
     if (ct.includes('application/pdf')) {
+      try { res.stream.destroy(); } catch { /* already closed */ }
       throw new Error(`unsupported document type: ${current.href} is a PDF document, which browse_page cannot extract text from. Download it into the workspace with run_shell instead, then read it with the read_pdf tool (the docs module's pandoc cannot read PDFs).`);
     }
     if (ct && !ct.includes('html') && !ct.startsWith('text/') && !ct.includes('json') && !ct.includes('xml')) {
+      try { res.stream.destroy(); } catch { /* already closed */ }
       throw new Error(`unsupported document type: ${current.href} was served as "${ct.split(';')[0]}", which browse_page cannot read as text.`);
     }
-    const { text: body, truncated } = await readBodyCapped(res);
+    const { text: body, truncated } = await readNodeStreamCapped(res.stream);
     const truncNote = truncated ? `\n\n[truncated — the page body exceeded ${Math.round(FETCH_PAGE_CAP_BYTES / 1048576)} MB and was cut off]` : '';
     if (ct.includes('html')) {
       const { title, text } = htmlToText(body);
@@ -2241,11 +2543,40 @@ const dynPolicy = new Map();
  * is filtering everywhere the turn looks). The exclusion is
  * turn-scoped state, never a catalog mutation: the next turn
  * enters its own scope. opts.excludeNative is the only knob. */
-export function enterDynTools(defs, opts = {}) {
+function dynStoreOf(defs, opts = {}) {
   const list = Array.isArray(defs) ? defs : [];
   for (const d of list) if (d && d.name) dynPolicy.set(d.name, { name: d.name, exec: Boolean(d.exec), mcp: d.mcp || null });
   const excludeNative = new Set(Array.isArray(opts.excludeNative) ? opts.excludeNative.map(String) : []);
-  dynTools.enterWith({ defs: list, excludeNative });
+  return { defs: list, excludeNative };
+}
+/* Scope discipline (item 156 D-04): enterWith REWRITES the current
+ * async context in place and never restores it — a delegated
+ * sub-turn entering its own (seat-filtered, bot-bound) defs left
+ * the PARENT turn running on the child's scope for every remaining
+ * iteration, since the engines rebuild the catalog per request.
+ * Three seams now exist, strongest first:
+ *   runDynTools(defs, opts, fn) — ALS.run: fn and everything it
+ *     awaits sees exactly this scope; the caller's scope is
+ *     restored by construction when fn settles. THIS is the shape
+ *     a chat turn should be wrapped in.
+ *   snapshotDynTools()/restoreDynTools(snap) — for a delegation
+ *     boundary that cannot re-wrap the parent: snapshot before the
+ *     sub-turn, restore after it returns.
+ *   enterDynTools(...) — the legacy entry; it now RETURNS a
+ *     restore function for the scope it replaced, so even existing
+ *     callers can put the previous scope back. */
+export function runDynTools(defs, opts, fn) {
+  if (typeof opts === 'function') { fn = opts; opts = {}; }
+  return dynTools.run(dynStoreOf(defs, opts), fn);
+}
+export function snapshotDynTools() { return dynTools.getStore() || null; }
+export function restoreDynTools(snapshot) {
+  dynTools.enterWith(snapshot || { defs: [], excludeNative: new Set() });
+}
+export function enterDynTools(defs, opts = {}) {
+  const previous = dynTools.getStore() || null;
+  dynTools.enterWith(dynStoreOf(defs, opts));
+  return () => restoreDynTools(previous);
 }
 function dynDefs() { return dynTools.getStore()?.defs || []; }
 function nativeExcluded(name) { return Boolean(dynTools.getStore()?.excludeNative?.has(name)); }

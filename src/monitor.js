@@ -39,6 +39,32 @@ export function setMonitorPref(userId, on) {
   return monitorPrefOn(userId);
 }
 
+/* Subscription gate (v0.21.0, audit F-09): the preference used to
+ * be checked ONLY on the subscriber — an initiator who turned
+ * their own liveMonitor OFF ("my runs are not broadcast") was
+ * still fully observable by any owner whose own pref was on. The
+ * gate is now two-sided:
+ *   - the subscriber's own pref must be on (unchanged);
+ *   - an INITIATOR subscribing to their own run needs nothing more;
+ *   - an OVERSIGHT subscriber (owner watching someone else) is
+ *     allowed only while the INITIATOR's pref is also on — the
+ *     initiator's off switch is a privacy switch, not just a
+ *     viewing preference.
+ * The endpoint in server.js calls this instead of the bare
+ * monitorPrefOn(user.id) check (wired, item 156 F-09 — the
+ * journal's userId is the initiator; the route reads .allowed).
+ * Returns a reason so the route can keep its existing error
+ * keys straight. */
+export function monitorSubscriptionGate({ subscriberId, initiatorId } = {}) {
+  if (!subscriberId) return { allowed: false, reason: 'no-subscriber' };
+  if (!monitorPrefOn(subscriberId)) return { allowed: false, reason: 'subscriber-off' };
+  const isInitiator = Boolean(initiatorId) && initiatorId === subscriberId;
+  if (!isInitiator && initiatorId && !monitorPrefOn(initiatorId)) {
+    return { allowed: false, reason: 'initiator-off' };
+  }
+  return { allowed: true, reason: isInitiator ? 'initiator' : 'oversight' };
+}
+
 /* The projection itself. Pure: one journal event in, one monitor
  * frame (or null) out. `isInitiator` is the ONLY content gate. */
 export function projectMonitorEvent(ev, { isInitiator = false } = {}) {
@@ -79,8 +105,17 @@ export function projectMonitorEvent(ev, { isInitiator = false } = {}) {
     }
     case 'done':
       return { kind: 'end', status: d.cancelled ? 'cancelled' : 'succeeded' };
-    case 'error':
-      return { kind: 'end', status: 'failed', error: typeof d.error === 'string' ? d.error : 'error' };
+    case 'error': {
+      // v0.21.0 (audit F-14, P2 same-file): error TEXT is content —
+      // it routinely carries upstream messages and paths, so free
+      // text stays initiator-only. An error CODE (an i18n key like
+      // errBudget) is not content — it is a key, in the same class
+      // as the notice keys projected above — and projects to
+      // oversight too (item 131 contract).
+      const code = typeof d.error === 'string' && /^err[A-Za-z0-9]+$/.test(d.error) ? d.error : null;
+      if (isInitiator) return { kind: 'end', status: 'failed', error: typeof d.error === 'string' ? d.error : 'error' };
+      return code ? { kind: 'end', status: 'failed', error: code } : { kind: 'end', status: 'failed' };
+    }
     default:
       // token / usage / package and anything unknown: not
       // projected (see the module note above).

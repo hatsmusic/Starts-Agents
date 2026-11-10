@@ -129,20 +129,71 @@ export function createTierController({ floor = 'T0' } = {}) {
 }
 
 /* ------------------------- keyframe sampling (§2.5) ------------------------- */
-export const FRAME_SAMPLE_POLICY = { minIntervalMs: 4000, cap: 24, keepStages: 30 };
+/* Retention (item 156 E-12): frames are screenshots of possibly
+ * logged-in pages sitting in plaintext on disk, so retention is
+ * bounded THREE ways, not by one global carousel alone: a 7-day
+ * TTL, a per-owner carousel (one user's churn can no longer evict
+ * another user's replay), and the pre-existing global carousel as
+ * the backstop. */
+export const FRAME_SAMPLE_POLICY = { minIntervalMs: 4000, cap: 24, keepStages: 30, keepPerUser: 10, ttlMs: 7 * 24 * 60 * 60 * 1000 };
 export function framesRoot() { return path.join(config.dataDir, 'browser-frames'); }
 
-export function pruneFrameStageDirs() {
+function frameDirOwner(root, name) {
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(root, name, 'meta.json'), 'utf8'));
+    return meta && typeof meta.userId === 'string' ? meta.userId : '';
+  } catch { return ''; }
+}
+
+export function pruneFrameStageDirs(now = Date.now()) {
   try {
     const root = framesRoot();
     const dirs = fs.readdirSync(root, { withFileTypes: true })
       .filter((d) => d.isDirectory())
       .map((d) => ({ name: d.name, mtime: (() => { try { return fs.statSync(path.join(root, d.name)).mtimeMs; } catch { return 0; } })() }))
       .sort((a, b) => b.mtime - a.mtime);
-    for (const d of dirs.slice(FRAME_SAMPLE_POLICY.keepStages)) {
-      try { fs.rmSync(path.join(root, d.name), { recursive: true, force: true }); } catch { /* best effort */ }
+    const drop = new Set();
+    // TTL: nothing lives past the horizon, whoever owns it.
+    for (const d of dirs) if (now - d.mtime > FRAME_SAMPLE_POLICY.ttlMs) drop.add(d.name);
+    // Per-owner carousel: each owner's stages rotate among
+    // themselves only.
+    const byOwner = new Map();
+    for (const d of dirs) {
+      if (drop.has(d.name)) continue;
+      const owner = frameDirOwner(root, d.name);
+      if (!byOwner.has(owner)) byOwner.set(owner, []);
+      byOwner.get(owner).push(d);
+    }
+    for (const list of byOwner.values()) {
+      for (const d of list.slice(FRAME_SAMPLE_POLICY.keepPerUser)) drop.add(d.name);
+    }
+    // Global backstop (the original rule, unchanged).
+    const alive = dirs.filter((d) => !drop.has(d.name));
+    for (const d of alive.slice(FRAME_SAMPLE_POLICY.keepStages)) drop.add(d.name);
+    for (const name of drop) {
+      try { fs.rmSync(path.join(root, name), { recursive: true, force: true }); } catch { /* best effort */ }
     }
   } catch { /* no frames root yet — nothing to prune */ }
+}
+
+/* Owner-checked frame cleanup (item 156 E-12): the lifecycle exit
+ * the store was missing — a stage's owner (or the account-deletion
+ * path acting for them) can wipe a stage's replay outright.
+ * Someone else's stageId is the same false as an unknown one.
+ * destroySession deliberately does NOT call this: the replay strip
+ * is read AFTER the stage ends, so teardown keeps the frames and
+ * the TTL/per-owner prune above bounds their stay. */
+export function removeStageFrames(stageId, userId) {
+  const id = String(stageId || '');
+  if (!/^[\w-]+$/.test(id)) return false;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(framesRoot(), id, 'meta.json'), 'utf8'));
+    if (!meta || meta.userId !== userId) return false;
+  } catch { return false; }
+  for (const [key, rec] of [...externalSamplers.entries()]) {
+    if (rec && rec.stageId === id && rec.userId === userId) externalSamplers.delete(key);
+  }
+  try { fs.rmSync(path.join(framesRoot(), id), { recursive: true, force: true }); return true; } catch { return false; }
 }
 
 /* One sampler per stage: keeps a JPEG every ≥4s when the frame
@@ -189,25 +240,45 @@ export function createFrameSampler(stageId, { userId, botId, startedAt }) {
  * stages. Box screenshots are PNG bytes in the store's .jpg names
  * — the read face serves by sniffing-agnostic bytes, same as the
  * host path's JPEG assumption is a naming convention. */
-const externalSamplers = new Map(); // stageId -> sampler
+const externalSamplers = new Map(); // `${stageId}|${userId}` -> { stageId, userId, sampler }
 export function saveStageFrame(stageId, buffer, meta = {}) {
   const id = String(stageId || '');
   if (!/^[\w-]+$/.test(id) || !buffer || !buffer.length) return false;
-  let sampler = externalSamplers.get(id);
-  if (!sampler) {
+  /* Ownership binding (item 156 E-11): a sampler is keyed by
+   * (stageId, userId), never by stageId alone, and a write whose
+   * owner differs from the stage's recorded owner is REFUSED —
+   * first-come-first-served on the bare id let one user's Box
+   * frames land in another user's replay strip (and the constant
+   * 'box-adhoc' stageId made that collision the default for every
+   * run-less Box card). The on-disk meta is checked too, so a
+   * sampler evicted from memory cannot be re-claimed by a stranger
+   * while its frames still live on disk. */
+  const userId = String(meta.userId || '');
+  if (!userId) return false;
+  const key = `${id}|${userId}`;
+  let rec = externalSamplers.get(key);
+  if (!rec) {
+    try {
+      const diskMeta = JSON.parse(fs.readFileSync(path.join(framesRoot(), id, 'meta.json'), 'utf8'));
+      if (diskMeta && diskMeta.userId && diskMeta.userId !== userId) return false;
+    } catch { /* no frames on disk yet — this writer founds the stage */ }
     // Bounded like the on-disk retention (30 stages): sampler
     // objects are tiny, but an unbounded map is still a leak.
     if (externalSamplers.size >= FRAME_SAMPLE_POLICY.keepStages) {
       externalSamplers.delete(externalSamplers.keys().next().value);
     }
-    sampler = createFrameSampler(id, {
-      userId: meta.userId || '',
-      botId: meta.botId || '',
-      startedAt: meta.startedAt || Date.now(),
-    });
-    externalSamplers.set(id, sampler);
+    rec = {
+      stageId: id,
+      userId,
+      sampler: createFrameSampler(id, {
+        userId,
+        botId: meta.botId || '',
+        startedAt: meta.startedAt || Date.now(),
+      }),
+    };
+    externalSamplers.set(key, rec);
   }
-  return sampler.offer(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer), meta.now || Date.now());
+  return rec.sampler.offer(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer), meta.now || Date.now());
 }
 
 /* Ownership-checked keyframe read (the /api/browser-frames face):
@@ -251,6 +322,7 @@ function defaultCastState() {
     lastSentAt: 0,
     backlogStreak: 0,       // consecutive sends that reported a full queue
     statsTimer: null,
+    tierChain: null,        // serialized tier changes (E-16)
   };
 }
 
@@ -331,11 +403,22 @@ async function stopCast(s) {
   }
 }
 
-async function applyTierChange(s) {
-  if (!s.cast.active) return;
-  await stopCast(s);
-  await startCast(s);
-  broadcastJson(s, { t: 'stats', fps: stageFps(s), tier: s.cast.ctl.tier.name });
+/* Tier changes are serialized per stage (item 156 E-16): the
+ * ladder samples from the frame path without awaiting, so two
+ * applyTierChange runs could interleave their stop/start pairs
+ * and leave `cast.active` describing neither. Each change now
+ * queues behind the previous one on the stage's own chain. */
+function applyTierChange(s) {
+  const run = async () => {
+    if (!s.cast.active) return;
+    await stopCast(s);
+    await startCast(s);
+    broadcastJson(s, { t: 'stats', fps: stageFps(s), tier: s.cast.ctl.tier.name });
+  };
+  const prev = s.cast.tierChain || Promise.resolve();
+  const next = prev.then(run, run);
+  s.cast.tierChain = next.catch(() => {});
+  return next;
 }
 
 /* One screencast frame in: count it, sample it, throttle it to
@@ -385,14 +468,35 @@ function onCastFrame(s, frame) {
  * stage. Starts the cast on first attach, stops it when the last
  * consumer detaches. Returns the detach function, or null when
  * the stage is not the caller's. */
+/* Stream fan-out bounds (item 156 E-13, this module's half): the
+ * WS face itself (Origin check, per-user connection count,
+ * text-queue depth) lives in server.js, but the sink registry is
+ * here — one stage never carries more than MAX_STREAM_SINKS
+ * consumers and one user never carries more than
+ * MAX_STREAM_SINKS_PER_USER across stages. attachStream returning
+ * null is the WS layer's cue to close the upgrade. */
+export const MAX_STREAM_SINKS = 4;
+export const MAX_STREAM_SINKS_PER_USER = 8;
+
 export function attachStream(id, userId, sink) {
   const s = getViewerSession(id, userId);
   if (!s) return null;
   ensureStageFields(s);
+  if (s.cast.sinks.size >= MAX_STREAM_SINKS) return null;
+  let userSinks = 0;
+  for (const other of sessions.values()) {
+    if (other !== s && other.userId === userId && other.cast) userSinks += other.cast.sinks.size;
+  }
+  if (userSinks + s.cast.sinks.size >= MAX_STREAM_SINKS_PER_USER) return null;
   s.cast.sinks.add(sink);
   s.lastAt = Date.now();
   if (!s.cast.statsTimer) {
     s.cast.statsTimer = setInterval(() => {
+      /* A watched stage is a live stage (item 156 E-15): while any
+       * sink is attached the stats heartbeat refreshes lastAt, so
+       * a paused cast or a static page is not idle-reaped out from
+       * under the person reading it. */
+      if (s.cast.sinks.size) s.lastAt = Date.now();
       broadcastJson(s, { t: 'stats', fps: stageFps(s), tier: s.cast.ctl.tier.name });
       if (s.handle && typeof s.handle.info === 'function') {
         s.handle.info().then((info) => updateMeta(s, info)).catch(() => {});
@@ -465,21 +569,67 @@ function waitersFor(key) {
  * uses. Host-stage semantics are untouched: with no external
  * record present, every function below behaves exactly as
  * before. */
-const externalControl = new Map(); // stageKey -> 'user'
+/* External records carry an expiry (item 156 E-06): a record set
+ * and never released (browser crashed, tab closed, network gone)
+ * used to park the bot's tool gate FOREVER — every later call
+ * waited out the 10-minute gate timeout and the bot read as
+ * bricked. A record now lives at most EXTERNAL_CONTROL_TTL_MS past
+ * its last refresh; the Box face refreshes it on lock heartbeats
+ * and on every accepted input (touchExternalControl), so an
+ * actively-driving user never ages out, while an abandoned record
+ * self-heals. Expiry is lazy, judged at every read. */
+export const EXTERNAL_CONTROL_TTL_MS = 10 * 60 * 1000;
+const externalControl = new Map(); // stageKey -> { at, expiresAt }
+function externalIsUser(key, now = Date.now()) {
+  const rec = externalControl.get(key);
+  if (!rec) return false;
+  if (now > rec.expiresAt) { externalControl.delete(key); return false; }
+  return true;
+}
 export function setExternalControl(userId, botId, control) {
   const key = stageKey(userId, botId);
-  if (control === 'user') externalControl.set(key, 'user');
-  else {
+  if (control === 'user') {
+    const now = Date.now();
+    externalControl.set(key, { at: now, expiresAt: now + EXTERNAL_CONTROL_TTL_MS });
+  } else {
     externalControl.delete(key);
     wakeControlWaiters(userId, botId);
   }
   return externalControlOf(userId, botId);
 }
+/* Refresh a live record's expiry (Box heartbeat / input path).
+ * Never creates a record: refreshing a dead one back to life
+ * would resurrect a takeover nobody is performing. */
+export function touchExternalControl(userId, botId) {
+  const key = stageKey(userId, botId);
+  if (!externalIsUser(key)) return false;
+  const now = Date.now();
+  externalControl.set(key, { at: now, expiresAt: now + EXTERNAL_CONTROL_TTL_MS });
+  return true;
+}
 export function externalControlOf(userId, botId) {
-  return externalControl.get(stageKey(userId, botId)) === 'user' ? 'user' : 'agent';
+  return externalIsUser(stageKey(userId, botId)) ? 'user' : 'agent';
 }
 
+/* The gate's single source of truth: the user is driving when
+ * EITHER control source says so — the host stage's
+ * session.control, or a live external (Box) record. */
+function userDrivingNow(userId, botId) {
+  const key = stageKey(userId, botId);
+  const s = stageIndex.get(key);
+  return Boolean((s && s.control !== 'agent') || externalIsUser(key));
+}
+
+/* Wake ONLY on the conjunction (item 156 E-03): releasing one
+ * control face while the other still says the user is driving
+ * must not free parked tool calls — the gate was a two-source AND
+ * on the way in and a one-source shrug on the way out, so closing
+ * either face released tools the other face was still holding.
+ * Every wake point (releaseControl, setExternalControl,
+ * destroySession) funnels through here and re-reads both sources
+ * at wake time. */
 function wakeControlWaiters(userId, botId) {
+  if (userDrivingNow(userId, botId)) return;
   const key = stageKey(userId, botId);
   const set = controlWaiters.get(key);
   if (!set) return;
@@ -524,7 +674,7 @@ export function awaitStageControl(userId, botId, signal, timeoutMs = 600_000) {
   // The gate holds when EITHER control source says the user is
   // driving: the host stage's session.control, or an external
   // (Box) control record for the same (user, bot).
-  const userDriving = (s && s.control !== 'agent') || externalControl.get(key) === 'user';
+  const userDriving = (s && s.control !== 'agent') || externalIsUser(key);
   if (!userDriving) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const waiter = { resolve, reject, timer: null, cleanup: () => {} };
@@ -554,7 +704,7 @@ export function awaitStageControl(userId, botId, signal, timeoutMs = 600_000) {
     // Race guard: control may have been handed back (or the stage
     // closed) between the lookup above and registration.
     const cur = stageIndex.get(key);
-    if ((!cur || cur.control === 'agent') && externalControl.get(key) !== 'user') { waiter.cleanup(); resolve(); }
+    if ((!cur || cur.control === 'agent') && !externalIsUser(key)) { waiter.cleanup(); resolve(); }
   });
 }
 
@@ -573,11 +723,29 @@ export function stageFor(userId, botId) {
 export function stageDrive(userId, botId) {
   const s = stageIndex.get(stageKey(userId, botId));
   if (!s || s.control !== 'agent' || !s.handle) return null;
+  /* Control is re-read LIVE at every step (item 156 E-04): the
+   * object above is a snapshot of "a stage existed when the turn
+   * started", but control can change while a navigate is in
+   * flight — the user tapping takeover in that window must win.
+   * agentHolds() therefore checks, at call time, that the session
+   * is still the registered one, the host control is still the
+   * agent's, and no external (Box) record says the user is
+   * driving. browse/shot check on entry, again after the navigate
+   * lands (before reading/capturing the page the user may now be
+   * looking at), and a failed check resolves null — the tool
+   * layer's ordinary one-shot fallback, never a half-driven page.
+   * (The turn-level snapshot in server.js — ctx.browserStage is
+   * still taken once per turn — is the coordinator's half; these
+   * live checks close the safety side from here regardless.) */
+  const agentHolds = () => sessions.get(s.id) === s && s.control === 'agent' && !externalIsUser(stageKey(userId, botId));
   return {
     async browse(url) {
       try {
+        if (!agentHolds()) return null;
         const finalUrl = await s.handle.navigate(String(url || ''), 20_000);
+        if (!agentHolds()) return null;
         const html = await s.handle.evaluate('document.documentElement ? document.documentElement.outerHTML : ""');
+        if (!agentHolds()) return null;
         const info = await s.handle.info().catch(() => null);
         updateMeta(s, info || { url: finalUrl || s.url, title: s.title });
         s.lastAt = Date.now();
@@ -586,8 +754,11 @@ export function stageDrive(userId, botId) {
     },
     async shot(url) {
       try {
+        if (!agentHolds()) return null;
         await s.handle.navigate(String(url || ''), 20_000);
+        if (!agentHolds()) return null;
         const b64 = await s.handle.capture();
+        if (!agentHolds()) return null;
         const info = await s.handle.info().catch(() => null);
         updateMeta(s, info);
         s.lastAt = Date.now();
@@ -602,11 +773,27 @@ export function stageDrive(userId, botId) {
  * Executes ONLY while the user holds control — the gate is
  * server-side, not client courtesy; when the agent holds control
  * this returns null and the WS layer answers 'denied'. */
+/* Takeover input rate bound (item 156 E-13, this module's half):
+ * every accepted input costs a CDP operation plus an info()
+ * round-trip, so an unbounded input stream from one client could
+ * monopolize the stage's Chromium. The bound is per stage and
+ * kind-agnostic — it counts the unified pointer/keyboard event
+ * stream as one flow (item 155 discipline: no new mouse-only
+ * assumptions are introduced here). */
+export const STAGE_INPUT_RATE = { max: 30, windowMs: 1000 };
+
 export async function stageInput(id, userId, input = {}) {
   const s = getViewerSession(id, userId);
   if (!s) return null;
   ensureStageFields(s);
   if (s.control !== 'user') return null;
+  const nowIn = Date.now();
+  if (!Array.isArray(s.inputTimes)) s.inputTimes = [];
+  s.inputTimes = s.inputTimes.filter((t) => nowIn - t < STAGE_INPUT_RATE.windowMs);
+  if (s.inputTimes.length >= STAGE_INPUT_RATE.max) {
+    throw viewerError('errBrowserInputRate', 'stage input rate exceeded — slow down');
+  }
+  s.inputTimes.push(nowIn);
   const kind = String(input.kind || '');
   const vw = s.viewport.width || STAGE_VIEWPORT.width;
   const vh = s.viewport.height || STAGE_VIEWPORT.height;
@@ -633,9 +820,14 @@ export function onStageEnded(fn) {
 async function destroySession(s) {
   if (sessions.get(s.id) === s) sessions.delete(s.id);
   if (stageIndex.get(stageKey(s.userId, s.botId)) === s) stageIndex.delete(stageKey(s.userId, s.botId));
-  // A closed stage hands control back by definition: parked tool
-  // calls proceed (their stage lookups will simply miss).
+  // A closed stage hands ITS control source back: parked tool
+  // calls proceed only if the OTHER source (an external Box
+  // record) is not still holding them — wakeControlWaiters
+  // re-checks the conjunction (E-03).
   wakeControlWaiters(s.userId, s.botId);
+  // Frame retention is bounded at stage end too (E-12): the
+  // replay stays for its owner, the TTL/per-owner prune runs.
+  try { pruneFrameStageDirs(); } catch { /* best effort */ }
   ensureStageFields(s);
   await stopCast(s).catch(() => {});
   if (s.cast.statsTimer) { clearInterval(s.cast.statsTimer); s.cast.statsTimer = null; }
@@ -678,6 +870,13 @@ export async function openViewerSession({ userId, botId, url, validate = assertP
   }
   if (sessions.size >= MAX_SESSIONS) throw viewerError('errBrowserBusy', 'too many live viewer sessions — close one first');
   const bin = modules.getBinary('chromium');
+  // The profile directory name is built from the two ids (item 156
+  // E-37④, defense in depth): both are server-generated today, but
+  // the name is a path segment, so the shape is asserted rather
+  // than assumed.
+  if (!/^[\w-]+$/.test(String(botId || '')) || !/^[\w-]+$/.test(String(userId || ''))) {
+    throw viewerError('errBrowserInput', 'invalid bot or user id for a browser stage');
+  }
   const profileDir = path.join(config.dataDir, 'browser-profiles', `${botId}--${userId}`);
   fs.mkdirSync(profileDir, { recursive: true });
   const handle = await startCdpSession(bin, { profileDir, validate, viewport: { ...STAGE_VIEWPORT } });

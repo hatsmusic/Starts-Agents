@@ -11,7 +11,8 @@ import { spawn, execFile } from 'node:child_process';
 import { config } from './config.js';
 import { availableTools, sandboxEnv } from './tools.js';
 import { untrustedNotice } from './trust.js';
-import { getLocalModel } from './local-models.js';
+import { getLocalModel, localModelContextTokens } from './local-models.js';
+import { estimateTokens } from './context.js';
 
 /* ---------------- vision capability (v0.15.1, item 70 A1) ----------------
  * Whether a model accepts image input decides how images travel:
@@ -210,7 +211,12 @@ function parseTextToolCall(text) {
     }
   }
   // Form B: name{args} on its own line, JSON running to the end.
-  const m = s.match(/(?:^|\n)\s*([a-z_][a-z0-9_]*)\s*\{/);
+  // The name charset is the tools' REAL charset (audit C-20, 顺手):
+  // MCP dynamic tools are named slug + remote name and may carry
+  // capitals and hyphens — the old [a-z0-9_] class made those
+  // tools unreachable through the text channel. knownTool() below
+  // remains the actual gate.
+  const m = s.match(/(?:^|\n)\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{/);
   if (m && knownTool(m[1])) {
     const braceIdx = s.indexOf('{', m.index);
     const bal = extractBalanced(s, braceIdx);
@@ -230,9 +236,9 @@ function parseTextToolCall(text) {
 function couldBeTextCall(probe) {
   if (!probe) return false;
   if (probe.startsWith('{') || probe.startsWith('`')) return true;
-  const withBrace = probe.match(/^([a-z_][a-z0-9_]*)\s*\{/);
+  const withBrace = probe.match(/^([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{/);
   if (withBrace) return knownTool(withBrace[1]);
-  const bare = probe.match(/^([a-z_][a-z0-9_]*)\s*$/);
+  const bare = probe.match(/^([a-zA-Z_][a-zA-Z0-9_-]*)\s*$/);
   if (bare) return availableTools().some((tool) => tool.name.startsWith(bare[1]));
   return false;
 }
@@ -245,29 +251,52 @@ function canonical(v) {
   return JSON.stringify(v);
 }
 
-/* Find a name{json} text call ANYWHERE in a held segment (round-end
+/* Find a name{json} text call in a held segment (round-end
  * reconciliation only — the segment was already deemed call-like by
  * the stream buffer). Returns { name, args, start, end } spanning the
  * call text, or null. The JSON must be one balanced object that
  * parses to a plain object. */
+/* Audit C-02 anchoring (the finder above carries it): a loose hit
+ * upgrades to EXECUTION at its call sites, so it must satisfy the
+ * same discipline as parseTextToolCall's v0.14 anchor — the call
+ * starts at a line start and, after its JSON, only whitespace or
+ * a single sentence-ending period may remain. The old finder
+ * accepted any trailing prose, so a model QUOTING an example call
+ * at a line start (`read_file{...} is how you call it`) had the
+ * quote executed — safe tools ran uninvited, risky ones popped
+ * approval cards. Leading prose in the segment stays allowed
+ * (a plan sentence before the call is the normal shape); dedup
+ * against structured calls still works because a duplicate print
+ * is exactly the call alone. Audit C-21 (same function): the
+ * winner is the EARLIEST valid call in the text, not the first
+ * in tool-catalog order. */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function extractLooseTextCall(text) {
   const s = String(text || '');
+  let best = null;
   for (const tool of availableTools()) {
-    const re = new RegExp('(^|\n)(\s*)' + tool.name + '\s*\{', 'g');
+    const re = new RegExp('(^|\n)(\\s*)' + escapeRegExp(tool.name) + '\\s*\\{', 'g');
     let m;
     while ((m = re.exec(s))) {
-      const braceIdx = s.indexOf('{', m.index + m[1].length + m[2].length);
+      const start = m.index + m[1].length + m[2].length;
+      if (best && start >= best.start) continue;
+      const braceIdx = s.indexOf('{', start);
       const bal = extractBalanced(s, braceIdx);
       if (!bal) continue;
+      const trailing = s.slice(bal.end + 1).trim();
+      if (trailing && trailing !== '.' && trailing !== '。') continue;
       try {
         const args = JSON.parse(bal.json);
         if (args && typeof args === 'object' && !Array.isArray(args)) {
-          return { name: tool.name, args, start: m.index + m[1].length + m[2].length, end: bal.end + 1 };
+          best = { name: tool.name, args, start, end: bal.end + 1 };
         }
       } catch { /* keep looking */ }
     }
   }
-  return null;
+  return best;
 }
 
 /* The agent working protocol, injected as a system message on every
@@ -472,6 +501,68 @@ function providerHttpError(status, bodyText) {
   return codedError(code, { status, detail: upstream });
 }
 
+/* The ONE effective-model rule (audit C-01): a bot's per-bot
+ * localModel override WINS over bot.model, which wins over the
+ * provider default — the same precedence botProviderWarning in
+ * server.js already used for its save-time warning. The engine
+ * used to read only `bot.model || provider.model`, so for any bot
+ * whose owner is not a registered volunteer (the server's turn
+ * resolution only applied localModel for volunteers) the editor's
+ * local-model pick was a dead control: the warning judged the
+ * picked model while every turn silently ran the provider
+ * default. The engine now applies the override itself whenever
+ * the run is actually on a local/Ollama-shaped provider — a
+ * loopback/LAN endpoint, a catalogued local tag, or a provider
+ * whose model list contains the pick — so a stray localModel on
+ * a cloud-bound bot stays inert, exactly as before.
+ * Precedence note: a requesting user's volunteer pick is applied
+ * by the server BEFORE this runs (it rewrites bot.model and
+ * provider.model to the pick in lockstep) — that lockstep is the
+ * fingerprint the rule below honors, so a pick always outranks
+ * the bot's own override. See the C-01 cooperation note in the
+ * fix report for the one residual corner and its server-side
+ * clean fix. */
+export function effectiveModelForRun(bot, provider) {
+  const localModel = String(bot?.localModel || '').trim();
+  const botModel = String(bot?.model || '').trim();
+  const providerModel = String(provider?.model || '').trim();
+  if (localModel && localModel !== botModel) {
+    /* A model the SERVER already resolved for this turn outranks
+     * the bot override: the volunteer pick / own-endpoint branches
+     * rewrite bot.model AND provider.model to the same wanted tag,
+     * while a stored bot record never rewrites provider.model.
+     * botModel === providerModel (and ≠ localModel) is that
+     * resolution's fingerprint. Residual corner, stated plainly:
+     * a stored bot.model that coincidentally equals the provider
+     * default also matches the fingerprint and keeps bot.model —
+     * the clean fix is server-side (stamp the resolved model /
+     * clear effBot.localModel on the pick branches), listed in
+     * the C-01 cooperation note in the fix report. */
+    if (botModel && providerModel && botModel === providerModel) return botModel;
+    const providerModels = Array.isArray(provider?.models) ? provider.models : [];
+    const looksLocal = Boolean(provider && LOCAL_BASE_RE.test(String(provider.baseUrl || '')))
+      || Boolean(getLocalModel(localModel) || getLocalModel(localModel.split('/').pop()))
+      || providerModels.includes(localModel);
+    if (looksLocal) return localModel;
+  }
+  return botModel || providerModel || '';
+}
+
+/* The context window (tokens) this run must fit into, or null
+ * when nothing is known (audit C-03): the local catalog's family
+ * table answers for catalogued/family-recognized models; an
+ * unknown model on a LOCAL endpoint gets a conservative 16k —
+ * local windows are 4k–32k in practice, and an overflow there is
+ * silent left-truncation by Ollama, the worst failure shape; an
+ * unknown cloud model returns null (the server's configured
+ * history budget stays the only cap, as before). */
+export function modelContextTokens(model, provider) {
+  const fromCatalog = localModelContextTokens(model);
+  if (fromCatalog) return fromCatalog;
+  if (provider && LOCAL_BASE_RE.test(String(provider.baseUrl || ''))) return 16384;
+  return null;
+}
+
 async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images, signal, teamNote, memoryNote, forceNoTools }) {
   // The provider is resolved by the server (resolveProvider): a bot
   // with its own provider NEVER falls back to the env key here — that
@@ -487,7 +578,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
   }
   const baseUrl = provider.baseUrl;
   const apiKey = provider.apiKey || '';
-  const model = bot.model || provider.model;
+  const model = effectiveModelForRun(bot, provider);
   const isLocal = LOCAL_BASE_RE.test(baseUrl);
   if (!apiKey && !isLocal) {
     const e = new Error('errNoKey');
@@ -506,6 +597,39 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userText },
   ];
+  /* Context-window fit (audit C-03): the server windows history
+   * against its configured budget, but that budget knows nothing
+   * of THIS model's window. When the window is known (catalog /
+   * local endpoint), fit the assembled messages into 85% of it
+   * BEFORE the first request: drop the oldest HISTORY messages
+   * (system messages and the current user message are never
+   * dropped) and leave an explicit note where they were, instead
+   * of letting Ollama left-truncate the system side in silence or
+   * the provider fail the whole turn with a context error. The
+   * engine also tells a local endpoint the window explicitly
+   * (num_ctx below), capped at 32k so a huge native window does
+   * not make a small box allocate a giant KV cache. */
+  const ctxTokensTotal = modelContextTokens(model, provider);
+  const ctxCapTokens = ctxTokensTotal ? Math.floor(ctxTokensTotal * 0.85) : null;
+  const numCtx = isLocal && ctxTokensTotal ? Math.min(ctxTokensTotal, 32768) : null;
+  const msgTokens = (m) => (typeof m.content === 'string'
+    ? estimateTokens(m.content)
+    : estimateTokens(JSON.stringify(m.content || '')) + 800);
+  if (ctxCapTokens) {
+    const systemCount = messages.length - history.length - 1;
+    let totalTokens = messages.reduce((s, m) => s + msgTokens(m), 0);
+    let droppedForWindow = 0;
+    while (totalTokens > ctxCapTokens && messages.length > systemCount + 1) {
+      const [removed] = messages.splice(systemCount, 1);
+      totalTokens -= msgTokens(removed);
+      droppedForWindow += 1;
+    }
+    if (droppedForWindow > 0) {
+      messages.splice(systemCount, 0, { role: 'user', content: zh
+        ? `[系统提示] 当前模型（${model}）的上下文窗口较小，已省略较早的 ${droppedForWindow} 条对话以适配窗口；要点在长期记忆 MEMORY.md 中，需要细节时用工具查证，不要凭空猜测被省略的内容。`
+        : `[System note] The current model (${model}) has a smaller context window, so ${droppedForWindow} earlier message(s) were omitted to fit it. Their notes live in long-term memory (MEMORY.md); use your tools to check details instead of guessing what was omitted.` });
+    }
+  }
   // Vision (v0.15.1, item 70 A1): the verdict for THIS run's model
   // decides how images travel — see visionVerdict above. 'no' means
   // blocks are never sent and the model reads the degradation note
@@ -539,6 +663,15 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
   const pushToolResult = (toolCallId, result) => {
     const { text, images: toolImages } = normalizeToolResult(result);
     let content = text.slice(0, 16000);
+    // Audit C-23 (顺手, same line): the slice used to be silent —
+    // the model read a truncated file/output as if complete and
+    // drew "already read it all" conclusions. Say so, with the
+    // true length, in the conversation language.
+    if (text.length > 16000) {
+      content += zh
+        ? `\n[已截断：该工具结果共 ${text.length} 字符，这里只显示前 16000 字符；需要后文时请分段读取或缩小范围]`
+        : `\n[truncated: this tool result was ${text.length} characters; only the first 16000 are shown — read it in parts or narrow the request if you need the rest]`;
+    }
     if (toolImages.length && visionBlocked) content += imageDegradationNote(toolImages, lang);
     messages.push({ role: 'tool', tool_call_id: toolCallId, content });
     if (toolImages.length && !visionBlocked) {
@@ -574,6 +707,40 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       if (idx >= 0) messages.splice(idx, 1, noteMsg);
     }
     pendingImageMsgs = [];
+  };
+  /* In-turn context budget (audit C-04): the history window is
+   * budgeted ONCE, at turn start — but a turn then appends tool
+   * results for up to 25 rounds (16k chars each, several calls per
+   * round), and nothing re-checked the total. Long coding turns
+   * hit the model's ceiling mid-task: the whole turn failed, tool
+   * side-effects stayed, the summary was lost; small local windows
+   * blew up within a few rounds. Before each round's request, if
+   * the assembled messages exceed the turn budget (the model's
+   * window cap when known, else ~96k tokens), compact the OLDEST
+   * tool results first — head + tail kept, middle replaced by an
+   * explicit omission note — and only then shave the oldest large
+   * non-system messages the same way. Structure is never touched:
+   * tool messages keep their tool_call_id and pairing. */
+  const inTurnBudgetTokens = ctxCapTokens || 96000;
+  const compactInTurnIfNeeded = () => {
+    const totalNow = () => messages.reduce((s, m) => s + msgTokens(m), 0);
+    if (totalNow() <= inTurnBudgetTokens) return;
+    const compactOne = (m, head, tail) => {
+      const orig = m.content.length;
+      m.content = m.content.slice(0, head)
+        + (zh
+          ? `\n[…回合内上下文压缩：这段内容共 ${orig} 字符，为适配上下文预算省略了中段；需要原文时重新调用工具/读取文件…]\n`
+          : `\n[… in-turn context compaction: this content was ${orig} characters; its middle was omitted to fit the context budget — re-run the tool / re-read the file if you need it verbatim …]\n`)
+        + m.content.slice(-tail);
+    };
+    for (const m of messages) {
+      if (totalNow() <= inTurnBudgetTokens) return;
+      if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 1200) compactOne(m, 800, 400);
+    }
+    for (const m of messages) {
+      if (totalNow() <= inTurnBudgetTokens) return;
+      if (m.role !== 'system' && typeof m.content === 'string' && m.content.length > 4000 && m !== messages[messages.length - 1]) compactOne(m, 1500, 500);
+    }
   };
   // Ask for token usage in the stream (OpenAI/DeepSeek/OpenRouter/
   // Ollama all support stream_options.include_usage). A provider that
@@ -626,7 +793,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
         // Forced no-tools omits tools AND tool_choice entirely; the
         // final-round flag alone keeps its historical
         // tool_choice:'none' shape (v0.19.2).
-        body: JSON.stringify({ model, messages, ...(forcedNoTools ? {} : noTools ? { tool_choice: 'none' } : { tools: openaiTools() }), stream: true, ...(config.maxTokensOut > 0 ? { max_tokens: config.maxTokensOut } : {}), ...(useUsage ? { stream_options: { include_usage: true } } : {}) }),
+        body: JSON.stringify({ model, messages, ...(forcedNoTools ? {} : noTools ? { tool_choice: 'none' } : { tools: openaiTools() }), stream: true, ...(config.maxTokensOut > 0 ? { max_tokens: config.maxTokensOut } : {}), ...(useUsage ? { stream_options: { include_usage: true } } : {}), ...(numCtx ? { options: { num_ctx: numCtx } } : {}) }),
       });
       return res;
     } catch (err) {
@@ -700,6 +867,7 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
     let releaseSlot = null;
     try {
       if (signal && signal.aborted) return;
+      compactInTurnIfNeeded();
       if (round === 24) {
         // Last round (v0.15, sweep P2-2): the loop used to end
         // mid-task in total silence — 25 rounds of tool work and no
@@ -755,9 +923,20 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
           // splice the explicit degradation note in their place, and
           // retry the round in pure text. The files stay in the
           // workspace either way.
-          stripImagesAfterRejection();
-          res = yield* fetchRound();
-          continue;
+          // Audit C-13 (顺手, same block): this strip used to fire
+          // on ANY non-OK response — a 401 (dead key) or 404 (wrong
+          // model) first cost a pointless image-stripped retry and
+          // flipped visionBlocked for the rest of the turn before
+          // the real coded error surfaced. It now fires only for a
+          // 400, or when the upstream's own words name the image /
+          // vision / multimodal shape as the problem.
+          const peek = await res.clone().text().catch(() => '');
+          const upstream = extractUpstreamMessage(peek);
+          if (res.status === 400 || /image|vision|multimodal/i.test(upstream) || /image|vision|multimodal/i.test(peek)) {
+            stripImagesAfterRejection();
+            res = yield* fetchRound();
+            continue;
+          }
         }
         break;
       }
@@ -790,9 +969,30 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       // flush instantly and leak raw JSON into the chat.)
       let segBuf = '';
       let mode = 'classify'; // classify | flow | hold
+      // Audit C-22 (顺手, same mechanism as C-02): a held segment
+      // used to have NO size cap after entering hold — one
+      // call-shaped line start parked the ENTIRE rest of the reply
+      // (a JSON explainer, a code sample) in memory until round
+      // end, streaming nothing. Past SEG_HOLD_MAX the segment is
+      // flushed as prose and this round gives up text-call
+      // recognition for the flushed text (it was already shown to
+      // the user as text; executing it afterwards would double it).
+      const SEG_HOLD_MAX = 8192;
+      let holdOverflowed = false;
       function* drain() {
         for (;;) {
-          if (!segBuf || mode === 'hold') return;
+          if (mode === 'hold') {
+            if (segBuf.length > SEG_HOLD_MAX) {
+              holdOverflowed = true;
+              const flushed = segBuf;
+              segBuf = '';
+              mode = 'classify';
+              yield { type: 'token', text: flushed };
+              continue;
+            }
+            return;
+          }
+          if (!segBuf) return;
           if (mode === 'classify') {
             const probe = segBuf.trimStart();
             if (!probe) {
@@ -908,15 +1108,28 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
         // content takes the existing empty-reply path below.
         calls.clear();
       }
+      if (!forcedNoTools && noTools && calls.size) {
+        // Audit C-18 (顺手, adjacent guard): the FINAL round also
+        // runs tools-off (tool_choice:'none'), but a provider that
+        // ignores it (small local models, commonly) used to get its
+        // calls EXECUTED — approval cards included — after which
+        // the loop simply ended: work done, no summary, the user
+        // shown the empty-reply fallback. The final round now gets
+        // the same treatment as a forced one: calls are noted by
+        // their absence, never run, and the round closes on words.
+        calls.clear();
+      }
       if (!calls.size) {
         // No structured calls: was the text itself a tool call in
         // disguise? Under noTools (forced or final round) a text
         // call is never upgraded either — it stays prose, matching
         // the reconciliation rule (found && !noTools) below.
-        let call = noTools ? null : parseTextToolCall(content);
-        if (!call && !noTools) {
-          // The strict forms missed it — try the held tail loosely (a
-          // call followed by trailing prose in the same held segment).
+        let call = (noTools || holdOverflowed) ? null : parseTextToolCall(content);
+        if (!call && !noTools && !holdOverflowed && segBuf.length <= SEG_HOLD_MAX) {
+          // The strict forms missed it — try the held tail loosely
+          // (a call after leading prose in the same held segment;
+          // the loose finder itself enforces the C-02 trailing
+          // anchor, so quoted example calls stay prose).
           const loose = extractLooseTextCall(segBuf);
           if (loose) {
             call = loose;
@@ -955,9 +1168,11 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       if (segBuf) {
         const flushedProse = content.slice(0, content.length - segBuf.length);
         let found = null;
-        const strict = parseTextToolCall(segBuf);
-        if (strict) found = { ...strict, start: 0, end: segBuf.length };
-        else found = extractLooseTextCall(segBuf);
+        if (!holdOverflowed && segBuf.length <= SEG_HOLD_MAX) {
+          const strict = parseTextToolCall(segBuf);
+          if (strict) found = { ...strict, start: 0, end: segBuf.length };
+          else found = extractLooseTextCall(segBuf);
+        }
         if (found && !noTools) {
           const rest = (segBuf.slice(0, found.start) + segBuf.slice(found.end)).trim();
           const dup = [...calls.values()].some((c) => {
@@ -1077,4 +1292,4 @@ export async function engineStatus() {
 
 // Re-export spawn so future drivers (codex, grok) have the import ready.
 export { spawn };
-export { parseTextToolCall, couldBeTextCall };
+export { parseTextToolCall, couldBeTextCall, extractLooseTextCall };

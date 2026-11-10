@@ -25,7 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from './db.js';
 import { encrypt, decrypt } from './vault.js';
-import { assertPublicUrl, isPrivateIp } from './tools.js';
+import { assertPublicUrl, isPrivateIp, workspaceUsage, adjustWorkspaceUsage } from './tools.js';
 import { getKv, setKv } from './store.js';
 import { config } from './config.js';
 import { resolveOAuthApp } from './oauth-apps.js';
@@ -67,9 +67,76 @@ export function slugifyMcp(name) {
 // typing) are exec-class wherever they came from: the harness maps
 // them onto its highest approval tier, no matter what a remote
 // server calls its own risk level. Judged on the RAW remote name.
+//
+// INVERTED DEFAULT (item 156 E-08): the name regex used to be the
+// whole judgement, so a remote server could walk a real execution
+// tool past every exec-keyed defence (owner-only deciding, taint
+// marking, the high risk band) by naming it `bash`, `eval_js`,
+// `fs_write` or `key_press` — none of which the word list knew.
+// The judgement is now default-deny: a tool is NON-exec only when
+// its name matches a known read-only shape (a read verb prefix, a
+// read-only suffix, or a small exact list of inert utilities);
+// anything else — writes, actions, machine driving, the simply
+// unknown — is exec-class. The old regex survives as an override
+// in the other direction: a machine-driving name is exec even if
+// it happens to start with a read verb (`get_shell_history` is
+// not a lookup, it is a shell).
 const EXEC_CLASS_RE = /shell|exec|computer|gui|terminal|command|desktop|click|type_text|keyboard|mouse|run_/i;
+const READONLY_PREFIX_RE = /^(?:get|list|search|find|read|fetch|query|lookup|describe|show|view|check|stat|info|count|exists|is|has|can|ping|health|whoami|preview|print|head|echo)(?:_|-|$)/i;
+const READONLY_EXACT_RE = /^(?:search|query|list|get|read|fetch|find|status|info|ping|health|whoami|echo|version|time|now|date|calculator|convert_units|screenshot|take_screenshot|capture_screen|screen_capture)$/i;
+const READONLY_SUFFIX_RE = /(?:_search|_query|_list|_info|_status|_read|_lookup|_count|_exists|_preview)$/i;
 export function isMcpExecClass(toolName) {
-  return EXEC_CLASS_RE.test(String(toolName || ''));
+  const n = String(toolName || '');
+  if (EXEC_CLASS_RE.test(n)) return true;
+  if (/read[-_]?only/i.test(n)) return false;
+  if (READONLY_PREFIX_RE.test(n) || READONLY_EXACT_RE.test(n) || READONLY_SUFFIX_RE.test(n)) return false;
+  return true;
+}
+
+/* --------------------- dynamic tool naming -------------------------
+ * The chat catalog names a remote tool `mcp__<slug>__<remoteName>`
+ * capped at 64 chars. Two collisions used to hide inside that
+ * shape (item 156 E-10): plain truncation made two long remote
+ * names on one server identical, and the slug is only unique PER
+ * USER while the platform Box row's slug is always 'box' — a user
+ * row slugged 'box' produced byte-identical names to the platform
+ * row's, so getTool / approvals / grants keyed by name could not
+ * tell the servers apart. The naming policy therefore lives HERE
+ * (the wiring in server.js buildMcpToolDefs is the coordinator's
+ * one-line adoption, recorded in the batch report):
+ *   - mcpToolNameFor: the legacy name when it fits; when it would
+ *     overflow, a name carrying a hash of (server id + remote
+ *     name) instead of a plain truncation — same inputs, same
+ *     name, different servers/tools, different names.
+ *   - uniqueMcpToolNames: given one turn's full entry list,
+ *     disambiguates any remaining exact duplicates (the cross-row
+ *     slug collision) with a server-id hash suffix fitted into
+ *     the 64-char cap. First occurrence keeps the plain name, so
+ *     existing names stay stable wherever no collision exists. */
+export const MCP_TOOL_NAME_MAX = 64;
+function shortHash(s) { return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 10); }
+export function mcpToolNameFor(row, toolName) {
+  const slug = String(row?.slug || 'srv');
+  const clean = String(toolName || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const base = `mcp__${slug}__${clean}`;
+  if (base.length <= MCP_TOOL_NAME_MAX) return base;
+  const suffix = `__h${shortHash(`${row?.id || row?.url || ''}:${toolName}`)}`;
+  return base.slice(0, MCP_TOOL_NAME_MAX - suffix.length) + suffix;
+}
+export function uniqueMcpToolNames(entries) {
+  const seen = new Map(); // name -> count
+  return (Array.isArray(entries) ? entries : []).map((e) => {
+    const row = e?.row || e;
+    const toolName = e?.toolName ?? e?.name ?? '';
+    let name = mcpToolNameFor(row, toolName);
+    const n = seen.get(name) || 0;
+    seen.set(name, n + 1);
+    if (n > 0) {
+      const suffix = `__s${shortHash(`${row?.id || row?.url || ''}:${toolName}:${n}`)}`;
+      name = name.slice(0, MCP_TOOL_NAME_MAX - suffix.length) + suffix;
+    }
+    return name;
+  });
 }
 
 /* ------------------------------ CRUD ------------------------------- */
@@ -214,8 +281,14 @@ export function mcpSecretHealth() {
   const bad = [];
   let checked = 0;
   const rows = db().prepare('SELECT id, secret_enc FROM mcp_servers').all();
-  const plat = platformBoxRow();
-  if (plat && plat.secret_enc) rows.push({ id: plat.id || 'platform-box', secret_enc: plat.secret_enc });
+  // B-02 (audit r1): read the Box secret from STORAGE, not via
+  // platformBoxRow() — that row only exists while the Box is
+  // mode=global AND enabled, so a configured-but-disabled Box
+  // key escaped the trial decrypt (and would escape a rotation
+  // post-mortem the same way). The kv face is in
+  // vault.VAULT_CIPHER_SURFACES.
+  const platStored = platformBoxStored();
+  if (platStored.secretEnc) rows.push({ id: '__platform_box__', secret_enc: platStored.secretEnc });
   for (const r of rows) {
     if (!r.secret_enc) continue;
     checked++;
@@ -307,7 +380,7 @@ async function fetchGuarded(url, init, signal) {
     const res = await fetch(current, { ...curInit, redirect: 'manual', signal });
     if (![301, 302, 303, 307, 308].includes(res.status)) return res;
     const loc = res.headers.get('location');
-    await res.text().catch(() => '');
+    await readBodyCapped(res).catch(() => ''); // capped drain (audit R2-08): the body is discarded, but never buffered whole
     if (!loc || hop >= 5) throw mcpError('errMcpRemote', 'MCP server redirected too many times');
     const next = new URL(loc, current).toString();
     await urlGuard(next);
@@ -391,11 +464,11 @@ export async function discoverOAuth(server) {
       headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'starts-agents', version: '0.20.0' } },
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'starts-agents', version: '0.21.0' } },
       }),
     }, timeoutMs);
     const www = probe.headers.get('www-authenticate') || '';
-    await probe.text().catch(() => '');
+    await readBodyCapped(probe).catch(() => ''); // R2-08 family (delta audit R2B-01): discard reads are capped too
     const m = www.match(/resource_metadata=(?:"([^"]+)"|([^,\s]+))/);
     if (m) resourceMetadataUrl = m[1] || m[2];
   } catch (e) {
@@ -484,13 +557,17 @@ export async function discoverOAuth(server) {
  * the operator pre-registers an OAuth app (Settings → OAuth apps,
  * or the SA_GITHUB_* env pair) and its client_id/secret are used
  * INSTEAD of DCR whenever this exact server is connected. Any
- * other server keeps the DCR flow untouched. Identified by the
- * preset flag or the canonical endpoint URL — a user typing the
- * GitHub MCP address by hand gets the platform client too. */
+ * other server keeps the DCR flow untouched. Identified ONLY by
+ * the canonical endpoint URL — a user typing the GitHub MCP
+ * address by hand gets the platform client too. (Item 156 E-01:
+ * this used to also trust a `preset === 'github'` flag, but preset
+ * was user-writable at the create route — a self-declared
+ * "github" row on an attacker URL got the platform client_secret
+ * seeded into it and POSTed to the attacker's own token endpoint.
+ * A display label must never be a credential-routing decision.) */
 const GITHUB_MCP_HOST = 'api.githubcopilot.com';
 function isGithubMcpServer(server) {
   if (!server) return false;
-  if (server.preset === 'github') return true;
   try {
     const u = new URL(server.url || '');
     return u.hostname === GITHUB_MCP_HOST && u.pathname.replace(/\/+$/, '') === '/mcp';
@@ -557,7 +634,18 @@ export async function ensureOAuthClient(server, redirectUri) {
 
 const base64url = (buf) => Buffer.from(buf).toString('base64url');
 
+/* OAuth entry guard (item 156 E-31): the flow rewrites the row's
+ * secret blob as a JSON token object, which silently DESTROYS a
+ * token-type row's bare-string secret. Starting (or finishing) an
+ * OAuth flow on a non-oauth row is therefore refused up front
+ * with a stable code instead of corrupting a working connector. */
+function assertOAuthRow(server) {
+  const t = server?.auth_type || server?.authType;
+  if (t !== 'oauth') throw mcpError('errMcpAuth', 'this MCP server is not an OAuth server — reconnect is only for auth type oauth');
+}
+
 export async function buildOAuthStart(server, redirectUri) {
+  assertOAuthRow(server);
   await discoverOAuth(server);
   const meta = await ensureOAuthClient(server, redirectUri);
   const state = crypto.randomBytes(16).toString('hex'); // 32 hex chars
@@ -626,6 +714,7 @@ function storeTokenResponse(server, j) {
 }
 
 export async function finishOAuth(server, { code, verifier, redirectUri } = {}) {
+  assertOAuthRow(server);
   let meta = parseOAuthMeta(server);
   if (!meta.endpoints?.token_endpoint) meta = await discoverOAuth(server);
   const form = new URLSearchParams();
@@ -660,6 +749,18 @@ export async function getAccessToken(server) {
   }
   return secret.access;
 }
+
+/* --------------------------- Box tool gate -------------------------
+ * Enforcement hook for the shared-Box entity lock (item 156
+ * E-05): browser-box.js registers its policy here at load, and
+ * mcpCallTool consults it before any non-internal call. The gate
+ * receives the call's actor (userId/botId) when the caller passes
+ * them in opts — the dyn-tool path in server.js is the caller
+ * that must (coordinator wiring, see the batch report). Internal
+ * card-face calls pass boxInternal and are judged by the card
+ * lock itself, never by this gate. */
+let boxToolGate = null;
+export function setBoxToolGate(fn) { boxToolGate = typeof fn === 'function' ? fn : null; }
 
 /* ------------------------- sessions & cache ------------------------ */
 // Live protocol state per server id: the session id the server
@@ -722,8 +823,43 @@ async function postServerResponse(server, auth, req) {
       const sid = res.headers.get('mcp-session-id');
       if (sid) sessionFor(server.id).sessionId = sid;
     }
-    await res.text().catch(() => '');
+    await readBodyCapped(res).catch(() => ''); // capped drain (audit R2-08): the body is discarded, but never buffered whole
   } catch { /* the answer is best-effort; the original result stands */ }
+}
+
+/* Response size discipline (item 156 E-09): the RPC body used to
+ * be read whole with res.text() and no bound — a hostile or
+ * hijacked server could balloon process memory with one giant
+ * reply before any parsing happened. The body is now streamed
+ * with a hard 32 MB ceiling (a declared Content-Length over the
+ * cap is refused before a byte is read). */
+export const RPC_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+async function readBodyCapped(res, capBytes = RPC_MAX_RESPONSE_BYTES) {
+  const declared = Number(res.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > capBytes) {
+    throw mcpError('errMcpRemote', `MCP response exceeds the ${capBytes}-byte limit`);
+  }
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > capBytes) {
+        try { await reader.cancel(); } catch { /* already gone */ }
+        throw mcpError('errMcpRemote', `MCP response exceeds the ${capBytes}-byte limit`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  }
+  const text = await res.text();
+  if (Buffer.byteLength(text, 'utf8') > capBytes) {
+    throw mcpError('errMcpRemote', `MCP response exceeds the ${capBytes}-byte limit`);
+  }
+  return text;
 }
 
 async function rpc(server, method, params, opts = {}) {
@@ -760,7 +896,7 @@ async function rpc(server, method, params, opts = {}) {
       if (sid) sessionFor(serverId).sessionId = sid;
     }
     if (res.status === 401 && authType === 'oauth' && !opts._oauthRetried) {
-      await res.text().catch(() => '');
+      await readBodyCapped(res).catch(() => ''); // capped drain (audit R2-08): the body is discarded, but never buffered whole
       // One forced refresh + one retry of the whole request; a
       // second 401 lands in the generic non-2xx path below.
       await refreshOAuthToken(server);
@@ -769,8 +905,9 @@ async function rpc(server, method, params, opts = {}) {
       return rpc(server, method, params, { ...opts, _oauthRetried: true });
     }
     let bodyText;
-    try { bodyText = await res.text(); } catch (e) {
+    try { bodyText = await readBodyCapped(res); } catch (e) {
       if (timedOut) throw mcpError('errMcpTimeout', `MCP request timed out after ${timeoutMs}ms`);
+      if (e && e.code === 'errMcpRemote') throw e; // the size cap's own verdict stands
       throw mcpError('errMcpConnect', `MCP response read failed: ${e.message || e}`);
     }
     if (!res.ok) throw mcpError('errMcpConnect', `MCP server returned HTTP ${res.status}`);
@@ -816,7 +953,7 @@ async function sendNotification(server, method, params, opts = {}) {
     headers: baseHeaders(server, auth),
     body: JSON.stringify({ jsonrpc: '2.0', method, params: params ?? {} }),
   }, timeoutOf(server, opts), { externalSignal: opts.signal || null });
-  await res.text().catch(() => '');
+  await readBodyCapped(res).catch(() => ''); // capped drain (audit R2-08): the body is discarded, but never buffered whole
 }
 
 async function ensureInitialized(server, opts = {}) {
@@ -825,12 +962,35 @@ async function ensureInitialized(server, opts = {}) {
   await rpc(server, 'initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
-    clientInfo: { name: 'starts-agents', version: '0.20.0' },
+    clientInfo: { name: 'starts-agents', version: '0.21.0' },
   }, opts);
   sessionFor(serverId).initialized = true;
   // The initialized notification completes the handshake; a server
   // that dislikes it must not cost us the session.
   try { await sendNotification(server, 'notifications/initialized', {}, opts); } catch { /* best effort */ }
+}
+
+/* Session self-heal (item 156 E-29): a remote server restart
+ * invalidates the Mcp-Session-Id this client keeps echoing, and
+ * the session used to stay poisoned until the row's credentials
+ * happened to change. When a call fails with the session-invalid
+ * signature (an HTTP 404 on an established session, or an error
+ * naming the session as unknown/expired), the session is dropped,
+ * the initialize handshake re-runs, and the call is retried
+ * exactly once. */
+function isSessionInvalidError(e) {
+  const msg = String((e && e.message) || e || '');
+  return /HTTP 404/.test(msg) || /session[^.]{0,40}(not found|unknown|invalid|expired|gone)/i.test(msg);
+}
+async function rpcWithSessionHeal(server, method, params, opts = {}) {
+  try {
+    return await rpc(server, method, params, opts);
+  } catch (e) {
+    if (opts._sessionRetried || !isSessionInvalidError(e)) throw e;
+    sessions.delete(server.id || server.url);
+    await ensureInitialized(server, opts);
+    return rpc(server, method, params, { ...opts, _sessionRetried: true });
+  }
 }
 
 export async function mcpListTools(server, { fresh = false, timeoutMs = undefined } = {}) {
@@ -844,7 +1004,7 @@ export async function mcpListTools(server, { fresh = false, timeoutMs = undefine
   // timeout (120s) — the chat path passes a short bound so one
   // unreachable server cannot hold a whole turn hostage.
   await ensureInitialized(server, { timeoutMs });
-  const result = await rpc(server, 'tools/list', {}, { timeoutMs });
+  const result = await rpcWithSessionHeal(server, 'tools/list', {}, { timeoutMs });
   const tools = (Array.isArray(result?.tools) ? result.tools : []).map((t) => ({
     name: t.name,
     description: t.description || '',
@@ -854,10 +1014,15 @@ export async function mcpListTools(server, { fresh = false, timeoutMs = undefine
   return tools;
 }
 
-export async function mcpCallTool(server, toolName, args, { signal = null, timeoutMs = undefined } = {}) {
+export async function mcpCallTool(server, toolName, args, { signal = null, timeoutMs = undefined, actorUserId = '', actorBotId = '', boxInternal = false } = {}) {
+  // Shared-Box entity gate (E-05): judged before any byte leaves —
+  // a refused call costs no handshake and leaves no audit ghost.
+  if (boxToolGate && !boxInternal) {
+    boxToolGate({ row: server, toolName, userId: actorUserId, botId: actorBotId });
+  }
   const opts = { signal, timeoutMs };
   await ensureInitialized(server, opts);
-  const result = await rpc(server, 'tools/call', { name: toolName, arguments: args ?? {} }, opts);
+  const result = await rpcWithSessionHeal(server, 'tools/call', { name: toolName, arguments: args ?? {} }, opts);
   return {
     content: Array.isArray(result?.content) ? result.content : [],
     isError: Boolean(result?.isError ?? result?.is_error ?? false),
@@ -866,8 +1031,12 @@ export async function mcpCallTool(server, toolName, args, { signal = null, timeo
 
 /* --------------------------- materialize --------------------------- */
 const MIME_EXT = {
+  // NB: 'image/svg+xml' is deliberately ABSENT (item 156 E-28):
+  // an SVG is script-capable markup, and MCP output is untrusted —
+  // it lands as .bin (download-only material), never as a .svg a
+  // preview face might one day serve inline. Item 148's rule.
   'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/gif': 'gif',
-  'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/bmp': 'bmp',
+  'image/webp': 'webp', 'image/bmp': 'bmp',
   'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav',
   'audio/ogg': 'ogg', 'audio/webm': 'webm', 'audio/mp4': 'm4a',
   'application/pdf': 'pdf', 'application/json': 'json', 'text/plain': 'txt',
@@ -892,24 +1061,58 @@ function stampOf(d = new Date()) {
 // vision-capable model — the saved-file placeholder stays as the
 // text-only model's explicit degradation path. Synchronous on
 // purpose — callers use it inline while rendering a tool result.
+/* Materialize bounds (item 156 E-09): a tools/call result is
+ * remote-controlled input, and this path used to decode and write
+ * EVERY data item at ANY size with no quota consultation — one
+ * call could fill the disk for the whole deployment. The bounds
+ * now mirror the native tools' discipline: per-item and per-call
+ * byte caps, an item-count cap, and the workspace quota checked
+ * BEFORE each write (usage adjusted after, like screenshot_page).
+ * Over-limit items degrade to a placeholder line; the text of the
+ * result still flows. */
+export const MCP_MATERIALIZE_LIMITS = { maxItems: 32, maxItemBytes: 16 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024 };
 export function materializeMcpResult(result, { workspace, slug } = {}) {
   const safeSlug = String(slug || 'srv').replace(/[^\w.-]+/g, '-').replace(/^\.+/, '') || 'srv';
   const parts = [];
   const files = [];
   const images = [];
   let n = 0;
+  let savedBytes = 0;
+  const quotaCap = workspace ? Number(config.workspaceQuotaBytes) || 0 : 0;
+  let quotaBase = null; // workspace usage, walked lazily on first save
   const saveData = (data, mime, isImage) => {
+    const raw = String(data);
+    // Decoded size from the base64 length (padding-aware) — judged
+    // BEFORE decoding, so an oversized item costs no allocation.
+    const approxBytes = Math.max(0, Math.floor(raw.length * 3 / 4) - (raw.endsWith('==') ? 2 : raw.endsWith('=') ? 1 : 0));
+    if (n >= MCP_MATERIALIZE_LIMITS.maxItems
+      || approxBytes > MCP_MATERIALIZE_LIMITS.maxItemBytes
+      || savedBytes + approxBytes > MCP_MATERIALIZE_LIMITS.maxTotalBytes) {
+      parts.push('[skipped oversized content from the MCP server: item/count/size limit]');
+      return;
+    }
+    if (quotaCap > 0) {
+      if (quotaBase === null) { try { quotaBase = workspaceUsage(workspace); } catch { quotaBase = 0; } }
+      if (quotaBase + savedBytes + approxBytes > quotaCap) {
+        parts.push('[skipped content from the MCP server: the workspace quota is full]');
+        return;
+      }
+    }
     n += 1;
     const ext = extForMime(mime || (isImage ? 'image/png' : ''));
     const file = `${isImage ? 'img' : 'file'}-${stampOf()}-${n}.${ext}`;
     const dir = path.join(workspace, 'mcp', safeSlug);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, file), Buffer.from(String(data), 'base64'));
+    const buf = Buffer.from(raw, 'base64');
+    fs.writeFileSync(path.join(dir, file), buf);
+    savedBytes += buf.length;
+    if (quotaCap > 0) { try { adjustWorkspaceUsage(workspace, buf.length); } catch { /* counter is advisory */ } }
     const rel = `mcp/${safeSlug}/${file}`;
     files.push(rel);
     parts.push(isImage ? `[screenshot saved: ${rel}]` : `[file saved: ${rel}]`);
-    if (isImage && images.length < 4 && String(data).length <= 8 * 1024 * 1024) {
-      images.push({ mime: mime || 'image/png', data: String(data), rel });
+    const isSvg = String(mime || '').toLowerCase().split(';')[0].trim() === 'image/svg+xml';
+    if (isImage && !isSvg && images.length < 4 && raw.length <= 8 * 1024 * 1024) {
+      images.push({ mime: mime || 'image/png', data: raw, rel });
     }
   };
   const content = Array.isArray(result?.content) ? result.content : [];

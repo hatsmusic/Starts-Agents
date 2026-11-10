@@ -318,7 +318,151 @@ const MIGRATIONS = [
       }
     },
   },
+  {
+    // v0.21.0 (audit F-03): usage idempotency keys. recordUsage can
+    // be handed a run/turn id; the first insert wins and any
+    // re-entry (finishRun fault path calling it twice) is a no-op
+    // instead of a double charge. Only-additive: old rows and old
+    // callers (no key) are unaffected. MUST stay after v8: the
+    // migration loop is append-only in array order.
+    version: 9,
+    up(db) {
+      db.exec(`CREATE TABLE IF NOT EXISTS usage_dedup (
+        dedup_key TEXT PRIMARY KEY,
+        bot_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        at_ms INTEGER NOT NULL DEFAULT 0
+      );`);
+    },
+  },
 ];
+
+const LATEST_SCHEMA_VERSION = MIGRATIONS.reduce((mx, m) => Math.max(mx, m.version), 0);
+
+/* Account-uniqueness indexes (audit F-06): migrations v6/v8 try to
+ * create these, but if legacy duplicates make one fail, the
+ * migration still records itself complete and the index is NEVER
+ * retried — the schema_version gate makes the old comment ("the
+ * next deploy picks the index up") false. This check is therefore
+ * independent of the migration chain: it runs on EVERY boot after
+ * migrations, creates any missing index it can, and rewrites the
+ * kv marker to name only the indexes still missing. Safe to re-run:
+ * existing indexes are skipped by an existence probe, and a failed
+ * create changes nothing but the warning + marker. */
+const UNIQUE_INDEXES = [
+  ['uq_users_name', `CREATE UNIQUE INDEX uq_users_name ON users(name_lower) WHERE name_lower <> ''`],
+  ['uq_users_email', `CREATE UNIQUE INDEX uq_users_email ON users(email) WHERE email <> ''`],
+  ['uq_users_sso', `CREATE UNIQUE INDEX uq_users_sso ON users(sso_id) WHERE sso_id <> ''`],
+  ['uq_users_google', `CREATE UNIQUE INDEX uq_users_google ON users(google_sub) WHERE google_sub <> ''`],
+  ['uq_users_tg', `CREATE UNIQUE INDEX uq_users_tg ON users(tg_id) WHERE tg_id <> ''`],
+  ['uq_users_github', `CREATE UNIQUE INDEX uq_users_github ON users(github_id) WHERE github_id <> ''`],
+];
+export function ensureUniqueIndexes(handle) {
+  const skipped = [];
+  let usersTable = false;
+  try { usersTable = Boolean(handle.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()); } catch { usersTable = false; }
+  if (!usersTable) return { skipped };
+  for (const [name, sql] of UNIQUE_INDEXES) {
+    let exists = false;
+    try { exists = Boolean(handle.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").get(name)); } catch { exists = false; }
+    if (exists) continue;
+    // The github index needs the v8 column; if the column is not
+    // there yet (should not happen post-migrations) skip quietly.
+    try { handle.exec(sql); }
+    catch (e) {
+      skipped.push(name);
+      console.warn(`[db] unique index ${name} still missing (existing duplicates?): ${e.message}`);
+    }
+  }
+  try {
+    if (skipped.length) {
+      handle.prepare("INSERT INTO kv (key, value) VALUES ('uniq_index_skipped', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(skipped.join(','));
+    } else {
+      handle.prepare("DELETE FROM kv WHERE key = 'uniq_index_skipped'").run();
+    }
+  } catch { /* kv not ready — the warning above is the signal */ }
+  return { skipped };
+}
+
+/* Pre-migration snapshot (audit F-07): the moment a bad migration
+ * hurts most is exactly when no restore point exists, because the
+ * old boot order took its startup backup AFTER migrations ran.
+ * When the on-disk schema is behind and real tables already exist,
+ * take a verified snapshot BEFORE runMigrations touches anything.
+ * A snapshot failure aborts the boot (fail closed): upgrading
+ * without a restore point is the failure mode being fixed.
+ * Fresh installs (no schema_meta / version 0) skip this — there is
+ * nothing to lose yet. Pre-migration files are deliberately NOT
+ * matched by pruneBackups' app-* pattern, so they survive the
+ * normal retention roll until an operator removes them. */
+function snapshotBeforeMigration(handle) {
+  let version = 0;
+  try {
+    const row = handle.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get();
+    version = row ? Number(row.value) || 0 : 0;
+  } catch { return null; /* fresh file: no schema_meta yet */ }
+  if (version <= 0 || version >= LATEST_SCHEMA_VERSION) return null;
+  let hasTables = false;
+  try { hasTables = Boolean(handle.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()); } catch { hasTables = false; }
+  if (!hasTables) return null;
+  fs.mkdirSync(backupsDir, { recursive: true });
+  const target = path.join(backupsDir, `pre-migration-v${version}-${compactTs()}-${process.pid}.db`);
+  handle.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+  try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
+  const verdict = validateBackupFile(target);
+  if (!verdict.ok) {
+    try { fs.unlinkSync(target); } catch { /* best effort */ }
+    throw new Error(`pre-migration snapshot failed verification (${verdict.error || 'integrity_check failed'}) and was discarded; refusing to migrate without a restore point: ${target}`);
+  }
+  log.info('pre-migration snapshot taken', { fromVersion: version, file: target });
+  return target;
+}
+
+/* Verify a snapshot file WITHOUT opening it as the live database:
+ * integrity_check must pass; foreign_key_check violations are
+ * counted and REPORTED but do not fail the verdict — legacy imports
+ * deliberately carried rows whose parents were already gone
+ * (foreign_keys OFF during import), so gating on FK would discard
+ * every snapshot of such an install forever (audit F-07, bounded). */
+export function validateBackupFile(file) {
+  try {
+    const probe = new DatabaseSync(file, { readOnly: true });
+    try {
+      const row = probe.prepare('PRAGMA integrity_check').get();
+      const integrity = row ? Object.values(row)[0] : null;
+      let fkViolations = null;
+      try { fkViolations = probe.prepare('PRAGMA foreign_key_check').all().length; } catch { fkViolations = null; }
+      let schemaVersion = null;
+      try {
+        const sv = probe.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get();
+        schemaVersion = sv ? Number(sv.value) || 0 : 0;
+      } catch { schemaVersion = null; }
+      return { ok: integrity === 'ok', integrity, fkViolations, schemaVersion, error: integrity === 'ok' ? null : 'integrity_check failed' };
+    } finally { probe.close(); }
+  } catch (e) {
+    return { ok: false, integrity: null, fkViolations: null, schemaVersion: null, error: e.message };
+  }
+}
+/* Alias with restore-facing name: a restore candidate is validated
+ * by exactly this function before any file is swapped. */
+export const validateRestoreCandidate = validateBackupFile;
+
+/* RESTORE PROCEDURE (audit F-07 — documented, operator-run; there
+ * is deliberately no in-process restore endpoint, because swapping
+ * the file under a live process with an open WAL is how restores
+ * get corrupted):
+ *   1. Stop the service (pm2 stop starts-agents).
+ *   2. Validate the candidate first: node -e with
+ *      validateRestoreCandidate('<file>') from src/db.js — require
+ *      ok:true; note schemaVersion (older snapshots migrate forward
+ *      on boot, never backward).
+ *   3. In the data dir, move app.db aside (do not delete), and
+ *      REMOVE app.db-wal, app.db-shm and app.lock — a stale WAL
+ *      from the old database must never be replayed onto the
+ *      restored file.
+ *   4. Copy the snapshot to app.db, chmod 600.
+ *   5. Start the service; boot runs migrations + a fresh verified
+ *      startup backup. Check the health surface before traffic. */
 
 function runMigrations(db) {
   db.exec('CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -509,6 +653,11 @@ function pruneRetention(db) {
   db.prepare('DELETE FROM codes WHERE exp < ?').run(now);
   const auditFloor = now - Math.max(1, config.auditKeepDays) * 24 * 3600 * 1000;
   db.prepare('DELETE FROM audit_log WHERE at_ms > 0 AND at_ms < ?').run(auditFloor);
+  // Usage dedup claims (item 156 F-03) only guard against a
+  // finishRun re-entry, which happens within seconds if at all —
+  // 90 days of claims is vastly more than the window needs, and
+  // the table must not grow one row per run forever (audit R2-03).
+  try { db.prepare('DELETE FROM usage_dedup WHERE at_ms > 0 AND at_ms < ?').run(now - 90 * 24 * 3600 * 1000); } catch { /* table may predate v9 on a store-only DB */ }
 }
 
 /* ---------------------------- backups ------------------------------ */
@@ -549,20 +698,19 @@ export function runBackup() {
   try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
   // Integrity gate (v0.15): a snapshot failing integrity_check is
   // NOT a restore point — discard it and fail loudly rather than
-  // let it pose as one in the directory.
-  let ok = false;
-  try {
-    const probe = new DatabaseSync(target, { readOnly: true });
-    const row = probe.prepare('PRAGMA integrity_check').get();
-    ok = Boolean(row) && Object.values(row)[0] === 'ok';
-    probe.close();
-  } catch { ok = false; }
-  if (!ok) {
+  // let it pose as one in the directory. v0.21.0 (audit F-07): the
+  // same probe now also runs foreign_key_check — violations are
+  // counted into the health info and warned about, but do NOT
+  // discard the snapshot (legacy imports can legitimately carry
+  // orphan rows; see validateBackupFile).
+  const verdict = validateBackupFile(target);
+  if (!verdict.ok) {
     try { fs.unlinkSync(target); } catch { /* best effort */ }
     lastBackupInfo = { at: Date.now(), ok: false, file: null, error: 'integrity_check failed' };
     throw new Error('backup snapshot failed integrity_check and was discarded: ' + target);
   }
-  lastBackupInfo = { at: Date.now(), ok: true, file: target, error: null };
+  if (verdict.fkViolations) log.warn('backup snapshot has foreign key violations', { file: target, fkViolations: verdict.fkViolations });
+  lastBackupInfo = { at: Date.now(), ok: true, file: target, error: null, fkViolations: verdict.fkViolations, schemaVersion: verdict.schemaVersion };
   // Mirror to the optional second directory (a different mount is
   // the poor man's offsite; SA_BACKUP_DIR2, empty = off).
   if (config.backupDir2) {
@@ -601,7 +749,9 @@ export function getDb() {
     handle.exec('PRAGMA foreign_keys = ON');
     handle.exec('PRAGMA busy_timeout = 5000');
     try { fs.chmodSync(dbFile, 0o600); } catch { /* best effort */ }
+    snapshotBeforeMigration(handle);
     runMigrations(handle);
+    ensureUniqueIndexes(handle);
     importLegacy(handle);
     pruneRetention(handle);
   } catch (e) {

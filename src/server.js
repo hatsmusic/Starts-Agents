@@ -8,10 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import * as store from './store.js';
-import { getEngine, engineStatus } from './engines.js';
-import { getTool, toolDef, toolCatalog, buildPackage, workspaceUsage, isSensitiveFile, packagesUsage, shareEpochFor, enterDynTools, DELEGATION_MAX_DEPTH, cdpVaultLogin, gitConfigExecRisk, assertPublicUrl } from './tools.js';
+import { getEngine, engineStatus, effectiveModelForRun, modelContextTokens } from './engines.js';
+import { getTool, toolDef, toolCatalog, buildPackage, workspaceUsage, isSensitiveFile, packagesUsage, shareEpochFor, enterDynTools, snapshotDynTools, restoreDynTools, DELEGATION_MAX_DEPTH, cdpVaultLogin, gitConfigExecRisk, assertPublicUrl } from './tools.js';
 import * as sitelogin from './sitelogin.js';
-import { resolveOAuthApp, oauthAppStatus, setOAuthApp } from './oauth-apps.js';
+import { resolveOAuthApp, oauthAppStatus, setOAuthApp, oauthSecretHealth } from './oauth-apps.js';
 import { srvT, srvVariants } from './server-i18n.js';
 import * as mcp from './mcp.js';
 import { probeToolchain } from './sandbox-env.js';
@@ -19,7 +19,7 @@ import * as sandboxModules from './modules.js';
 import { requestApproval, resolveApproval, listPending, getPending, cancelByRun } from './approvals.js';
 import { rateHit } from './ratelimit.js';
 import { buildContextWithMeta } from './context.js';
-import { memorySystemText, sedimentCompressed } from './memory.js';
+import { memorySystemText, sedimentCompressed, resetSedimentMarkers } from './memory.js';
 import { commandRisk, isReadOnlyShell, isExecConfigPath } from './risk.js';
 import { shellCardSummary } from './shell-summary.js';
 import { buildI18nSlice, I18N_LANGS } from './i18n-slice.js';
@@ -45,10 +45,11 @@ import { dbPaths, getBackupHealth, setBackupAlertHook } from './db.js';
 import { log } from './log.js';
 import crypto from 'node:crypto';
 import { sendMail, mailEnabled } from './mailer.js';
-import { AVATAR_PRESETS, AVATAR_COLORS, AVATAR_MAX_BYTES, AVATAR_FILE_RE, AVATAR_MIME, normalizeAvatar, sniffImageExt } from './avatars.js';
+import { AVATAR_PRESETS, AVATAR_COLORS, AVATAR_MAX_BYTES, AVATAR_FILE_RE, AVATAR_MIME, normalizeAvatar, sniffImageExt, deleteAvatarImageFile } from './avatars.js';
 import { scrubText, scrubValue, scrubErrorMessage, cleanReplyText } from './scrub.js';
-import { monitorAvailable, monitorPrefOn, setMonitorPref, projectMonitorEvent } from './monitor.js';
-import { viewerAvailable, openViewerSession, closeViewerSession, getViewerSession, attachStream, takeControl, releaseControl, pauseStream, resumeStream, setStreamTierMode, stageInput, stageDrive, awaitStageControl, readStageFrame, readStageFrameTimes, onStageEnded, listStagesForUser } from './browser-viewer.js';
+import { redactUserText } from './scrub.js';
+import { monitorAvailable, monitorPrefOn, setMonitorPref, projectMonitorEvent, monitorSubscriptionGate } from './monitor.js';
+import { viewerAvailable, openViewerSession, closeViewerSession, getViewerSession, attachStream, takeControl, releaseControl, pauseStream, resumeStream, setStreamTierMode, stageInput, stageDrive, awaitStageControl, readStageFrame, readStageFrameTimes, onStageEnded, listStagesForUser, framesRoot, removeStageFrames } from './browser-viewer.js';
 import { filterMcpDefsForSeat, nativeToolsExcludedForSeat, boxView, boxToken, boxFrame, boxTakeover, boxInput, boxRelease } from './browser-box.js';
 
 // Module installs audit through the same log as everything else.
@@ -363,7 +364,20 @@ function isOllamaShapedProvider(provider, rec) {
  * conversation / use tools" (the catalog's tools:false marks are
  * hints for pickers only). Results cache per baseUrl+model for
  * 5 minutes; ANY failure or unknown shape returns null — unknown
- * always means "allow", never a block. */
+ * always means "allow", never a block.
+ * Item 154 refinement: 'completion' alone does NOT prove a chat
+ * model. codegemma:2b (the reported failure) reports capabilities
+ * ['completion','insert'] but ships a FIM code-completion template
+ * (verified against the registry manifest AND a local /api/show:
+ * the template is `{{ if .Suffix }}<|fim_prefix|>…{{ else }}
+ * {{ .Prompt }}` — no message iteration, no turn markers — and its
+ * only stop tokens are the FIM/file separators). Driven through
+ * the chat endpoint it treats the transcript as a document to
+ * continue: code fragments and `[root] hi` loops, never a reply.
+ * So chat ALSO requires the model's template to carry chat-turn
+ * structure (see completionOnlyTemplate below). The judgment only
+ * ever fires on a MEASURED template — a missing/empty template
+ * stays unknown = allow, exactly like every other leg here. */
 const capCache = new Map(); // `${nativeRoot}|${model}` -> { at, caps|null }
 const CAP_TTL_MS = 5 * 60 * 1000;
 /* A null (unmeasured) result gets a much shorter leash (item 150
@@ -374,6 +388,22 @@ const CAP_TTL_MS = 5 * 60 * 1000;
 const CAP_NULL_TTL_MS = 30 * 1000;
 const capFresh = (hit) => Boolean(hit) && Date.now() - hit.at < (hit.caps ? CAP_TTL_MS : CAP_NULL_TTL_MS);
 const ollamaNativeRoot = (baseUrl) => String(baseUrl || '').replace(/\/$/, '').replace(/\/v1$/, '');
+/* Chat-turn markers for the item 154 template judgment. Any ONE of
+ * these in a template proves it renders conversation turns (every
+ * instruct/chat model in the registry carries at least one: Llama
+ * <start_of_turn>/<|begin_of_text|>/[INST], ChatML <|im_start|>,
+ * Gemma instruct <start_of_turn>, Phi <|user|>/<|system|>, Alpaca
+ * ### Instruction, Vicuna/DeepSeek USER:/ASSISTANT: lines). A
+ * template with NONE of them AND no system-prompt slot (.System)
+ * cannot render roles at all — it is a raw completion template
+ * (codegemma's FIM shape is the proven case). Missing/empty
+ * template → false (unknown = allow). */
+const CHAT_TEMPLATE_MARKERS = ['.Messages', '<start_of_turn>', '<|im_start|>', '[INST]', '<|user|>', '<|assistant|>', '<|system|>', '<|begin_of_text|>', '### Instruction', '### Human', '### User', 'USER:', 'User:', 'ASSISTANT:', 'Assistant:', 'Human:', '｜User｜', '｜Assistant｜'];
+function completionOnlyTemplate(tpl) {
+  if (typeof tpl !== 'string' || !tpl.trim()) return false;
+  if (tpl.includes('.System')) return false;
+  return !CHAT_TEMPLATE_MARKERS.some((mk) => tpl.includes(mk));
+}
 async function getModelCapabilities(provider, model) {
   const m = String(model || '').trim();
   if (!m || !provider || !isOllamaShapedProvider(provider, null)) return null;
@@ -391,7 +421,17 @@ async function getModelCapabilities(provider, model) {
     if (res.ok) {
       const data = await res.json().catch(() => null);
       const list = Array.isArray(data?.capabilities) ? data.capabilities : null;
-      if (list) caps = { tools: list.includes('tools'), chat: list.includes('completion') };
+      if (list) {
+        const completionOnly = list.includes('completion') && completionOnlyTemplate(data?.template);
+        caps = { tools: list.includes('tools'), chat: list.includes('completion') && !completionOnly };
+        // Why a non-chat model cannot chat (item 154): the
+        // pre-flight wording must name the REAL class — calling a
+        // code-completion model an "embedding model" would just be
+        // a new wrong sentence. 'embed' keeps the item 150 class
+        // (no completion capability at all); 'completion' is the
+        // template-judged class.
+        if (!caps.chat) caps.chatBlock = completionOnly ? 'completion' : 'embed';
+      }
     }
   } catch { caps = null; }
   clearTimeout(timer);
@@ -480,7 +520,10 @@ async function botProviderWarning(bot) {
   if (!rec || !isLocalProviderRecord(rec)) return null;
   const resolved = resolveProvider(bot);
   if (!resolved || resolved.keyError) return null;
-  const model = String(bot.localModel || bot.model || providerModels(rec)[0] || '').trim();
+  // The warning must judge the model the run will actually use —
+  // the single effective-model function (audit R2-05); a hand-
+  // rolled priority here diverged in the fingerprint corner.
+  const model = effectiveModelForRun(bot, resolved);
   const verdict = capabilityVerdict(await getModelCapabilities(resolved, model));
   if (verdict === 'notChat') return { providerWarning: 'localModelNotChat', providerWarningModel: model };
   if (verdict === 'noTools') return { providerWarning: 'localModelNoTools', providerWarningModel: model };
@@ -525,8 +568,12 @@ function isPrivateHost(hostname) {
  * 169.254.x or a LAN address sailed through registration and the
  * server then fetched internal services (its own Ollama among
  * them) on the registrant's behalf. assertPublicUrl resolves the
- * name and refuses when ANY answer is private. Registration, edit,
- * the fetch-models probe and every serving turn all gate on this;
+ * name and refuses when ANY answer is private. Registration, edit
+ * and the fetch-models probe gate on this, and — since item 156
+ * F-02 — every serving turn re-gates NAME-based picks on it too
+ * (chatTurn refuses the turn when the pick's name no longer
+ * validates; literal-IP picks are fixed addresses that every
+ * write path already gated, so there is nothing to re-resolve);
  * the per-turn re-check shrinks the DNS-rebinding window to the
  * fetch itself (the fetch does not pin the resolution — the same
  * documented residual class as the browse guard). */
@@ -577,6 +624,36 @@ function revokeVolunteerArtifacts(userId) {
 // who may DECIDE a shell approval card, not whether an existing
 // grant skips one.
 const oauthStates = new Map(); // Google OAuth state -> expiry
+/* OAuth state hygiene (item 156 A-03/A-04): states are BROWSER-
+ * BOUND — starting a social flow sets the state in an HttpOnly
+ * cookie and the callback requires the cookie to match the state
+ * parameter, so a callback URL captured by one browser cannot be
+ * replayed into another (login CSRF: the victim would be signed
+ * into the attacker's account, displacing their own session).
+ * The map itself is swept and capped: the start endpoints are
+ * unauthenticated, and an unbounded map is a memory-exhaustion
+ * surface. */
+const OAUTH_STATE_CAP = 500;
+function oauthStateSet(key, exp) {
+  const now = Date.now();
+  for (const [k, v] of oauthStates) if (v < now) oauthStates.delete(k);
+  while (oauthStates.size >= OAUTH_STATE_CAP) {
+    const oldest = oauthStates.keys().next().value;
+    if (oldest === undefined) break;
+    oauthStates.delete(oldest);
+  }
+  oauthStates.set(key, exp);
+}
+function oauthStateCookie(req, state) {
+  return `sa_oauth_state=${state}; Path=/api/auth; Max-Age=600; HttpOnly; SameSite=Lax${isHttps(req) ? '; Secure' : ''}`;
+}
+function oauthStateClearCookie(req) {
+  return `sa_oauth_state=; Path=/api/auth; Max-Age=0; HttpOnly; SameSite=Lax${isHttps(req) ? '; Secure' : ''}`;
+}
+function oauthStateOk(req, key, st) {
+  if (!st || !oauthStates.has(key) || oauthStates.get(key) < Date.now()) return false;
+  return parseCookies(req).sa_oauth_state === st;
+}
 const sessionGrants = new Map(); // `${userId}:${botId}:${tool}` -> expiresAt
 const GRANT_TTL = 30 * 60 * 1000;
 function grantKey(userId, botId, tool) { return `${userId || 'anon'}:${botId}:${tool}`; }
@@ -830,12 +907,25 @@ async function buildMcpToolDefs(userId, bot) {
     try { return { row, remote: await mcp.mcpListTools(row, { timeoutMs: 12000 }) }; }
     catch { return { row, remote: null }; }
   }));
+  const flat = [];
   for (const { row, remote } of listed) {
     if (!remote) continue;
     for (const t of remote || []) {
       const toolName = String(t?.name || '');
       if (!toolName) continue;
-      const name = ('mcp__' + row.slug + '__' + toolName.replace(/[^a-zA-Z0-9_-]/g, '_')).slice(0, 64);
+      flat.push({ row, t, toolName });
+    }
+  }
+  // Collision-free names (item 156 E-10/S-6): the naming policy
+  // lives in mcp.js — a hash suffix instead of the old plain
+  // slice(0,64) truncation, plus cross-row dedup (a user server
+  // slugged 'box' vs the platform Box row). Names are
+  // byte-identical to the old scheme whenever nothing collides
+  // or overflows, so stored grants/cards keyed by name stay valid.
+  const names = mcp.uniqueMcpToolNames(flat.map(({ row, toolName }) => ({ row, toolName })));
+  flat.forEach(({ row, t, toolName }, fi) => {
+    {
+      const name = names[fi];
       const exec = mcp.isMcpExecClass(toolName);
       defs.push({
         name,
@@ -858,7 +948,12 @@ async function buildMcpToolDefs(userId, bot) {
             // to interrupt an in-flight remote call instead of
             // parking the whole run until the server's own
             // 120-600s clock fires.
-            const result = await mcp.mcpCallTool(row, toolName, input, { signal: ctx.signal || null });
+            // The actor rides along (item 156 E-05/S-4): the Box
+            // tool gate registered by browser-box stays inert
+            // until callers identify themselves — this is the
+            // identification. Box-internal card calls pass
+            // boxInternal on their own side.
+            const result = await mcp.mcpCallTool(row, toolName, input, { signal: ctx.signal || null, actorUserId: userId, actorBotId: bot.id });
             const mat = mcp.materializeMcpResult(result, { workspace: ctx.workspace, slug: row.slug });
             store.audit({ bot: bot.id, kind: 'mcp_call', userId, server: row.slug, tool: toolName, ok: true, ms: Date.now() - t0 });
             const text = typeof mat === 'string' ? mat : String(mat?.text ?? '');
@@ -877,7 +972,7 @@ async function buildMcpToolDefs(userId, bot) {
         },
       });
     }
-  }
+  });
   /* Browser seat (v0.18.0, §8.2): a bot seated on the HOST loses
    * the Box server's browser_* dynamic tools (judged on the
    * REMOTE name in def.mcp.toolName — the Box's shell/desktop/
@@ -925,7 +1020,18 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   // history remains available through the export endpoint.
   const totalMsgs = store.countMessages(bot.id);
   const pageTail = store.getMessagesPage(bot.id, { limit: 400 }).messages;
-  const ctxMeta = buildContextWithMeta(pageTail, { tokenBudget: config.contextTokenBudget, lang });
+  // Window-aware history budget (item 156 C-03 wiring): the
+  // history is built before this turn's provider resolution, so
+  // the window is estimated from the bot's BOUND provider and the
+  // engine's one effective-model function; a volunteer pick that
+  // swaps the model afterwards is still bounded by the engine's
+  // own post-assembly trim. Unknown/cloud windows stay null and
+  // the configured budget rules alone, as before.
+  const boundProv = bot.providerId ? store.getProvider(bot.providerId) : null;
+  const ctxMeta = buildContextWithMeta(pageTail, {
+    tokenBudget: config.contextTokenBudget, lang,
+    modelContextTokens: modelContextTokens(effectiveModelForRun(bot, boundProv), boundProv),
+  });
   const history = ctxMeta.history;
   // Long-term memory sedimentation (v0.15.1, item 70 B5): whatever
   // the window just compressed out is written into the bot's
@@ -959,7 +1065,13 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   // transcripts. Assistant messages stay unattributed — the bot is
   // the speaker by definition.
   store.pushMessage(bot.id, {
-    role: 'user', text: extras.storedText ?? userText, at: new Date().toISOString(),
+    // Stored user text is secret-redacted (item 156 B-04/S-2): a
+    // pasted API key must not sit in the transcript (and later in
+    // MEMORY.md via sedimentation) forever. Only secret SHAPES are
+    // cut — the user's paths and prose stay readable. The live
+    // turn above already used the verbatim text; this governs the
+    // stored copy and every future context build from it.
+    role: 'user', text: redactUserText(extras.storedText ?? userText), at: new Date().toISOString(),
     ...(extras.delegated
       ? { delegated: extras.delegated }
       : (extras.userId ? { by: { userId: extras.userId, name: extras.userName || '' } } : {})),
@@ -980,7 +1092,16 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   // no stage is live or the user holds control, and the tools
   // fall back to their one-shot paths.
   ctx.userId = extras.userId || null;
-  ctx.browserStage = extras.userId ? stageDrive(extras.userId, bot.id) : null;
+  // Per-call resolution (item 156 E-04/S-3): the binding used to
+  // be one stageDrive() snapshot per turn, so a stage opened
+  // MID-turn (the user opens the live card while the bot works)
+  // stayed invisible to the browsing tools until the next turn.
+  // The seam now resolves at each call; a missing stage resolves
+  // null and the tools take their one-shot paths, as before.
+  ctx.browserStage = extras.userId ? {
+    browse: (u) => { const d = stageDrive(extras.userId, bot.id); return d ? d.browse(u) : Promise.resolve(null); },
+    shot: (u) => { const d = stageDrive(extras.userId, bot.id); return d ? d.shot(u) : Promise.resolve(null); },
+  } : null;
   // Multi-bot collaboration: a bot may delegate a self-contained task
   // to a teammate with ask_teammate. The teammate runs a REAL turn of
   // its own (own workspace, model, transcript, approvals — forwarded
@@ -1055,6 +1176,13 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
         if (JSON.stringify(readBotTasks(target.id)) !== tasksBefore) finalizeBotTasks(target.id, status);
       } catch { /* convergence never breaks a delegation */ }
     };
+    // Dynamic-tool scope hygiene (item 156 D-04): the sub-turn
+    // enters its OWN MCP scope via enterWith, which mutates this
+    // async context in place — without a restore, the parent
+    // turn's remaining iterations would see the sub-bot's tool
+    // set (and its defs' run closures) as their own. Snapshot
+    // before, restore in finally; nested delegations stack.
+    const dynSnap = snapshotDynTools();
     try {
       const reply = await chatTurn(target, String(task), subEmit, lang, {
         depth: depth + 1,
@@ -1078,13 +1206,28 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
         onApprovalWait: (waiting) => { subLive.status = waiting ? 'awaiting_approval' : 'running'; },
         onUsage: (u) => { lastUsage = u; },
       });
-      if (lastUsage) store.recordUsage(target.id, lastUsage, extras.userId || null, { providerId: subTurnMeta.providerId || undefined, ownEndpoint: Boolean(subTurnMeta.ownEndpoint) });
       convergeSubTasks(subController.signal.aborted ? 'cancelled' : 'succeeded');
       return reply || '(teammate finished without a text reply)';
     } catch (e) {
       convergeSubTasks(subController.signal.aborted ? 'cancelled' : 'failed');
       throw e;
     } finally {
+      restoreDynTools(dynSnap);
+      // Usage lands on EVERY exit (item 156 F-04/S-2): a failed or
+      // aborted sub-turn still burned tokens, and the top level has
+      // always accounted errors the same way. finally runs exactly
+      // once per delegation, so this single write site cannot
+      // double-count (the old success-path site is gone).
+      // IDEMPOTENCY BASIS (audit R2-02): deliberately NO dedup key
+      // here — the finally single-write-point IS the invariant.
+      // Never pass the parent's run.id as a key (it would collide
+      // with finishRun's claim and swallow one side's accounting),
+      // and if a second write site ever appears, it must mint a
+      // per-delegation key of its own at that time.
+      if (lastUsage) {
+        try { store.recordUsage(target.id, lastUsage, extras.userId || null, { providerId: subTurnMeta.providerId || undefined, ownEndpoint: Boolean(subTurnMeta.ownEndpoint) }); }
+        catch { /* accounting never breaks a delegation */ }
+      }
       // Release the slot on EVERY exit — completion, error, abort —
       // but only if the entry is still ours (identity check, the
       // same discipline as the chat route's timers).
@@ -1108,9 +1251,14 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   ctx.vaultLogin = async (entryRef) => {
     const ref = String(entryRef || '').trim();
     const granted = sitelogin.loginsGrantedTo(bot.id);
-    const entry = granted.find((e) => e.id === ref || String(e.label || '').toLowerCase() === ref.toLowerCase()) || null;
+    // Filling resolves through the owner-scoped resolver (item 156
+    // B-05/S-1): list rows no longer carry ciphertext, so the
+    // fillable row comes from resolveGrantedLogin (owner-limited,
+    // grant-checked), and the same-account existence probe passes
+    // the bot owner's id — a foreign entry is never confirmed.
+    const entry = sitelogin.resolveGrantedLogin(bot.id, ref);
     if (!entry) {
-      const any = sitelogin.findLoginByRef(ref);
+      const any = sitelogin.findLoginByRef(ref, bot.ownerId);
       if (any) {
         store.audit({ bot: bot.id, kind: 'vault_login_fail', entry: any.id, domain: any.domain, status: 'not_granted', by: extras.userName || null });
         return { status: 'not_granted', text: `site_login: the vault entry "${any.label}" (${any.domain}) exists but is not granted to ${bot.name}. The owner can grant it in the vault. Do not ask the user for the password instead.` };
@@ -1123,7 +1271,14 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
       store.audit({ bot: bot.id, kind: 'vault_login_fail', entry: entry.id, domain: entry.domain, status: 'failed', by: extras.userName || null });
       return { status: 'failed', text: 'site_login: the browser sandbox module is not installed, so no sign-in can be performed.' };
     }
-    const secret = sitelogin.siteLoginSecret(entry);
+    let secret;
+    try { secret = sitelogin.siteLoginSecretStrict(entry); }
+    catch {
+      // Strict read (item 156 B-18/S-1): a corrupt entry fails
+      // loudly instead of typing empty credentials into the form.
+      store.audit({ bot: bot.id, kind: 'vault_login_fail', entry: entry.id, domain: entry.domain, status: 'secret_unreadable', by: extras.userName || null });
+      return { status: 'failed', text: 'site_login: the stored credentials for this entry could not be decrypted (the vault key may have changed). Ask the owner to re-save the entry in the vault.' };
+    }
     const profileDir = path.join(config.dataDir, 'browser-profiles', bot.id);
     // The kept browser profile holds live site sessions (v0.15.7,
     // P2): it lives under owner-only permissions — the tree is
@@ -1209,21 +1364,57 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     const rawProv = bot.providerId ? store.getProvider(bot.providerId) : null;
     if (pick?.type === 'endpoint') {
       const rec = pick.rec;
+      // Per-turn revalidation (item 156 F-02): registration checked
+      // the address ONCE, but a DNS name can be re-pointed at an
+      // internal target afterwards — the comment on
+      // volunteerEndpointPublic always claimed every serving turn
+      // gates on it; the serving path never actually called it.
+      // Now it does for every NAME-based endpoint: the name is
+      // re-resolved and a failed check refuses the turn in plain
+      // words, and the daily-cap exemption never engages (the
+      // ownEndpoint flag is only set after this gate). A literal-IP
+      // endpoint is exempt from the re-check by construction: an
+      // IP has no DNS to rebind, the address in the record is the
+      // address fetched, and every write path for it (create at
+      // the volunteer route, edits, the models probe) re-runs the
+      // full public gate — a private literal can only exist via
+      // direct DB access, which is operator trust, not a member
+      // attack surface.
+      let recHost = '';
+      try { recHost = new URL(rec.baseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { /* unparsable — the check below refuses */ }
+      const literalIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(recHost) || recHost.includes(':');
+      if (!literalIp && !(await volunteerEndpointPublic(rec.baseUrl))) {
+        let host = '';
+        try { host = new URL(rec.baseUrl).hostname; } catch { /* unparsable — refused either way */ }
+        const msg = srvT(lang, 'volunteerEndpointNotPublic', { host: host || String(rec.baseUrl || '') });
+        emit('token', { text: msg });
+        store.pushMessage(bot.id, { role: 'assistant', text: msg, at: new Date().toISOString() });
+        return msg;
+      }
       let apiKey = '';
       let keyError = false;
       if (rec.keyEnc) { try { apiKey = decrypt(rec.keyEnc); } catch { keyError = true; } }
       provider = { baseUrl: rec.baseUrl, model: providerModels(rec)[0] || '', models: providerModels(rec), apiKey, keyError };
-      effBot = { ...bot, model: providerModels(rec)[0] || '' };
+      // Stamp the resolution onto effBot.localModel (item 156
+      // C-01): the engine's effective-model fingerprint corner
+      // (stored bot.model coinciding with a provider default)
+      // cannot misread a turn the server has already resolved.
+      effBot = { ...bot, model: providerModels(rec)[0] || '', localModel: providerModels(rec)[0] || '' };
       turnMeta.ownEndpoint = true;
       turnMeta.providerId = rec.id;
     } else if (provider && rawProv && rawProv.ownerId === 'system') {
       const wanted = pick?.type === 'model' ? pick.tag
-        : (bot.localModel && bot.ownerId && auth.volunteerOf(bot.ownerId) ? bot.localModel : '');
+        // The bot-level localModel override is a VOLUNTEER unlock
+        // (item 156 F-08): it used to key on the bot OWNER being a
+        // volunteer, which extended the unlock to ANYONE chatting
+        // with that bot. It now keys on the REQUESTER, exactly like
+        // the endpoint-pick face beside it.
+        : (bot.localModel && extras.userId && auth.volunteerOf(extras.userId) ? bot.localModel : '');
       if (wanted) {
         const installed = (await ollamaInstalled()) || [];
         if (installed.includes(wanted)) {
           provider = { ...provider, model: wanted };
-          effBot = { ...bot, model: wanted };
+          effBot = { ...bot, model: wanted, localModel: wanted };
           turnMeta.providerId = rawProv.id;
         }
       }
@@ -1255,7 +1446,7 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   // raw upstream complaint. Refuse up front with the stable key so
   // the client can say, in the user's language, exactly what to fix
   // (pick a model in the bot editor / on the provider).
-  if (engineName === 'openai' && provider && !String(effBot.model || provider.model || '').trim()) {
+  if (engineName === 'openai' && provider && !effectiveModelForRun(effBot, provider)) {
     throw codedError('errNoModel');
   }
   // Local provider pre-flight (item 149): a bot bound to a LOCAL
@@ -1269,7 +1460,7 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   if (engineName === 'openai' && provider && !turnMeta.ownEndpoint) {
     const boundRec = bot.providerId ? store.getProvider(bot.providerId) : null;
     if (boundRec && isLocalProviderRecord(boundRec)) {
-      const wantModel = String(effBot.model || provider.model || '').trim();
+      const wantModel = effectiveModelForRun(effBot, provider);
       const reach = await probeProviderReach(provider, wantModel);
       if (reach !== 'ok') {
         const key = (reach === 'missing' ? 'localModelMissing' : 'localDown') + (canFixProvider ? 'Owner' : 'Member');
@@ -1297,10 +1488,15 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
   let noToolsNotePending = false;
   let turnModel = '';
   if (engineName === 'openai' && provider) {
-    turnModel = String(effBot.model || provider.model || '').trim();
-    const verdict = capabilityVerdict(await getModelCapabilities(provider, turnModel));
+    // Judged on the engine's OWN effective model (item 156 C-01
+    // wiring): a bot carrying only a localModel override used to
+    // be capability-judged — and reach-judged above — on the
+    // provider default it would never actually run.
+    turnModel = effectiveModelForRun(effBot, provider);
+    const turnCaps = await getModelCapabilities(provider, turnModel);
+    const verdict = capabilityVerdict(turnCaps);
     if (verdict === 'notChat') {
-      const key = 'localModelNotChat' + (canFixProvider ? 'Owner' : 'Member');
+      const key = (turnCaps && turnCaps.chatBlock === 'completion' ? 'localModelCompletion' : 'localModelNotChat') + (canFixProvider ? 'Owner' : 'Member');
       const msg = srvT(lang, key, { model: turnModel });
       emit('token', { text: msg });
       store.pushMessage(bot.id, { role: 'assistant', text: msg, at: new Date().toISOString() });
@@ -1375,7 +1571,11 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     try { host = new URL(url).hostname; } catch { /* no url on this call */ }
     emit('browser', {
       seat: 'box',
-      stageId: 'box-' + (extras.runId || 'adhoc'),
+      // Per-user stage even without a run (item 156 E-11/S-7):
+      // the bare 'box-adhoc' id was shared by every user, and the
+      // frame sampler now refuses cross-owner writes — an
+      // underived id would leave everyone's adhoc replay empty.
+      stageId: 'box-' + (extras.runId || ('adhoc-' + crypto.createHash('sha256').update(String(extras.userId || '') + ':' + bot.id).digest('hex').slice(0, 12))),
       tool: remote,
       url,
       host,
@@ -1494,13 +1694,15 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
           //    decider the endpoint accepts.
           const ownsBot = Boolean(bot.ownerId && extras.userId && bot.ownerId === extras.userId);
           const siteOwner = extras.userRole === 'owner';
-          // MCP tools (v0.15): session grants may skip their card,
-          // persistent grants NEVER apply — external tools are not
-          // permanently pre-cleared, by design (and none can exist:
-          // the decide endpoint refuses to store one for them).
-          const grantSkip = (ownsBot || siteOwner)
-            ? (hasGrant(extras.userId, bot.id, tool.name) || (!tool.mcp && store.hasPersistentGrant(extras.userId, bot.id, tool.name)))
-            : hasGrant(extras.userId, bot.id, tool.name);
+          // MCP tools (v0.15; item 156 E-02): NO grant of either
+          // shape skips their card — external tools are never
+          // pre-cleared. The write side enforces the same rule
+          // twice (decide-endpoint downgrade + no session store);
+          // this read-side false is the third belt.
+          const grantSkip = tool.mcp ? false
+            : (ownsBot || siteOwner)
+              ? (hasGrant(extras.userId, bot.id, tool.name) || store.hasPersistentGrant(extras.userId, bot.id, tool.name))
+              : hasGrant(extras.userId, bot.id, tool.name);
           // Exec-config writes (v0.15.7, item 118-1): a write into
           // .git/ (config, hooks) or onto .gitmodules is not file
           // editing, it is planting instructions for the next git
@@ -1576,7 +1778,17 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
             if (extras.signal && extras.signal.aborted) {
               permitted = false;
             } else if (decision === 'allow_session') {
-              sessionGrants.set(grantKey(extras.userId, bot.id, tool.name), Date.now() + GRANT_TTL);
+              // MCP tools never take a session grant (item 156
+              // E-02, belt to the decide endpoint's downgrade): the
+              // decision arriving here as allow_session for an MCP
+              // tool can only come from a path that skipped the
+              // downgrade — honor the one call, store nothing.
+              // The grant is keyed to the DECIDER (item 156 D-03),
+              // matching allow_always below: an owner deciding a
+              // member's card must not mint the member a 30-minute
+              // skip (which for run_shell would also bypass the
+              // owner-only decide fence entirely).
+              if (!tool.mcp) sessionGrants.set(grantKey(decidedBy?.id || extras.userId, bot.id, tool.name), Date.now() + GRANT_TTL);
               permitted = true;
             } else if (decision === 'allow_always') {
               // Persistent grant (v0.12, user direction): scoped to
@@ -1762,7 +1974,19 @@ async function chatTurn(bot, userText, emit, lang, extras = {}) {
     assistant = assistant ? assistant + '\n\n' + note : note;
     emit('token', { text: assistant === note ? note : '\n\n' + note });
   }
-  store.pushMessage(bot.id, { role: 'assistant', text: scrubText(assistant, { workspace: ctx.workspace }), at: new Date().toISOString() });
+  // Item 154: a turn the user stopped (or that was aborted while
+  // the engine sat at a yield point, so it returned normally with
+  // partial text) is stored WITH an `aborted` mark. The stored
+  // transcript still shows it — the user saw those tokens live —
+  // but buildContextWithMeta keeps marked messages OUT of every
+  // later turn's context: a half-finished remnant re-fed as if it
+  // were a completed reply teaches the model the remnant's shape
+  // (the [root]-continuation loop fed on exactly this). Turns that
+  // THREW on abort never reach this line (loopErr rethrows above),
+  // so they were never stored at all — unchanged.
+  const storedMsg = { role: 'assistant', text: scrubText(assistant, { workspace: ctx.workspace }), at: new Date().toISOString() };
+  if (extras.signal && extras.signal.aborted) storedMsg.aborted = true;
+  store.pushMessage(bot.id, storedMsg);
   return assistant;
 }
 
@@ -1809,7 +2033,23 @@ export function tokenEq(presented) {
 }
 
 function currentUser(req) {
-  if (!auth.hasUsers() && !config.accessToken) return { id: 'local', name: 'Local', role: 'owner', implicit: true };
+  if (!auth.hasUsers() && !config.accessToken) {
+    // Implicit owner is a LOCAL convenience (item 156 A-11): the
+    // production shape is a loopback bind behind a same-box nginx,
+    // so "the socket peer is loopback" no longer proves "the
+    // operator's own hands" — every proxied public visitor arrives
+    // from 127.0.0.1 too. The grant therefore requires a loopback
+    // peer AND no X-Forwarded-For (a genuinely local request never
+    // carries one; a proxied one always does). Proxied visitors in
+    // the first-run window get the setup screen instead — first
+    // registration stays open (rate-limited, A-06) so the operator
+    // can still claim the instance, but nobody is owner by merely
+    // arriving.
+    const peer = String(req.socket?.remoteAddress || '');
+    const peerLoopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+    if (peerLoopback && !req.headers['x-forwarded-for']) return { id: 'local', name: 'Local', role: 'owner', implicit: true };
+    return null;
+  }
   const cookies = parseCookies(req);
   const u = cookies.sa_session ? auth.sessionUser(cookies.sa_session) : null;
   if (u) return u;
@@ -1955,6 +2195,20 @@ function checkProviderKeys() {
     checked += h.checked;
     for (const id of h.bad) bad.push('mcp:' + id);
   } catch { /* the MCP store may not be migrated yet on a first boot; provider result stands */ }
+  // The remaining cipher surfaces join the same boot check
+  // (item 156 B-02/S-4): site-login secrets and OAuth app secrets
+  // — the rotation scripts cover all five surfaces now, and the
+  // boot warning must be able to see every one of them.
+  try {
+    const h = sitelogin.siteLoginSecretHealth();
+    checked += h.checked;
+    for (const id of h.bad) bad.push('login:' + id);
+  } catch { /* table may not exist on a first boot */ }
+  try {
+    const h = oauthSecretHealth();
+    checked += h.checked;
+    for (const id of h.bad) bad.push('oauth:' + id);
+  } catch { /* ditto */ }
   vaultKeyErrors = bad.length;
   if (bad.length) {
     // Loud at boot, silent about content: ids + count only — never
@@ -2064,7 +2318,13 @@ for (const b of store.listBots()) {
 }
 function startRun(bot, title, userId = null) {
   const run = {
-    id: 'run_' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36),
+    // Unguessable by construction (item 156 A-01/F-01): the old
+    // shape was a millisecond timestamp plus a 10,000-value
+    // Math.random suffix — and the roster hands every signed-in
+    // user the exact start millisecond, so another member's runId
+    // was enumerable in ~10k tries. 96 bits of crypto random; the
+    // timestamp lives on startedAt where it belongs.
+    id: 'run_' + crypto.randomBytes(12).toString('base64url'),
     botId: bot.id, botName: bot.name, userId, title: String(title || '').slice(0, 120),
     prompt: String(title || '').slice(0, 2000),
     startedAt: Date.now(), endedAt: null, status: 'running', error: null,
@@ -2561,6 +2821,10 @@ function resolveAvatarSet(body, old) {
   if (!raw || typeof raw !== 'object' || raw.kind === 'image') return { error: 'avatarBadType' };
   const av = normalizeAvatar(raw);
   if (!av || av.kind !== raw.kind || av.value !== raw.value) return { error: 'avatarBadType' };
+  // Switching AWAY from an uploaded image retires its file
+  // (item 156 F-26/S-8): the image→image branch above already
+  // unlinks the predecessor; this branch used to leak it forever.
+  if (old && old.kind === 'image') { try { deleteAvatarImageFile(config.dataDir, old); } catch { /* best effort */ } }
   return { avatar: av };
 }
 
@@ -2724,9 +2988,20 @@ const server = http.createServer(async (req, res) => {
     // X-Forwarded-For is only trusted when the operator says a proxy
     // in front of us sets it (audit fix: otherwise any direct client
     // can spoof it to rotate their rate-limit identity at will).
-    const clientIp = process.env.TRUST_PROXY
-      ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim()
-      : String(req.socket.remoteAddress || '');
+    // Client IP for rate limiting (item 156 A-07): production is
+    // nginx on the SAME box proxying to a loopback bind, so the
+    // socket peer is 127.0.0.1 for every real visitor — judging by
+    // the socket alone collapses every IP-dimension limiter into
+    // one site-wide bucket (one flooder locks out all logins). The
+    // rule is now the session-display rule: a LOOPBACK peer is a
+    // local reverse proxy whose X-Forwarded-For first hop is the
+    // real client (only the local proxy can speak from loopback,
+    // so the header is trustworthy exactly there); TRUST_PROXY
+    // extends the same trust to a named non-loopback proxy.
+    const peerAddr = String(req.socket.remoteAddress || '');
+    const xffFirst = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const peerLoopback = peerAddr === '127.0.0.1' || peerAddr === '::1' || peerAddr === '::ffff:127.0.0.1';
+    const clientIp = (process.env.TRUST_PROXY || (peerLoopback && xffFirst)) ? (xffFirst || peerAddr) : peerAddr;
     // Session display metadata (v0.14.1, item 37): behind the
     // production nginx every socket peer is 127.0.0.1, which made
     // the owner's session list useless (six identical loopback
@@ -2747,6 +3022,11 @@ const server = http.createServer(async (req, res) => {
     const presentedDid = validDeviceId(parseCookies(req)[DEVICE_COOKIE]);
     const deviceId = presentedDid || newDeviceId();
     const loginCookies = (sid) => (presentedDid ? sessionCookie(req, sid) : [sessionCookie(req, sid), deviceCookie(req, deviceId)]);
+    // loginCookies returns a bare string when a device cookie was
+    // presented — callers that APPEND a cookie must normalize
+    // first (spreading a string would spread its characters into
+    // the Set-Cookie header; item 156 second-round catch).
+    const asCookieList = (v) => (Array.isArray(v) ? v : [v]);
     // (oauthStates lives at module scope — see below the imports.)
     // Human verification (Cloudflare Turnstile, the main site's
     // provider): enforced only when a secret is configured.
@@ -2832,14 +3112,28 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { available: monitorAvailable(), on });
     }
     if (p === '/api/auth/register' && req.method === 'POST') {
+      // Rate gate (item 156 A-06): this route had NO limiter at
+      // all — in the first-run window the break-glass token check
+      // below was an unthrottled online guessing oracle, and in
+      // steady state the code-verification flow could be flooded.
+      // Same IP bucket shape as login, plus a failure gate on the
+      // setup-token check itself.
+      const rlReg = rateHit(`register:${clientIp}`, config.rateLimits.loginIp);
+      if (!rlReg.ok) return json(res, 429, { error: 'errRateLimited', retryAfter: rlReg.retryAfter });
       const b = await readBody(req);
       if (!auth.hasUsers()) {
         // First-account setup. Audit fix (critical): when an access
         // token is configured, setup must prove knowledge of it — as
         // it stood, anyone who found a fresh deployment could
         // register themselves owner before the operator did.
-        if (config.accessToken && !tokenEq(b.token)) {
-          return json(res, 403, { error: 'errTokenRequired' });
+        if (config.accessToken) {
+          const setupKey = 'setup:' + clientIp;
+          const setupLocked = loginGate(setupKey, '');
+          if (setupLocked > 0) return json(res, 429, { error: 'errLocked', retryAfter: setupLocked });
+          if (!tokenEq(b.token)) {
+            loginFail(setupKey, '');
+            return json(res, 403, { error: 'errTokenRequired' });
+          }
         }
         try {
           const u = await auth.registerFirst(b.name, b.password, { email: b.email, displayName: b.displayName });
@@ -3003,14 +3297,16 @@ const server = http.createServer(async (req, res) => {
       // account that bypasses the main site's bans and role control.
       if (config.ssoEnabled) return json(res, 404, { error: 'errSocialOff' });
       if (!config.google.clientId || !config.google.clientSecret) return json(res, 404, { error: 'errSocialOff' });
+      const rlOAuth = rateHit(`oauthstart:${clientIp}`, config.rateLimits.loginIp);
+      if (!rlOAuth.ok) return json(res, 429, { error: 'errRateLimited', retryAfter: rlOAuth.retryAfter });
       const state = crypto.randomBytes(16).toString('hex');
-      oauthStates.set(state, Date.now() + 10 * 60 * 1000);
+      oauthStateSet(state, Date.now() + 10 * 60 * 1000);
       const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
         client_id: config.google.clientId,
         redirect_uri: originOf(req) + '/api/auth/google/callback',
         response_type: 'code', scope: 'openid email profile', state,
       }).toString();
-      res.writeHead(302, { location: url, ...SEC_HEADERS });
+      res.writeHead(302, { location: url, 'set-cookie': oauthStateCookie(req, state), ...SEC_HEADERS });
       return res.end();
     }
     if (p === '/api/auth/google/callback' && req.method === 'GET') {
@@ -3019,7 +3315,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const q = new URL(req.url, 'http://x').searchParams;
         const st = q.get('state');
-        if (!st || !oauthStates.has(st) || oauthStates.get(st) < Date.now()) return back(false);
+        if (!oauthStateOk(req, st, st)) return back(false);
         oauthStates.delete(st);
         const tokRes = await fetch('https://oauth2.googleapis.com/token', {
           method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -3051,7 +3347,7 @@ const server = http.createServer(async (req, res) => {
         const pub = auth.profileOf(row.id);
         const sid = auth.createSession(pub, sessIp, sessUa, deviceId);
         store.audit({ kind: 'auth_login', user: pub.name + ' (google)' });
-        res.writeHead(302, { location: '/', 'set-cookie': loginCookies(sid), ...SEC_HEADERS });
+        res.writeHead(302, { location: '/', 'set-cookie': [...asCookieList(loginCookies(sid)), oauthStateClearCookie(req)], ...SEC_HEADERS });
         return res.end();
       } catch { return back(false); }
     }
@@ -3077,14 +3373,16 @@ const server = http.createServer(async (req, res) => {
       // No ssoEnabled gate here (item 106): GitHub is the exception.
       const creds = resolveOAuthApp('github');
       if (!creds) return json(res, 404, { error: 'errSocialOff' });
+      const rlOAuth = rateHit(`oauthstart:${clientIp}`, config.rateLimits.loginIp);
+      if (!rlOAuth.ok) return json(res, 429, { error: 'errRateLimited', retryAfter: rlOAuth.retryAfter });
       const state = crypto.randomBytes(16).toString('hex');
-      oauthStates.set('gh:' + state, Date.now() + 10 * 60 * 1000);
+      oauthStateSet('gh:' + state, Date.now() + 10 * 60 * 1000);
       const url = config.githubWebBase + '/login/oauth/authorize?' + new URLSearchParams({
         client_id: creds.clientId,
         redirect_uri: originOf(req) + '/api/auth/github/callback',
         scope: 'read:user user:email', state,
       }).toString();
-      res.writeHead(302, { location: url, ...SEC_HEADERS });
+      res.writeHead(302, { location: url, 'set-cookie': oauthStateCookie(req, state), ...SEC_HEADERS });
       return res.end();
     }
     if (p === '/api/auth/github/callback' && req.method === 'GET') {
@@ -3095,7 +3393,7 @@ const server = http.createServer(async (req, res) => {
         if (!creds) return back(false);
         const q = new URL(req.url, 'http://x').searchParams;
         const st = q.get('state');
-        if (!st || !oauthStates.has('gh:' + st) || oauthStates.get('gh:' + st) < Date.now()) return back(false);
+        if (!oauthStateOk(req, 'gh:' + st, st)) return back(false);
         oauthStates.delete('gh:' + st);
         if (!q.get('code')) return back(false);
         const tokRes = await fetch(config.githubWebBase + '/login/oauth/access_token', {
@@ -3151,7 +3449,7 @@ const server = http.createServer(async (req, res) => {
         const pub = auth.profileOf(row.id);
         const sid = auth.createSession(pub, sessIp, sessUa, deviceId);
         store.audit({ kind: 'auth_login', user: pub.name + ' (github)' });
-        res.writeHead(302, { location: '/', 'set-cookie': loginCookies(sid), ...SEC_HEADERS });
+        res.writeHead(302, { location: '/', 'set-cookie': [...asCookieList(loginCookies(sid)), oauthStateClearCookie(req)], ...SEC_HEADERS });
         return res.end();
       } catch { return back(false); }
     }
@@ -3291,7 +3589,7 @@ const server = http.createServer(async (req, res) => {
     const userDelMatch = p.match(/^\/api\/auth\/users\/([\w-]+)$/);
     if (userDelMatch && req.method === 'DELETE') {
       if (!needOwner()) return ownerDeny();
-      try { auth.deleteUser(userDelMatch[1], user); return json(res, 200, { ok: true }); }
+      try { auth.deleteUser(userDelMatch[1], user); purgeUserStageFrames(userDelMatch[1]); return json(res, 200, { ok: true }); }
       catch (e) { return json(res, 400, { error: e.message }); }
     }
     /* volunteer program (v0.7, reshaped v3 in v0.14.1 item 39):
@@ -3357,14 +3655,26 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/auth/password' && req.method === 'POST') {
       if (user.implicit || user.legacy) return json(res, 400, { error: 'this session has no password to change' });
       const b = await readBody(req);
+      // Failure gate (item 156 A-08): a held session must not get
+      // unlimited guesses at the current password — the vault
+      // unlock door has had this gate since v0.15.2 (BC P2-5) and
+      // this higher-value door was simply missed. Wrong-current-
+      // password failures count; success clears.
+      const pk = 'pwchange:' + clientIp + '|' + String(user.name || '').toLowerCase();
+      const pLocked = loginGate(pk, String(user.name || '').toLowerCase());
+      if (pLocked > 0) return json(res, 429, { error: 'errLocked', retryAfter: pLocked });
       // The current session survives the change; every other session
       // of this account is revoked inside changePassword (P1-6).
       try {
         await auth.changePassword(user.id, b.oldPassword, b.newPassword, parseCookies(req).sa_session);
+        loginOk(pk, String(user.name || '').toLowerCase());
         store.audit({ kind: 'auth_pw_changed', user: user.name });
         return json(res, 200, { ok: true });
       }
-      catch (e) { return json(res, 400, { error: e.message }); }
+      catch (e) {
+        if (/current password is wrong/.test(e.message)) loginFail(pk, String(user.name || '').toLowerCase());
+        return json(res, 400, { error: e.message });
+      }
     }
     if (p === '/api/auth/me' && req.method === 'GET') {
       if (user.implicit || user.legacy) return json(res, 200, { user: { name: user.name, role: user.role, legacy: true } });
@@ -3425,14 +3735,27 @@ const server = http.createServer(async (req, res) => {
      * shape; an export file must never become a key leak. */
     if (p === '/api/auth/me/export' && req.method === 'GET') {
       if (user.implicit || user.legacy) return json(res, 400, { error: 'this session has no account profile' });
+      const myBots = store.listBots().filter((b) => b.ownerId === user.id);
       const data = {
         exportedAt: new Date().toISOString(),
         profile: auth.profileOf(user.id),
-        bots: store.listBots().filter((b) => b.ownerId === user.id).map((b) => ({ id: b.id, name: b.name, engine: b.engine, model: b.model || null, createdAt: b.createdAt || null })),
-        providers: store.listProviders().filter((pr) => pr.ownerId === user.id).map((pr) => ({ id: pr.id, name: pr.name, baseUrl: pr.baseUrl, model: pr.model || null, hasKey: Boolean(pr.keyEnc) })),
+        // Completeness (item 156 F-11/S-7): the export previously
+        // omitted personas, all message/run history, site logins
+        // and volunteer state while presenting itself as "my
+        // data" — and read the provider's display name from a
+        // field that does not exist (records carry `label`).
+        bots: myBots.map((b) => ({ id: b.id, name: b.name, engine: b.engine, model: b.model || null, localModel: b.localModel || null, persona: b.persona || '', createdAt: b.createdAt || null })),
+        messages: Object.fromEntries(myBots.map((b) => [b.id, store.getMessages(b.id)])),
+        runs: store.listRuns().filter((r) => r.userId === user.id),
+        providers: store.listProviders().filter((pr) => pr.ownerId === user.id).map((pr) => ({ id: pr.id, name: pr.label || pr.name || null, baseUrl: pr.baseUrl, model: pr.model || null, hasKey: Boolean(pr.keyEnc) })),
         mcpServers: (() => { try { return mcp.listMcpServers(user.id); } catch { return []; } })(),
+        siteLogins: (() => { try { return sitelogin.listSiteLogins(user.id).map((r) => sitelogin.publicSiteLogin(r)); } catch { return []; } })(),
+        volunteer: (() => { const v = auth.volunteerOf(user.id); return v ? { since: v.since || null, quotaTier: v.quotaTier || 'standard', pick: v.pick || null } : null; })(),
         grants: store.listGrants(user.id),
         usageTotal: store.usageUserTotal(user.id),
+        usageLatestDay: store.usageUserDay(user.id),
+        // Stated, never silent: secrets are NOT part of an export.
+        excluded: ['provider API keys (encrypted at rest, never exported)', 'site-login passwords and 2FA seeds (reveal them in the vault instead)', 'vault entry secrets'],
       };
       const stamp = new Date().toISOString().slice(0, 10);
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="my-data-${stamp}.json"`, ...SEC_HEADERS });
@@ -3447,8 +3770,24 @@ const server = http.createServer(async (req, res) => {
       // providers, grants, sessions, usage) with the self-service
       // flag; the last-owner guard inside still applies.
       if (String(b.name || '') !== user.name) return json(res, 400, { error: 'errDeleteConfirm' });
+      // Password re-verification (item 156 A-09): the typed name is
+      // visible to anyone holding the session, so a stolen session
+      // could irreversibly cascade-delete the whole account. An
+      // account WITH a known password must prove it (behind the
+      // same failure-gate family as password change); an account
+      // without one (social / SSO-provisioned) has no password to
+      // prove and keeps the typed-name confirmation alone.
+      if (auth.hasKnownPassword(user.id)) {
+        const dk = 'delacct:' + clientIp + '|' + String(user.name || '').toLowerCase();
+        const dLocked = loginGate(dk, String(user.name || '').toLowerCase());
+        if (dLocked > 0) return json(res, 429, { error: 'errLocked', retryAfter: dLocked });
+        const okPw = b.password ? await auth.verify(user.name, String(b.password)) : false;
+        if (!okPw) { loginFail(dk, String(user.name || '').toLowerCase()); return json(res, 401, { error: 'errDeletePassword' }); }
+        loginOk(dk, String(user.name || '').toLowerCase());
+      }
       try {
         const r = auth.deleteUser(user.id, { ...user, selfService: true });
+        purgeUserStageFrames(user.id);
         store.audit({ kind: 'auth_self_delete', user: user.name, cascade: r.cascade });
         return json(res, 200, { ok: true });
       } catch (e) {
@@ -3687,10 +4026,21 @@ const server = http.createServer(async (req, res) => {
       if (b.providerId && !saved) return json(res, 404, { error: 'provider not found' });
       const baseUrl = String(b.baseUrl || saved?.baseUrl || '').replace(/\/$/, '');
       if (!baseUrl) return json(res, 400, { error: 'baseUrl required' });
-      const apiKey = b.apiKey ? String(b.apiKey) : (saved ? safeDecrypt(saved.keyEnc) : '');
+      // Key↔URL binding (item 156 B-01): a SAVED provider's key may
+      // only ever be sent to that provider's SAVED baseUrl. The old
+      // code resolved baseUrl and apiKey independently, so a request
+      // carrying providerId + a different baseUrl silently shipped
+      // the vault key to the supplied address — bypassing the vault
+      // unlock gate that guards reveal. Testing an EDITED address
+      // therefore needs the key typed into the request; with none,
+      // the probe runs keyless and reports the auth failure plainly.
+      const savedHostBound = Boolean(saved) && baseUrl === String(saved.baseUrl || '').replace(/\/$/, '');
+      const apiKey = b.apiKey ? String(b.apiKey) : (savedHostBound ? safeDecrypt(saved.keyEnc) : '');
       const model = String(b.model || (saved ? (providerModels(saved)[0] || '') : '') || '');
       const checks = await probeProviderChecks({ baseUrl, apiKey, model });
-      store.audit({ kind: 'provider_tested', provider: saved?.id || null, by: user.name, ok: checks.models.ok && checks.chat.ok && checks.tools.ok });
+      let targetHost = '';
+      try { targetHost = new URL(baseUrl).hostname; } catch { /* unparsable — probe already failed */ }
+      store.audit({ kind: 'provider_tested', provider: saved?.id || null, by: user.name, host: targetHost || null, ok: checks.models.ok && checks.chat.ok && checks.tools.ok });
       return json(res, 200, { checks });
     }
     if (p === '/api/providers' && req.method === 'POST') {
@@ -3837,7 +4187,10 @@ const server = http.createServer(async (req, res) => {
       const saved = savedRaw && (!savedRaw.ownerId || savedRaw.ownerId === 'system' || (user && savedRaw.ownerId === user.id)) ? savedRaw : null;
       const baseUrl = String(b.baseUrl || saved?.baseUrl || '').replace(/\/$/, '');
       if (!baseUrl) return json(res, 400, { error: 'baseUrl required' });
-      const key = b.apiKey ? String(b.apiKey) : (saved ? safeDecrypt(saved.keyEnc) : '');
+      // Key↔URL binding, same rule as /api/providers/test (item 156
+      // B-01): the saved key rides only to the saved baseUrl.
+      const savedHostBound = Boolean(saved) && baseUrl === String(saved.baseUrl || '').replace(/\/$/, '');
+      const key = b.apiKey ? String(b.apiKey) : (savedHostBound ? safeDecrypt(saved.keyEnc) : '');
       try {
         const r = await fetch(baseUrl + '/models', {
           headers: { ...(key ? { authorization: 'Bearer ' + key } : {}) },
@@ -3865,6 +4218,15 @@ const server = http.createServer(async (req, res) => {
       store.removeProvider(provMatch[1]);
       // A deleted provider cannot stay anyone's default (item 135).
       if (pr && user?.id && store.getKv('defaultProviderId:' + user.id) === pr.id) store.setKv('defaultProviderId:' + user.id, '');
+      // Nor anyone's volunteer endpoint pick (item 156 F-12 tail):
+      // resolveVolunteerPick already treats a dangling pick as no
+      // pick, this just keeps the stored state honest.
+      if (pr) {
+        for (const u of auth.listUsers()) {
+          const pk = auth.localPickOf(u.id);
+          if (pk?.type === 'endpoint' && pk.providerId === pr.id) { try { auth.setLocalPick(u.id, null); } catch { /* best effort */ } }
+        }
+      }
       if (pr) store.audit({ kind: 'provider_deleted', provider: pr.id, label: pr.label, by: user.name });
       return json(res, 200, { ok: true });
     }
@@ -3896,7 +4258,11 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/mcp/servers' && req.method === 'POST') {
       const b = await readBody(req);
       try {
-        const created = mcp.createMcpServer(user.id, { name: b.name, url: b.url, authType: b.authType, token: b.token || undefined, preset: typeof b.preset === 'string' ? b.preset.slice(0, 20) : undefined });
+        // preset is NOT accepted from the wire (item 156 E-01):
+        // it is a server-side label (the platform Box flow sets its
+        // own), and letting a user write it made self-declared
+        // platform-connector impersonation possible.
+        const created = mcp.createMcpServer(user.id, { name: b.name, url: b.url, authType: b.authType, token: b.token || undefined });
         store.audit({ kind: 'mcp_server_add', userId: user.id, server: created.slug });
         return json(res, 200, { server: created });
       } catch (e) { return json(res, 400, { error: e.code || 'errMcp' }); }
@@ -4322,6 +4688,11 @@ const server = http.createServer(async (req, res) => {
       if (!bot) return json(res, 404, { error: 'no such bot' });
       if (!msgGate(bot)) return json(res, 403, { error: 'this agent belongs to another account' });
       const removed = store.clearMessages(bot.id);
+      // A cleared conversation restarts seq at 1: reset the
+      // sediment markers so its messages are not filtered by the
+      // old conversation's watermark (item 156 C-06 backstop).
+      // Truncate needs no reset — surviving seqs stay above it.
+      try { resetSedimentMarkers(store.workspaceOf(bot.id)); } catch { /* best effort */ }
       store.audit({ bot: bot.id, kind: 'conversation_clear', removed, by: user.name });
       return json(res, 200, { ok: true, removed });
     }
@@ -4492,7 +4863,9 @@ const server = http.createServer(async (req, res) => {
         // on read (stripBakedAttachLabel, below).
       }
       const controller = new AbortController();
-      const run = startRun(bot, storedText, user?.id || null);
+      // The run record (title + prompt) is a stored copy too —
+      // same redaction as the transcript push (item 156 B-04).
+      const run = startRun(bot, redactUserText(storedText), user?.id || null);
       const usageAcc = { prompt: 0, completion: 0, total: 0 };
       // topLevel marks the entries the run caps count (v0.15.5):
       // only chat-route runs are top-level; delegated placeholders
@@ -4560,8 +4933,15 @@ const server = http.createServer(async (req, res) => {
         graceTimer = setTimeout(() => { if (liveRuns.get(bot.id) === live) abortRun(live); }, config.disconnectGraceMs);
       });
       const turnMeta = {};
+      let usageRecorded = false;
       const finishRun = (status, err) => {
-        if (usageAcc.total > 0) store.recordUsage(bot.id, usageAcc, user?.id || null, { providerId: turnMeta.providerId || undefined, ownEndpoint: Boolean(turnMeta.ownEndpoint) });
+        // Idempotent accounting (item 156 F-03/S-1): the runId is
+        // the dedup key in the store, and this flag is the second
+        // layer — a re-entered finishRun can never double-count.
+        if (usageAcc.total > 0 && !usageRecorded) {
+          usageRecorded = true;
+          store.recordUsage(bot.id, usageAcc, user?.id || null, { providerId: turnMeta.providerId || undefined, ownEndpoint: Boolean(turnMeta.ownEndpoint), runId: run.id });
+        }
         endRun(run, status, err, usageAcc.total || null);
         // Checklist convergence (item 49): every terminal path of
         // this route — success, failure, cancel via stop /
@@ -4655,15 +5035,20 @@ const server = http.createServer(async (req, res) => {
 
     /* Re-attach to a run's event journal (v0.15.7, item 119):
      * replays the frames after ?after=<seq> and then follows live
-     * until the run settles. Same read posture as the transcript
-     * (any signed-in user — chat is a shared team surface); the
-     * journal itself is the capability: runIds are unguessable and
-     * the journal dies 30 minutes after its run settles. */
+     * until the run settles. Item 156 (A-01/F-01): the journal is
+     * NOT transcript-posture — its frames are the UNSCRUBBED event
+     * stream (tool args and results, reasoning), so re-attach is
+     * ownership-hard exactly like the monitor projection below:
+     * only the run's initiator or a site owner may subscribe.
+     * Other members keep the (scrubbed) transcript as their shared
+     * view. The journal dies 30 minutes after its run settles. */
     const runStreamMatch = p.match(/^\/api\/bots\/([\w-]+)\/runs\/([\w-]+)\/stream$/);
     if (runStreamMatch && req.method === 'GET') {
       if (!user) return json(res, 401, { error: 'sign in required' });
       const j = runJournals.get(runStreamMatch[2]);
       if (!j || j.botId !== runStreamMatch[1]) return json(res, 404, { error: 'no such run' });
+      const isInitiator = Boolean(j.userId && j.userId === user.id);
+      if (!isInitiator && user.role !== 'owner') return json(res, 403, { error: 'errRunStreamForbidden' });
       const after = Math.max(0, Number(url.searchParams.get('after') || 0) || 0);
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no', ...SEC_HEADERS });
       if (j.truncated) { try { res.write(`event: journal\ndata: ${JSON.stringify({ truncated: true })}\n\n`); } catch { /* gone */ } }
@@ -4683,10 +5068,12 @@ const server = http.createServer(async (req, res) => {
      * re-attaches the INITIATOR's own chat view and follows the
      * shared-transcript posture — this endpoint is an activity
      * feed and is ownership-hard:
-     *   - module switches first (deployment flag, then the
-     *     subscriber's own preference): off means off, for anyone;
+     *   - the deployment flag first: off means off, for anyone;
      *   - then ownership: only the run's initiator or a site owner
      *     may subscribe — anyone else gets a 403 and no frames;
+     *   - then the two-sided subscription gate (both the run
+     *     owner's and the subscriber's own preference must allow
+     *     it, else 403 errMonitorOff);
      *   - the frames themselves are the projection from
      *     monitor.js: content (args, reasoning text) only ever
      *     reaches the initiator; oversight sees the shape.
@@ -4695,11 +5082,19 @@ const server = http.createServer(async (req, res) => {
     const runMonitorMatch = p.match(/^\/api\/bots\/([\w-]+)\/runs\/([\w-]+)\/monitor$/);
     if (runMonitorMatch && req.method === 'GET') {
       if (!user) return json(res, 401, { error: 'sign in required' });
-      if (!monitorAvailable() || !monitorPrefOn(user.id)) return json(res, 403, { error: 'errMonitorOff' });
+      if (!monitorAvailable()) return json(res, 403, { error: 'errMonitorOff' });
       const j = runJournals.get(runMonitorMatch[2]);
       if (!j || j.botId !== runMonitorMatch[1]) return json(res, 404, { error: 'no such run' });
       const isInitiator = Boolean(j.userId && j.userId === user.id);
       if (!isInitiator && user.role !== 'owner') return json(res, 403, { error: 'errMonitorForbidden' });
+      // Two-sided preference gate (item 156 F-09): the switch is
+      // not only the subscriber's — an initiator who turned their
+      // own monitor off means "my runs are not broadcast", and a
+      // bystander (incl. an owner) must not receive them anyway.
+      // Ownership is refused first (errMonitorForbidden) so a
+      // stranger's answer never depends on anyone's preferences.
+      const gate = monitorSubscriptionGate({ subscriberId: user.id, initiatorId: j.userId });
+      if (!gate.allowed) return json(res, 403, { error: 'errMonitorOff' });
       const after = Math.max(0, Number(url.searchParams.get('after') || 0) || 0);
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no', ...SEC_HEADERS });
       const writeFrame = (ev) => {
@@ -5237,6 +5632,12 @@ const server = http.createServer(async (req, res) => {
           }
         };
         if (req.method === 'DELETE') {
+          // Unlock window (item 156 A-10): reveal and rotate have
+          // always required it; deletion silently destroying every
+          // stored credential did not — a held session could wipe
+          // or (via PATCH below) replace the owner's site logins
+          // without ever passing the password gate.
+          if (!vUnlocked(true)) return json(res, 423, { error: 'vaultLocked' });
           const before = grantsOf(row);
           sitelogin.deleteSiteLogin(row.id);
           wipeOrphanProfiles(before);
@@ -5244,6 +5645,12 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, { ok: true });
         }
         const b = await readBody(req);
+        // Secret-bearing writes ride the same unlock window
+        // (A-10); label / URL / grant-only edits stay ungated so
+        // organizing entries never demands the password.
+        if ((b.username !== undefined || b.password !== undefined || b.totpSecret !== undefined || b.note !== undefined) && !vUnlocked(true)) {
+          return json(res, 423, { error: 'vaultLocked' });
+        }
         try {
           const before = grantsOf(row);
           const updated = sitelogin.updateSiteLogin(row.id, {
@@ -5312,8 +5719,12 @@ const server = http.createServer(async (req, res) => {
       // inapplicable choices; this is the server-side twin for
       // stale or hand-rolled clients.
       let d = decision;
-      if (entry2?.neverSession && d === 'allow_always') d = 'allow';
-      if (entry2?.neverSession && entry2?.exec && d === 'allow_session') d = 'allow';
+      // Item 156 E-02: the exec qualifier on the session line was
+      // the hole — a NON-exec MCP tool's allow_session survived as
+      // a session grant and silently skipped its card for 30
+      // minutes, breaking the "external tools always card" rule.
+      // For never-session tools BOTH grant shapes degrade.
+      if (entry2?.neverSession && (d === 'allow_always' || d === 'allow_session')) d = 'allow';
       // The decider rides along (audit fix P1-6): an allow_always
       // grant belongs to whoever answered the card. The deny reason
       // (P2-5) rides along too — the waiting turn passes it to the
@@ -5374,19 +5785,22 @@ const server = http.createServer(async (req, res) => {
           pendingPersona: personaBots.map((b) => ({ name: normalizeDisplayName(b.name, 60), persona: String(b.persona).slice(0, 400) })),
         });
       }
-      const created = team.bots.map((b) => store.addBot({
-        // Item 150 (FIX-2): imported bots pass the same effectiveEngine
-        // normalization as every other write boundary — the import
-        // format carries no providerId, so this only pins the engine
-        // field to the one canonical resolver instead of a raw copy.
+      // One transaction (item 156 F-10/S-6): the batch insert rolls
+      // back whole on any failure — a bad file no longer leaves a
+      // half-imported team behind. (Per-bot normalization unchanged:
+      // item 150 FIX-2's effectiveEngine pinning still applies.)
+      const created = store.addBots(team.bots.map((b) => ({
         id: store.newId('bot'), name: normalizeDisplayName(b.name, 60), engine: effectiveEngine({ engine: b.engine || config.defaultEngine, providerId: '' }), ownerId: user?.id || null,
         model: b.model || '', persona: b.persona || '', createdAt: new Date().toISOString(),
-      }));
+      })));
       store.audit({ kind: 'team_import', team: team.name, bots: created.length, personaConfirmed: personaBots.length ? true : undefined, by: user?.name || null });
       return json(res, 201, { team: team.name, bots: created });
     }
     if (p === '/api/teams/export' && req.method === 'GET') {
-      const md = exportTeam(url.searchParams.get('name') || 'My team', store.listBots().filter((b) => !b.ownerId || (user && b.ownerId === user.id)));
+      // Ownerless (legacy local) bots export only for a site owner
+      // (item 156 F-24 first half): their personas are not every
+      // member's to take.
+      const md = exportTeam(url.searchParams.get('name') || 'My team', store.listBots().filter((b) => (b.ownerId ? (user && b.ownerId === user.id) : (user && user.role === 'owner'))));
       res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', ...SEC_HEADERS });
       return res.end(md);
     }
@@ -5594,6 +6008,11 @@ class WsConn {
   queueDepth() { return (this.writing ? 1 : 0) + (this.pendingBinary ? 1 : 0); }
   sendText(str) {
     if (this.closed) return;
+    // Bounded text queue (item 156 E-13/S-9): a viewer that falls
+    // 64 frames behind is not catching up; an unbounded queue was
+    // a memory sink driven by the producer's frame rate. Close
+    // instead — the client reconnects and re-syncs from hello.
+    if (this.textQueue.length >= 64) { this.close(); return; }
     this.textQueue.push(wsEncodeFrame(1, Buffer.from(String(str), 'utf8')));
     this._pump();
   }
@@ -5730,9 +6149,38 @@ async function handleStageMessage(conn, stageId, userId, text) {
   }
 }
 
+/* Account deletion clears the user's replay frames (item 156
+ * E-12/S-8): stage dirs are enumerated from disk, ownership is
+ * read from each dir's meta.json, and removal goes through the
+ * viewer's owner-checked exit — a dir whose meta cannot be read
+ * is left to the TTL pruner rather than force-deleted blind. */
+function purgeUserStageFrames(userId) {
+  try {
+    const root = framesRoot();
+    for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(root, ent.name, 'meta.json'), 'utf8'));
+        if (meta && meta.userId === userId) removeStageFrames(ent.name, userId);
+      } catch { /* unreadable meta — TTL pruner owns it */ }
+    }
+  } catch { /* no frames root yet */ }
+}
+
+const stageUserSockets = new Map(); // userId -> live WS count (item 156 E-13)
 server.on('upgrade', (req, socket, head) => {
   const m = String(req.url || '').split('?')[0].match(/^\/api\/browser-viewer\/([\w-]+)\/stream$/);
   if (!m) { socket.destroy(); return; }
+  // Origin discipline (item 156 E-13/S-9): a browser always sends
+  // Origin on upgrade; a cross-site page riding the user's cookie
+  // (CSWSH) names a foreign one. Same destroy-without-signal
+  // treatment as every other refusal here.
+  const origin = req.headers.origin;
+  if (origin) {
+    let originHost = '';
+    try { originHost = new URL(origin).host; } catch { /* unparsable = foreign */ }
+    if (!originHost || originHost !== req.headers.host) { socket.destroy(); return; }
+  }
   // Auth is the HTTP faces' own: sa_session cookie → currentUser,
   // plus strict stage ownership via getViewerSession. Signed-out,
   // foreign and unknown-id upgrades are ALL destroyed without a
@@ -5741,6 +6189,10 @@ server.on('upgrade', (req, socket, head) => {
   const s = user ? getViewerSession(m[1], user.id) : null;
   const key = req.headers['sec-websocket-key'];
   if (!user || !s || !key) { socket.destroy(); return; }
+  // Per-user connection cap (item 156 E-13/S-9): one account's
+  // tabs/retries must not fan out without bound — 8 mirrors the
+  // viewer's per-user sink ceiling.
+  if ((stageUserSockets.get(user.id) || 0) >= 8) { socket.destroy(); return; }
   socket.write(
     'HTTP/1.1 101 Switching Protocols\r\n'
     + 'Upgrade: websocket\r\n'
@@ -5749,10 +6201,23 @@ server.on('upgrade', (req, socket, head) => {
   );
   try { socket.setNoDelay(true); } catch { /* cosmetic */ }
   const conn = new WsConn(socket);
+  stageUserSockets.set(user.id, (stageUserSockets.get(user.id) || 0) + 1);
   let conns = stageSockets.get(s.id);
   if (!conns) { conns = new Set(); stageSockets.set(s.id, conns); }
   conns.add(conn);
-  const detach = attachStream(s.id, user.id, {
+  // onClose is wired BEFORE attachStream can fail: its failure
+  // path closes the connection, and the per-user count above must
+  // be returned on EVERY exit, this one included.
+  let detach = null;
+  conn.onText = (text) => { handleStageMessage(conn, s.id, user.id, text).catch(() => {}); };
+  conn.onClose = () => {
+    const n = (stageUserSockets.get(user.id) || 1) - 1;
+    if (n > 0) stageUserSockets.set(user.id, n); else stageUserSockets.delete(user.id);
+    conns.delete(conn);
+    if (!conns.size) stageSockets.delete(s.id);
+    if (detach) detach();
+  };
+  detach = attachStream(s.id, user.id, {
     sendFrame: (buf) => conn.sendBinary(buf),
     sendJson: (obj) => conn.sendJson(obj),
   });
@@ -5764,12 +6229,6 @@ server.on('upgrade', (req, socket, head) => {
     vw: s.viewport?.width || 960, vh: s.viewport?.height || 800,
     tier: s.cast?.ctl?.tier?.name || 'T0',
   });
-  conn.onText = (text) => { handleStageMessage(conn, s.id, user.id, text).catch(() => {}); };
-  conn.onClose = () => {
-    conns.delete(conn);
-    if (!conns.size) stageSockets.delete(s.id);
-    detach();
-  };
   if (head && head.length) conn._onData(head);
 });
 

@@ -78,7 +78,7 @@ test('index.html carries the v0.20.0 shell surfaces', () => {
   assert.ok(html.includes('id="sideNav"'), 'sidebar nav mount');
   assert.ok(html.includes('id="view-home"'), 'overview view inside #roster');
   assert.ok(html.includes('data-view="chat"'), 'mobile chat tab (intercepted by shell200)');
-  assert.ok(html.includes('shell200.js?v=200'), 'shell200 module registered');
+  assert.ok(html.includes('shell200.js?v=210'), 'shell200 module registered');
 });
 
 test('style.css carries the v0.20.0 desktop layer', () => {

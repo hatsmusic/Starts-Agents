@@ -331,14 +331,30 @@ test('OAuth: discovery, dynamic registration, PKCE start, code finish', async ()
   assert.equal(JSON.parse(mcp.getMcpSecret(pub.id)).clientSecret, 'shh-secret');
 });
 
-test('OAuth (item 129): GitHub-shaped AS with NO metadata document — synthesized endpoints, platform client, GitHub scope policy', async () => {
+test('OAuth (item 129): GitHub-shaped AS with NO metadata document — synthesized endpoints, platform client, GitHub scope policy', async (t) => {
   setOAuthApp('github', { clientId: 'gh-client-1', clientSecret: 'gh-secret-1' });
-  const ghUrl = fakeUrl.replace(/\/mcp$/, '/mcp-gh');
   const ghOrigin = new URL(fakeUrl).origin;
   const pub = mcp.createMcpServer('u-gh', { name: 'GitHub', url: 'https://api.githubcopilot.com/mcp/', authType: 'oauth', preset: 'github' });
-  getDb().prepare('UPDATE mcp_servers SET url = ? WHERE id = ?').run(ghUrl, pub.id);
   const row = mcp.getMcpServerRow(pub.id);
   const redirectUri = 'https://example.com/oauth/callback';
+  // Item 156 (E-01): the platform-client gate now identifies the
+  // GitHub server ONLY by its canonical URL — a user-writable
+  // preset flag must never route the platform client_secret, so
+  // this test can no longer rewrite the row's URL to the local
+  // fake in the DB (that row would, rightly, not be GitHub). The
+  // row keeps the canonical URL and the transport is stubbed at
+  // the fetch seam instead: the discovery probe to the canonical
+  // host answers the GitHub-shaped 401 pointing at the local
+  // fake's resource metadata; everything else rides real fetch
+  // to the local fake authorization server.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith('https://api.githubcopilot.com/mcp')) {
+      return new Response('', { status: 401, headers: { 'www-authenticate': `Bearer resource_metadata="${ghOrigin}/rm-gh"` } });
+    }
+    return realFetch(url, init);
+  };
+  t.after(() => { globalThis.fetch = realFetch; });
 
   // Discovery must survive the 404 well-known document and land
   // on the synthesized endpoints under the AS base.

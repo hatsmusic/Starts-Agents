@@ -13,7 +13,8 @@ import { getDb } from './db.js';
 import { normalizeDisplayName } from './trust.js';
 import * as store from './store.js';
 import { codePepper } from './vault.js';
-import { normalizeAvatar, parseStoredAvatar } from './avatars.js';
+import { normalizeAvatar, parseStoredAvatar, deleteAvatarImageFile } from './avatars.js';
+import { config } from './config.js';
 
 /* Device-style sessions (v0.14 batch 1, item 14): sign in once and
  * the device stays signed in — 180-day TTL with sliding renewal
@@ -226,7 +227,7 @@ export const auth = {
   // through registerFirst() from the setup screen.
   async registerFirst(name, password, opts = {}) {
     if (this.hasUsers()) throw new Error('accounts already exist');
-    return this._create(name, password, 'owner', opts);
+    return this._create(name, password, 'owner', { ...opts, firstOnly: true });
   },
   async createUser(name, password, role = 'member', opts = {}) {
     return this._create(name, password, role === 'owner' ? 'owner' : 'member', opts);
@@ -261,6 +262,13 @@ export const auth = {
       ssoVerifiedAt: opts.ssoId ? Date.now() : 0,
       pendingEmail: '',
     };
+    // First-account race (item 156 A-05): the hasUsers() check at
+    // registerFirst's door and this insert are separated by the
+    // async password hash — two concurrent first registrations
+    // could BOTH pass the door and mint two owners. Re-check in
+    // the same synchronous tick as the insert (no await between),
+    // which makes check+insert atomic on the event loop.
+    if (opts.firstOnly && this.hasUsers()) throw new Error('accounts already exist');
     try {
       putUser(user);
     } catch (e) {
@@ -517,6 +525,12 @@ export const auth = {
         usageRows: Number(d.prepare('DELETE FROM usage_daily WHERE user_id = ?').run(id).changes),
         volunteer: u.volunteer ? 1 : 0,
       };
+      // Owned-row sweep (item 156 F-05/S-3): MCP servers, site
+      // logins (live credentials other bots may be granted!),
+      // run history and the user's own kv keys were missing from
+      // this cascade — a deleted account's site logins stayed
+      // usable by the bots they were granted to.
+      Object.assign(cascade, store.purgeUserOwnedRows(id));
       // Pending verification codes are addressed to the account (the
       // reset/register keys are its email, the email-change proof is
       // 'email:<id>') — none of them may outlive it.
@@ -529,6 +543,8 @@ export const auth = {
       throw e;
     }
     for (const b of myBots) store.removeBotFiles(b.id);
+    // The account's own uploaded avatar image goes with it (F-05).
+    try { deleteAvatarImageFile(config.dataDir, u.avatar); } catch { /* best effort */ }
     store.audit({ kind: 'auth_user_delete', user: u.name, by: byUser?.name || null, cascade });
     return { user: publicUser(u), cascade };
   },

@@ -9,7 +9,7 @@
 //         no scryptSync left in auth.js)
 //   P1-24 boot-time provider key check (health counter, error log,
 //         audit row; startup not blocked)
-//   NF-1  version markers agree: package.json 0.20.0 / ?v=200 /
+//   NF-1  version markers agree: package.json 0.21.0 / ?v=210 /
 //         SW starts-agents-v39 with ui-utils.js in the shell list
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -104,18 +104,18 @@ async function waitIdle(base, cookie, botId, timeoutMs = 15000) {
  * children list and fire when the file is truly done. */
 
 /* ================= NF-1: version markers ================= */
-test('NF-1: package.json, ?v= and the service worker agree on 0.20.0 / 200 / v39', () => {
+test('NF-1: package.json, ?v= and the service worker agree on 0.21.0 / 210 / v41', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.20.0');
+  assert.equal(pkg.version, '0.21.0');
   const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
   const app = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
   const sw = fs.readFileSync(path.join(ROOT, 'public', 'sw.js'), 'utf8');
   for (const [name, text] of [['index.html', html], ['app.js', app], ['sw.js', sw]]) {
-    assert.ok(text.includes('?v=200'), `${name} carries ?v=200`);
+    assert.ok(text.includes('?v=210'), `${name} carries ?v=210`);
     assert.ok(!text.includes('?v=130'), `${name} has no stale ?v=130`);
   }
-  assert.ok(sw.includes("const CACHE = 'starts-agents-v39'"), 'SW cache bumped to v39');
-  assert.ok(sw.includes("'/ui-utils.js?v=200'"), 'ui-utils.js joined the SW shell list');
+  assert.ok(sw.includes("const CACHE = 'starts-agents-v41'"), 'SW cache bumped to v41');
+  assert.ok(sw.includes("'/ui-utils.js?v=210'"), 'ui-utils.js joined the SW shell list');
   /* v0.15.2 (audit FE P2-5): parse-based uniformity — EVERY ?v=
    * occurrence across the three shell files must carry the same
    * number (a single missed reference used to slip past the old
@@ -123,15 +123,15 @@ test('NF-1: package.json, ?v= and the service worker agree on 0.20.0 / 200 / v39
    * must carry every shell asset at that same version. */
   const seen = new Set();
   for (const text of [html, app, sw]) for (const m of text.matchAll(/\?v=(\d+)/g)) seen.add(m[1]);
-  assert.deepEqual([...seen], ['200'], 'every ?v= in the shell files is 200');
+  assert.deepEqual([...seen], ['210'], 'every ?v= in the shell files is 210');
   const shellList = sw.match(/const SHELL = \[([^\]]+)\]/)[1];
   for (const asset of ['style.css', 'app.js', 'i18n.js', 'ui-utils.js', 'botwork-logo.png']) {
-    assert.ok(shellList.includes(`/${asset}?v=200`), `SW shell list carries ${asset} at ?v=200`);
+    assert.ok(shellList.includes(`/${asset}?v=210`), `SW shell list carries ${asset} at ?v=210`);
   }
   // The MCP clientInfo version tracks the release too.
   const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp.js'), 'utf8');
   assert.ok(!mcp.includes("version: '0.15.0'"), 'no stale MCP clientInfo version');
-  assert.ok(mcp.includes("version: '0.20.0'"), 'MCP clientInfo at 0.20.0');
+  assert.ok(mcp.includes("version: '0.21.0'"), 'MCP clientInfo at 0.21.0');
 });
 
 /* ================= P1-21: async scrypt ================= */
@@ -424,7 +424,7 @@ test('P1-24: a dead provider key is announced at boot — health counter, audit 
   const health = await api(BASE3, boss3, 'GET', '/api/health');
   assert.equal(health.status, 200);
   assert.equal(health.data.ok, true);
-  assert.equal(health.data.version, '0.20.0', 'health reports the new version');
+  assert.equal(health.data.version, '0.21.0', 'health reports the new version');
   assert.equal(health.data.detail.vaultKeyErrors, 1, 'owner detail counts the undecryptable provider');
 
   const pub = await api(BASE3, '', 'GET', '/api/health');
