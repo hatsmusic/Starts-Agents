@@ -9,13 +9,98 @@
 // Add a brain = add one entry to ENGINES below. Nothing else changes.
 import { spawn, execFile } from 'node:child_process';
 import { config } from './config.js';
-import { TOOLS } from './tools.js';
+import { availableTools, sandboxEnv } from './tools.js';
+import { untrustedNotice } from './trust.js';
+import { getLocalModel } from './local-models.js';
+
+/* ---------------- vision capability (v0.15.1, item 70 A1) ----------------
+ * Whether a model accepts image input decides how images travel:
+ *   'yes'     — send image content blocks (user attachments AND
+ *               tool-result images, e.g. screenshot_page captures);
+ *   'no'      — never send blocks; the model instead gets an
+ *               explicit note naming the saved file(s). Images are
+ *               NEVER dropped silently;
+ *   'unknown' — try the blocks; a provider rejection flips the run
+ *               to 'no' (blocks stripped, note spliced in, one
+ *               retry) so the turn still completes in text.
+ * The local catalog is authoritative for Ollama tags (its `vision`
+ * category exists precisely to mark these); the pattern lists below
+ * cover the hosted families the presets ship. The 'no' list stays
+ * deliberately tight — a model we are not sure about is 'unknown'
+ * and earns the try-and-fallback path, not a premature refusal. */
+const VISION_YES = [
+  /gpt-4o/, /gpt-4\.1/, /gpt-5/, /claude/, /gemini/, /gemma3/, /gemma4/,
+  /qwen[\d.]*-?vl/, /qwen2\.5vl/, /llava/, /moondream/, /minicpm-v/,
+  /llama3\.2-vision/, /llama-?4/, /internvl/, /pixtral/, /glm-4v/, /deepseek-ocr/,
+];
+const VISION_NO = [
+  /deepseek-chat/, /deepseek-reasoner/, /deepseek-coder/, /deepseek-r1/, /deepseek-v3/,
+  /coder/, /codellama/, /starcoder/, /codegemma/, /devstral/, /codestral/, /granite-code/,
+  /gpt-oss/, /llama3\.1(?!-vision)/, /llama3\.3/,
+];
+export function visionVerdict(model) {
+  const raw = String(model || '').trim().toLowerCase();
+  if (!raw) return 'unknown';
+  const local = getLocalModel(raw) || getLocalModel(raw.split('/').pop());
+  if (local) {
+    /* v0.15.2 (audit B-P1-6): the catalog verdict reads the
+     * entry's explicit capability: cat 'vision' or a vision:true
+     * flag (multimodal general models — Gemma 3 ≥4B, Gemma 4,
+     * Llama 4 — live under cat 'general' but DO see images, and
+     * used to be hard-judged 'no' here with no retry path). Any
+     * other local entry falls through to the name patterns
+     * instead of a hard 'no', so an unlisted capability earns the
+     * try-and-fallback path rather than a premature refusal. */
+    if (local.cat === 'vision' || local.vision) return 'yes';
+    // An explicit vision:false in the catalog WINS over the name
+    // patterns below (gemma3:1b rides a multimodal family name
+    // but is genuinely text-only).
+    if (local.vision === false) return 'no';
+  }
+  if (VISION_YES.some((re) => re.test(raw))) return 'yes';
+  if (VISION_NO.some((re) => re.test(raw))) return 'no';
+  return 'unknown';
+}
+
+/* The explicit degradation note for images a model cannot see:
+ * names the saved file(s) so the model can still work with them
+ * through file tools (or ask the user), instead of the image
+ * vanishing without a trace. */
+export function imageDegradationNote(images, lang) {
+  const zh = lang === 'zh' || lang === 'tw';
+  const names = (images || []).map((im) => im && (im.rel || im.name)).filter(Boolean);
+  const where = names.length ? names.join(', ') : 'uploads/';
+  return zh
+    ? `\n[注意：当前模型不支持图片输入，没能看到 ${names.length || ''} 张图片；图片文件已存入工作区：${where}。需要看图时可换用支持视觉的模型，或请用户描述图片内容。]`
+    : `\n[Note: the current model does not accept image input, so it could not see the attached image(s). The image file(s) are saved in the workspace: ${where}. To inspect them, switch to a vision-capable model or ask the user to describe the image.]`;
+}
+
+/* A tool result travelling back from the harness is a plain string,
+ * or { text, images: [{ mime, data, rel }] } when the tool produced
+ * images the model should look at (screenshot_page, view_image,
+ * MCP image results — v0.15.1). Normalize both shapes here so the
+ * loop below has exactly one form to reason about. */
+export function normalizeToolResult(result) {
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const images = Array.isArray(result.images)
+      ? result.images.filter((im) => im && im.data && String(im.mime || '').startsWith('image/')).slice(0, 4)
+      : [];
+    return { text: String(result.text ?? ''), images };
+  }
+  return { text: String(result ?? ''), images: [] };
+}
+
+/* The tools the model may see RIGHT NOW (v0.13): module-gated tools
+ * appear only while their sandbox module is installed. */
+function knownTool(name) {
+  return availableTools().some((tool) => tool.name === name);
+}
 
 /* ---------------- echo: the offline demo brain ---------------- */
 // No key, no network. It reflects the conversation, and proposes tools
 // when you phrase requests plainly:
 //   "list files" / "read notes.txt" / "note buy milk" / "run ls -la"
-async function* echoRun({ bot, history, userText, lang, signal }) {
+async function* echoRun({ bot, history, userText, lang, signal, images }) {
   const zh = lang === 'zh' || lang === 'tw';
   const say = async function* (text) {
     const words = String(text).split(/(?<=\s)/);
@@ -39,6 +124,9 @@ async function* echoRun({ bot, history, userText, lang, signal }) {
     : `I'm ${bot.name}, running on the offline demo engine (echo) — I just mirror the system: ` +
       `try "list files", "read <file>", "note <text>", "run <command>" (asks your approval). ` +
       `For real coding, add a provider under Settings and switch this bot to the API engine.`);
+  // The echo engine has no eyes (v0.15.1): an attached image is
+  // named, never silently dropped.
+  if (Array.isArray(images) && images.length) yield* say(imageDegradationNote(images, lang));
 }
 
 /* ------------- openai: any OpenAI-compatible endpoint ------------- */
@@ -47,7 +135,7 @@ async function* echoRun({ bot, history, userText, lang, signal }) {
 // in. The tool loop runs up to 25 rounds so real coding work — read,
 // edit, run tests, fix, re-run — completes in one turn.
 function openaiTools() {
-  return TOOLS.map((t) => ({
+  return availableTools().map((t) => ({
     type: 'function',
     function: {
       name: t.name,
@@ -56,7 +144,11 @@ function openaiTools() {
       // 'string, optional subdirectory'): surface the notes as the
       // parameter description and mark non-optional args required —
       // models call tools measurably better with both (audit fix).
-      parameters: {
+      // A definition may carry an explicit JSON schema (v0.15:
+      // dynamic MCP tools — their single `input` argument is a real
+      // object, and typing it 'string' like every spec-string arg
+      // would teach models to stringify it).
+      parameters: t.parameters || {
         type: 'object',
         properties: Object.fromEntries(Object.entries(t.args).map(([k, spec]) => [k, { type: 'string', description: String(spec) }])),
         required: Object.entries(t.args).filter(([, spec]) => !/optional/i.test(String(spec))).map(([k]) => k),
@@ -90,18 +182,28 @@ function parseTextToolCall(text) {
   const s = String(text).trim()
     .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')
     .replace(/<\/?tool_call>/gi, '').trim();
-  // Form A: a JSON object naming the tool.
-  const start = s.indexOf('{');
-  if (start >= 0) {
-    const bal = extractBalanced(s, start);
-    if (bal) {
+  // Form A: a JSON object naming the tool — ANCHORED (v0.14 batch 4,
+  // audit P1-9). The object must BE the message: it starts at the
+  // first character (after fence/tag stripping above) and nothing
+  // but whitespace may follow it. The old parser took the first '{'
+  // ANYWHERE in the text, so a model merely QUOTING an example call
+  // in its second paragraph had the quote executed as a real call —
+  // approval cards for show, and safe tools (write_note,
+  // package_project, browse…) running uninvited. Arguments must be a
+  // plain object, too: a malformed payload is prose, not a call with
+  // empty args.
+  if (s.startsWith('{')) {
+    const bal = extractBalanced(s, 0);
+    if (bal && !s.slice(bal.end + 1).trim()) {
       try {
         const obj = JSON.parse(bal.json);
         const name = obj.name || obj.function || obj.tool;
         let args = obj.arguments ?? obj.args ?? obj.parameters ?? {};
-        if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
-        if (name && typeof name === 'string' && TOOLS.some((tool) => tool.name === name)) {
-          if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+        if (typeof args === 'string') {
+          try { args = JSON.parse(args); } catch { args = null; }
+        }
+        if (name && typeof name === 'string' && knownTool(name)
+          && args && typeof args === 'object' && !Array.isArray(args)) {
           return { name, args };
         }
       } catch { /* not the JSON form — try the prefix form */ }
@@ -109,7 +211,7 @@ function parseTextToolCall(text) {
   }
   // Form B: name{args} on its own line, JSON running to the end.
   const m = s.match(/(?:^|\n)\s*([a-z_][a-z0-9_]*)\s*\{/);
-  if (m && TOOLS.some((tool) => tool.name === m[1])) {
+  if (m && knownTool(m[1])) {
     const braceIdx = s.indexOf('{', m.index);
     const bal = extractBalanced(s, braceIdx);
     if (bal && !s.slice(bal.end + 1).trim()) {
@@ -129,9 +231,9 @@ function couldBeTextCall(probe) {
   if (!probe) return false;
   if (probe.startsWith('{') || probe.startsWith('`')) return true;
   const withBrace = probe.match(/^([a-z_][a-z0-9_]*)\s*\{/);
-  if (withBrace) return TOOLS.some((tool) => tool.name === withBrace[1]);
+  if (withBrace) return knownTool(withBrace[1]);
   const bare = probe.match(/^([a-z_][a-z0-9_]*)\s*$/);
-  if (bare) return TOOLS.some((tool) => tool.name.startsWith(bare[1]));
+  if (bare) return availableTools().some((tool) => tool.name.startsWith(bare[1]));
   return false;
 }
 
@@ -150,7 +252,7 @@ function canonical(v) {
  * parses to a plain object. */
 function extractLooseTextCall(text) {
   const s = String(text || '');
-  for (const tool of TOOLS) {
+  for (const tool of availableTools()) {
     const re = new RegExp('(^|\n)(\s*)' + tool.name + '\s*\{', 'g');
     let m;
     while ((m = re.exec(s))) {
@@ -176,10 +278,47 @@ function extractLooseTextCall(text) {
  * plan-before-act and human checkpoints, SWE-agent's
  * edit→test→iterate spine. The point of every line: the result must
  * actually RUN, not just exist. */
-function agentProtocol(lang) {
+/* Session-language names (v0.16.0, item 137): the protocol below
+ * exists in zh/en versions only, so the language rule NAMES the
+ * session language explicitly — a model in a Japanese session reads
+ * the English protocol text but is told, by name, that its own
+ * user-facing words must be Japanese. Keys are the 15 UI languages
+ * (I18N_LANGS in i18n-slice.js); unknown codes fall back to English,
+ * matching the protocol-version fallback. */
+export const SESSION_LANGUAGE_NAMES = {
+  zh: '中文（简体）',
+  tw: '中文（繁體）',
+  en: 'English',
+  ja: '日本語 (Japanese)',
+  ko: '한국어 (Korean)',
+  es: 'Español (Spanish)',
+  fr: 'Français (French)',
+  de: 'Deutsch (German)',
+  ru: 'Русский (Russian)',
+  pt: 'Português (Portuguese)',
+  vi: 'Tiếng Việt (Vietnamese)',
+  th: 'ไทย (Thai)',
+  id: 'Bahasa Indonesia (Indonesian)',
+  ar: 'العربية (Arabic)',
+  hi: 'हिन्दी (Hindi)',
+};
+export function sessionLanguageName(lang) {
+  return SESSION_LANGUAGE_NAMES[lang] || SESSION_LANGUAGE_NAMES.en;
+}
+
+export function agentProtocol(lang) {
   const zh = lang === 'zh' || lang === 'tw';
-  return zh ? [
+  const langName = sessionLanguageName(lang);
+  // The untrusted-content declaration (v0.14 batch 3, item 21) rides
+  // at the END of the protocol block in every language: it defines
+  // the boundary the server wraps tool results in, and it must be
+  // part of the standing instructions, not of any one turn.
+  const notice = untrustedNotice(lang);
+  return (zh ? [
     '【Agent 工作协议 — 每个任务都遵守】',
+    (lang === 'tw'
+      ? `0. 語言跟隨（最高優先）：本會話語言：${langName}。你所有面向使用者的文字——包括動手前的計劃、工具呼叫之間的敘述與進度更新、以及最終總結——必須全部使用${langName}，不得整段改用英文或其他語言。專有名詞、程式碼、檔案路徑、命令、模型名與原文引用除外。`
+      : `0. 语言跟随（最高优先）：本会话语言：${langName}。你所有面向用户的文字——包括动手前的计划、工具调用之间的叙述与进度更新、以及最终总结——必须全部使用${langName}，不得整段改用英文或其他语言。专有名词、代码、文件路径、命令、模型名与原文引用除外。`),
     '1. 先探索后动手：先看工作区现状（文件树 / list_files / read_file / search_text），不猜、不编造路径。',
     '2. 先说计划：动手前用 2-4 句话讲清计划——要建或改哪些文件、最后怎么验证——然后再调用工具。任务超过 3 步时，先调用 update_tasks 把清单列出来，每做完一项就更新，进度始终可见。',
     '3. 小步且完整：write_file 写出的文件必须完整、可运行，不留占位符、TODO 或半截代码；路径用相对路径（如 index.html、src/app.js），不要编造绝对路径。',
@@ -189,8 +328,11 @@ function agentProtocol(lang) {
     '7. 闲聊、打招呼、一般问题只用文字回复，不调用任何工具。',
     '8. 直接干，不要反复追问：用户的要求只要大方向明确，就立刻执行；细节缺失时用合理默认自己补齐，在交付总结里说明即可，不要把问题推回给用户，更不要把同一句追问说第二遍。',
     '9. 正文保持干净：聊天正文只写结论、摘要和关键数据；大段代码一律用 write_file 落盘，绝不把整份文件内容贴进聊天；引用工具输出时只摘关键几行。',
+    '10. 长期记忆：值得长期记住的事实（用户偏好、项目约定、重要决定）用 remember 写入长期记忆 MEMORY.md——它在每次对话开始时自动回到你的上下文；上下文被压缩时，早期对话要点也会沉淀进该文件。',
+    '11. 文档与图像：PDF 读文字用 read_pdf、扫描件与图片上的文字用 ocr_image、图片尺寸用 image_info、缩放/转格式用 process_image、看工作区里的图片用 view_image；screenshot_page 的截图与用户附件图片，在当前模型支持视觉时会直接呈现在你眼前，不支持时你会收到明确说明与文件路径，不要假装看过没看到的图。',
   ].join('\n') : [
     '[Agent working protocol — follow on every task]',
+    `0. LANGUAGE RULE (highest priority): Conversation language: ${langName}. ALL user-facing text you produce — including the plan you state before acting, the narration and progress updates between tool calls, and the final summary — MUST be written in ${langName}. Never switch wholesale to another language, even when these instructions, tool names or tool results are written in a different one. Exceptions: proper nouns, code, file paths, commands, model names, and verbatim quotations.`,
     '1. Explore before acting: inspect the workspace first (file tree / list_files / read_file / search_text). Never guess or invent paths.',
     '2. State a plan: before touching tools, say in 2-4 sentences what you will create or change and how you will verify it. For work with more than 3 steps, first call update_tasks to lay out the checklist, and update it as items complete so progress is always visible.',
     '3. Small and complete: every file you write must be complete and runnable — no placeholders, no TODOs, no half-finished code. Use relative paths, never invented absolute ones.',
@@ -200,20 +342,157 @@ function agentProtocol(lang) {
     '7. Chat, greetings and general questions: reply in plain text only, no tools.',
     '8. Act, do not interrogate: when the request is clear in intent, execute it immediately. Fill missing details with sensible defaults and note them in the summary — never bounce the question back, and never ask the same clarifying question twice.',
     '9. Keep the chat clean: prose carries conclusions, summaries and key numbers only. Full code always goes to files via write_file — never paste a whole file into the chat; quote only the few lines of tool output that matter.',
-  ].join('\n');
+    '10. Long-term memory: save facts worth keeping (user preferences, project conventions, important decisions) with the remember tool — they land in MEMORY.md, which is injected back into your context at the start of every conversation; when the context is compressed, extractive notes on the omitted messages are sedimented into the same file.',
+    '11. Documents and images: read PDF text with read_pdf, text on scans/photos with ocr_image, image dimensions with image_info, resize/convert with process_image, and look at a workspace image with view_image. Screenshots from screenshot_page and user-attached images are shown to you directly when the current model supports vision; when it does not, you get an explicit note naming the saved file — never pretend to have seen an image you did not see.',
+  ].join('\n')) + '\n' + notice;
 }
 
-async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images, signal, teamNote }) {
+/* ------------- provider request discipline (v0.15.5, item 91) -------------
+ * Two bots sharing one provider key used to pile independent fetches
+ * onto the upstream with no queue and no backoff: a 429 hit one run
+ * as an opaque failure while the other kept spending. Now:
+ *  - a per-endpoint in-flight soft cap (config.providerInflightMax):
+ *    rounds beyond the cap QUEUE at the request layer, abortably —
+ *    stopping the run frees its place in line, it does not leave a
+ *    ghost waiter. The slot covers the request + stream read only;
+ *    tool execution (and approval waits) never hold one.
+ *  - 429/5xx responses retry with exponential backoff + jitter,
+ *    honoring Retry-After, bounded in count and per-wait duration,
+ *    and every wait is announced as a 'notice' event so the run
+ *    surface shows WHY it is pausing. Exhaustion ends the round
+ *    with the stable key errProviderBusy instead of raw prose.
+ * The key is the endpoint baseUrl: resolveProvider hands the engine
+ * no provider id, and the contention that matters (one upstream
+ * account) lives at the endpoint anyway. A Map entry is dropped
+ * when its queue drains so the table stays box-sized. */
+const providerSlots = new Map(); // baseUrl -> { active, waiters[] }
+function acquireProviderSlot(key, signal) {
+  const max = Math.max(1, config.providerInflightMax || 4);
+  return new Promise((resolve, reject) => {
+    let s = providerSlots.get(key);
+    if (!s) { s = { active: 0, waiters: [] }; providerSlots.set(key, s); }
+    const waiter = { settled: false, onAbort: null };
+    const cleanup = () => { if (signal && waiter.onAbort) signal.removeEventListener('abort', waiter.onAbort); };
+    waiter.grant = () => {
+      if (waiter.settled) return;
+      waiter.settled = true; cleanup(); s.active++;
+      resolve(() => releaseProviderSlot(key));
+    };
+    waiter.onAbort = () => {
+      if (waiter.settled) return;
+      waiter.settled = true;
+      const i = s.waiters.indexOf(waiter);
+      if (i >= 0) s.waiters.splice(i, 1);
+      const e = new Error('provider queue wait aborted');
+      e.name = 'AbortError';
+      reject(e);
+    };
+    if (signal) {
+      if (signal.aborted) { waiter.onAbort(); return; }
+      signal.addEventListener('abort', waiter.onAbort, { once: true });
+    }
+    if (s.active < max) waiter.grant();
+    else s.waiters.push(waiter);
+  });
+}
+function releaseProviderSlot(key) {
+  const s = providerSlots.get(key);
+  if (!s) return;
+  s.active = Math.max(0, s.active - 1);
+  const max = Math.max(1, config.providerInflightMax || 4);
+  while (s.active < max && s.waiters.length) s.waiters.shift().grant();
+  if (!s.active && !s.waiters.length) providerSlots.delete(key);
+}
+function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); return; }
+    const cleanup = () => { clearTimeout(t); if (signal) signal.removeEventListener('abort', onAbort); };
+    const onAbort = () => { cleanup(); const e = new Error('aborted'); e.name = 'AbortError'; reject(e); };
+    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/* ------------- coded provider errors (v0.19.2, item 150) -------------
+ * Every error this driver throws carries a stable `.code` (a DICT
+ * key the server whitelists and the client localizes), an optional
+ * `.status`, and an optional `.detail` — the upstream's own
+ * error.message as PLAIN TEXT, capped at 120 chars. The raw upstream
+ * body is never spliced into `.message`: the message IS the code, so
+ * a raw English JSON envelope can no longer reach the error card
+ * (the codegemma tools-400 leak that opened item 150). */
+/* "Local" endpoint — ONE definition shared by the keyless
+ * exemption, the TTFT budget and the local-500 retry cap: loopback
+ * plus the LAN/private ranges (item 82's TTFT definition, now also
+ * the no-key definition — a keyless Ollama on 192.168.x.x used to be
+ * refused 'No API key' before any request was even sent). */
+const LOCAL_BASE_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(?::|\/|$)/i;
+const TOOLS_UNSUPPORTED_RE = /does not support tools|tools? (is )?not supported|tool calling (is )?not supported/i;
+const CONTEXT_LIMIT_RE = /context_length|context length|exceeds the available context|maximum context/i;
+
+/* Pull the human message out of an upstream error body: OpenAI
+ * shape { error: { message } }, Ollama native { error: "..." }, or
+ * a plain-text body. Malformed JSON yields '' — never the raw body. */
+function extractUpstreamMessage(bodyText) {
+  const raw = String(bodyText || '').trim();
+  if (!raw) return '';
+  try {
+    const j = JSON.parse(raw);
+    if (j && typeof j === 'object') {
+      if (j.error && typeof j.error === 'object' && typeof j.error.message === 'string') return j.error.message.trim();
+      if (typeof j.error === 'string') return j.error.trim();
+      return '';
+    }
+    return '';
+  } catch {
+    // Not JSON at all: a plain-text body IS the message; a body
+    // that merely LOOKS like JSON but failed to parse stays empty.
+    return /^[{\[]/.test(raw) ? '' : raw;
+  }
+}
+
+function codedError(code, { status, detail, cause } = {}) {
+  const e = new Error(code);
+  e.code = code;
+  if (status != null) e.status = status;
+  if (detail) e.detail = String(detail).slice(0, 120);
+  if (cause) e.cause = cause;
+  return e;
+}
+
+/* The non-OK status → code table (contract, v0.19.2). Retryable
+ * exhaustion (429/5xx) is coded at its own site in fetchRound. */
+function providerHttpError(status, bodyText) {
+  const upstream = extractUpstreamMessage(bodyText);
+  let code = 'errProviderGeneric';
+  if (status === 401 || status === 403) code = 'errProviderAuth';
+  else if (status === 404) code = 'errProviderModel';
+  else if (status === 400 && CONTEXT_LIMIT_RE.test(upstream)) code = 'errProviderContext';
+  else if (status === 400) code = 'errProviderRequest';
+  return codedError(code, { status, detail: upstream });
+}
+
+async function* openaiRun({ bot, history, userText, provider, lang, workspaceTree, images, signal, teamNote, memoryNote, forceNoTools }) {
   // The provider is resolved by the server (resolveProvider): a bot
   // with its own provider NEVER falls back to the env key here — that
   // fallback lives in resolveProvider and applies only to providerless
   // bots (audit fix: env keys must not leak to third-party endpoints).
-  if (!provider) throw new Error('No provider resolved for this bot.');
+  if (!provider) {
+    // Item 150 re-sweep N4: message IS the code, like every other
+    // engine error — downstream feeds (incl. the teammate tool
+    // result) then carry the stable key, never English prose.
+    const e = new Error('errNoProvider');
+    e.code = 'errNoProvider';
+    throw e;
+  }
   const baseUrl = provider.baseUrl;
   const apiKey = provider.apiKey || '';
   const model = bot.model || provider.model;
-  if (!apiKey && !/127\.0\.0\.1|localhost/.test(baseUrl)) {
-    throw new Error('No API key for this bot. Add a provider in Settings, then pick it in the bot editor.');
+  const isLocal = LOCAL_BASE_RE.test(baseUrl);
+  if (!apiKey && !isLocal) {
+    const e = new Error('errNoKey');
+    e.code = 'errNoKey';
+    throw e;
   }
   const zh = lang === 'zh' || lang === 'tw';
   const messages = [
@@ -223,24 +502,96 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       ? '当前工作区文件树（需要细节再用 read_file / search_text 看）：\n'
       : 'Current workspace file tree (use read_file / search_text for details):\n') + workspaceTree }] : []),
     ...(teamNote ? [{ role: 'system', content: teamNote }] : []),
+    ...(memoryNote ? [{ role: 'system', content: memoryNote }] : []),
     ...history.map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userText },
   ];
-  // Images ride along as OpenAI-style parts when the user attached
-  // any. Text-only models reject that with a 400 — caught below and
-  // downgraded to text (the files are in the workspace either way).
-  let visionActive = Array.isArray(images) && images.length > 0;
+  // Vision (v0.15.1, item 70 A1): the verdict for THIS run's model
+  // decides how images travel — see visionVerdict above. 'no' means
+  // blocks are never sent and the model reads the degradation note
+  // instead; 'unknown' tries the blocks and a provider rejection
+  // flips visionBlocked mid-run (the fetch retry below), stripping
+  // blocks and splicing the note in. Tool-result images arriving
+  // later in the run follow the same state.
+  let visionBlocked = visionVerdict(model) === 'no';
+  let visionActive = false;
+  // The user messages carrying tool-result image blocks that no
+  // successful fetch has accepted yet, kept so a rejection can
+  // strip them all (several image tools may land in one round).
+  let pendingImageMsgs = [];
   const userMsg = messages[messages.length - 1];
-  if (visionActive) {
-    userMsg.content = [
-      { type: 'text', text: userText },
-      ...images.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
-    ];
+  if (Array.isArray(images) && images.length > 0) {
+    if (visionBlocked) {
+      userMsg.content = userText + imageDegradationNote(images, lang);
+    } else {
+      visionActive = true;
+      userMsg.content = [
+        { type: 'text', text: userText },
+        ...images.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
+      ];
+    }
   }
+  /* Push one tool result into the conversation. Images ride as a
+   * following user message of image parts (the portable shape —
+   * array content inside a tool message is NOT accepted by several
+   * OpenAI-compatible providers), captioned with where the file
+   * lives. A vision-blocked model gets the note in the tool text. */
+  const pushToolResult = (toolCallId, result) => {
+    const { text, images: toolImages } = normalizeToolResult(result);
+    let content = text.slice(0, 16000);
+    if (toolImages.length && visionBlocked) content += imageDegradationNote(toolImages, lang);
+    messages.push({ role: 'tool', tool_call_id: toolCallId, content });
+    if (toolImages.length && !visionBlocked) {
+      const rels = toolImages.map((im) => im.rel || im.name).filter(Boolean);
+      // The bookkeeping (which images this message carries) lives
+      // OUTSIDE the message object: messages are serialized verbatim
+      // into the provider request, and a stray harness field could
+      // read as a malformed message to a strict provider.
+      const imgMsg = {
+        role: 'user',
+        content: [
+          { type: 'text', text: (zh ? '[工具产生的图片' : '[Image produced by a tool') + (rels.length ? `: ${rels.join(', ')}]` : ']') },
+          ...toolImages.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })),
+        ],
+      };
+      pendingImageMsgs.push({ msg: imgMsg, images: toolImages });
+      messages.push(imgMsg);
+    }
+    return content;
+  };
+  /* Strip every in-flight image block after a provider rejection:
+   * attachments revert to text + note, a pending tool image message
+   * is replaced by a plain note message. The run continues in text. */
+  const stripImagesAfterRejection = () => {
+    visionBlocked = true;
+    if (visionActive) {
+      visionActive = false;
+      userMsg.content = userText + imageDegradationNote(images, lang);
+    }
+    for (const { msg, images: imgs } of pendingImageMsgs) {
+      const idx = messages.indexOf(msg);
+      const noteMsg = { role: 'user', content: (zh ? '[工具图片]' : '[Tool image]') + imageDegradationNote(imgs, lang) };
+      if (idx >= 0) messages.splice(idx, 1, noteMsg);
+    }
+    pendingImageMsgs = [];
+  };
   // Ask for token usage in the stream (OpenAI/DeepSeek/OpenRouter/
   // Ollama all support stream_options.include_usage). A provider that
   // rejects the field gets one retry without it — see below.
   let useUsage = true;
+  // Final-round tools-off flag (v0.15, sweep P2-2): set on the last
+  // loop round so the model must close out in words — see the loop.
+  let noTools = false;
+  // Forced no-tools (v0.19.2, item 150): the server pre-check knows
+  // this model cannot call tools (capability probe), or the tools-400
+  // strip below discovered it mid-run. While forced, the request body
+  // carries NEITHER tools NOR tool_choice, and structured tool_calls
+  // the provider returns anyway are never executed (content only).
+  // Kept distinct from the final-round flag above: a merely-final
+  // round still sends tool_choice:'none' as it always has; a forced
+  // run omits the whole tools surface, final round included.
+  let forcedNoTools = !!forceNoTools;
+  if (forcedNoTools) noTools = true;
   // First-byte timeout (audit fix): a hung provider used to pin the
   // run forever. The caller's abort signal still governs the stream;
   // this only bounds the wait for the response to START, then hands
@@ -249,21 +600,43 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
   // take a minute or more just to load into RAM before the first byte
   // — at 30s every cold start died as a silent "no reply" (user report,
   // 2026-11-07). Remote APIs answer in well under 30s or not at all.
-  const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(baseUrl);
+  // Item 82: "local" includes LAN/private addresses — a
+  // home-network Ollama at 192.168.x.x cold-starts just as slowly
+  // as a loopback one and used to die against the 30s remote
+  // budget, indistinguishable from a dead provider.
   const TTFT_MS = isLocal ? 180000 : 30000;
   const doFetch = async () => {
     const ctl = new AbortController();
     const onAbort = () => ctl.abort();
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => ctl.abort(new Error(`provider did not respond within ${Math.round(TTFT_MS / 1000)}s`)), TTFT_MS);
+    let ttftFired = false;
+    const timer = setTimeout(() => { ttftFired = true; ctl.abort(new Error(`provider did not respond within ${Math.round(TTFT_MS / 1000)}s`)); }, TTFT_MS);
     try {
       const res = await fetch(baseUrl + '/chat/completions', {
         signal: ctl.signal,
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: 'Bearer ' + apiKey } : {}) },
-        body: JSON.stringify({ model, messages, tools: openaiTools(), stream: true, ...(useUsage ? { stream_options: { include_usage: true } } : {}) }),
+        // One fetch site serves both the plain and the tool-calling
+        // rounds, so the output cap lands on both (v0.14 batch 2,
+        // audit P1-14): without max_tokens a runaway completion is
+        // bounded only by the provider's own default. There is no
+        // separate Anthropic driver in this codebase — the
+        // OpenAI-compatible path is the only API path. 0 in config
+        // omits the field entirely (provider default rules).
+        // Forced no-tools omits tools AND tool_choice entirely; the
+        // final-round flag alone keeps its historical
+        // tool_choice:'none' shape (v0.19.2).
+        body: JSON.stringify({ model, messages, ...(forcedNoTools ? {} : noTools ? { tool_choice: 'none' } : { tools: openaiTools() }), stream: true, ...(config.maxTokensOut > 0 ? { max_tokens: config.maxTokensOut } : {}), ...(useUsage ? { stream_options: { include_usage: true } } : {}) }),
       });
       return res;
+    } catch (err) {
+      // The caller's own Stop passes through untouched — it is not
+      // a provider failure. Everything else fetch throws is coded:
+      // our TTFT abort is a timeout; a connection refusal / DNS /
+      // reset is 'down', with the original error kept as `cause`.
+      if (signal && signal.aborted) throw err;
+      if (ttftFired) throw codedError('errProviderTimeout', { cause: err });
+      throw codedError('errProviderDown', { cause: err });
     } finally {
       // The timer bounds only the wait for the response to start. The
       // abort-forwarding listener intentionally stays registered for
@@ -272,181 +645,345 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
       clearTimeout(timer);
     }
   };
-  for (let round = 0; round < 25; round++) {
-    if (signal && signal.aborted) return;
-    let res = await doFetch();
-    if (!res.ok && useUsage) {
-      const peek = await res.clone().text().catch(() => '');
-      if (/stream_options|include_usage/.test(peek)) { useUsage = false; res = await doFetch(); }
-    }
-    if (!res.ok && visionActive && round === 0) {
-      visionActive = false;
-      userMsg.content = userText + (zh
-        ? '\n[注意：附带的图片没能发送给当前模型（它不支持图片输入），文件已存入工作区 uploads/ 目录。]'
-        : '\n[Note: the attached image(s) could not be sent to this model (it does not accept image input); the files are saved in the workspace under uploads/.]');
-      res = await doFetch();
-    }
-    if (!res.ok || !res.body) {
-      const peek = res.ok ? '' : await res.text().catch(() => '');
-      throw new Error('AI endpoint returned ' + res.status + (peek ? ': ' + peek.slice(0, 200) : ''));
-    }
-    const calls = new Map();
-    let lastSlotKey = null; // providers may omit tool_call.index
-    let lastUsage = null;
-    let content = '';
-    let reasoning = '';
-    // Small/local models often skip the structured tool_calls channel
-    // and print the call as text instead. Buffering is per LINE: a
-    // line whose start could still become a text call (JSON shape, or
-    // a tool-name prefix like `run_shell{`) is held until the round
-    // ends and parseTextToolCall decides; prose lines stream through
-    // the moment they are classified. (The name-prefix form used to
-    // flush instantly and leak raw JSON into the chat.)
-    let segBuf = '';
-    let mode = 'classify'; // classify | flow | hold
-    function* drain() {
-      for (;;) {
-        if (!segBuf || mode === 'hold') return;
-        if (mode === 'classify') {
-          const probe = segBuf.trimStart();
-          if (!probe) {
-            const nl = segBuf.indexOf('\n');
-            if (nl < 0) return;
-            yield { type: 'token', text: segBuf.slice(0, nl + 1) }; segBuf = segBuf.slice(nl + 1); continue;
-          }
-          if (!couldBeTextCall(probe)) { mode = 'flow'; continue; }
-          if (segBuf.includes('\n') || segBuf.length > 64000) { mode = 'hold'; return; }
-          return; // still ambiguous — wait for more of the line
-        }
-        // flow: stream up to and including the next newline, then the
-        // following line needs classifying again.
-        const nl = segBuf.indexOf('\n');
-        if (nl < 0) { yield { type: 'token', text: segBuf }; segBuf = ''; return; }
-        yield { type: 'token', text: segBuf.slice(0, nl + 1) }; segBuf = segBuf.slice(nl + 1); mode = 'classify';
-      }
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    // Mid-stream idle guard: a provider that opens the stream and then
-    // goes silent (crashed model process, wedged proxy) must not pin
-    // the turn forever — 120s without a single chunk ends it loudly.
-    const IDLE_MS = 120000;
+  /* One round's request under the backoff discipline (v0.15.5,
+   * item 91): retryable statuses (429 + the transient 5xx family)
+   * are retried with exponential backoff + jitter, honoring a
+   * numeric Retry-After, every wait announced as a notice event so
+   * the pause is visible instead of reading as a stall. Any other
+   * response returns immediately — the semantic fallbacks below
+   * (stream_options strip, vision strip) still get their say on
+   * it. Exhaustion on a retryable status throws the stable key
+   * errProviderBusy: by then the provider has said no several
+   * times, and the run surface deserves a localizable reason, not
+   * a raw upstream body. An async generator purely so the notice
+   * can ride the run's own event stream (consume with yield*). */
+  const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+  const fetchRound = async function* () {
+    let attempt = 0;
     for (;;) {
-      let idleTimer = null;
-      let step;
-      try {
-        step = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) => { idleTimer = setTimeout(() => reject(new Error('provider stopped responding mid-stream')), IDLE_MS); }),
-        ]);
-      } catch (e) {
-        try { await reader.cancel(); } catch { /* already gone */ }
+      const res = await doFetch();
+      if (res.ok || !RETRYABLE_STATUS.has(res.status)) return res;
+      // Local 500s retry at most ONCE (v0.19.2, P1-7): a local 500
+      // is usually a model load failure / OOM, and the old discipline
+      // hammered the box with 4 cold-load attempts. Cloud endpoints
+      // keep the configured backoff count for every status; local
+      // non-500 statuses keep it too — only the 500 is capped.
+      const maxRetries = isLocal && res.status === 500
+        ? Math.min(1, config.providerRetryMax)
+        : config.providerRetryMax;
+      if (attempt >= maxRetries) {
+        const bodyText = await res.text().catch(() => '');
+        if (res.status === 429) {
+          const e = new Error('errProviderBusy');
+          e.code = 'errProviderBusy';
+          e.status = res.status;
+          throw e;
+        }
+        // 5xx exhaustion is a SERVER failure, not rate limiting —
+        // it used to borrow errProviderBusy and misdiagnose Ollama
+        // load failures / OOM as throttling (P1-7).
+        throw codedError('errProviderServer', { status: res.status, detail: extractUpstreamMessage(bodyText) });
+      }
+      attempt++;
+      const status = res.status;
+      // Drain the refused body so keep-alive can reuse the socket.
+      try { await res.text(); } catch { /* ignore */ }
+      const ra = Number(res.headers.get('retry-after'));
+      let waitMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : config.providerRetryBaseMs * 2 ** (attempt - 1);
+      waitMs = Math.min(config.providerRetryCapMs, waitMs);
+      waitMs = Math.max(1, Math.round(waitMs * (0.75 + Math.random() * 0.5))); // jitter ±25%
+      yield { type: 'notice', key: 'providerWait', attempt, waitMs, status };
+      await abortableSleep(waitMs, signal);
+    }
+  };
+  for (let round = 0; round < 25; round++) {
+    let releaseSlot = null;
+    try {
+      if (signal && signal.aborted) return;
+      if (round === 24) {
+        // Last round (v0.15, sweep P2-2): the loop used to end
+        // mid-task in total silence — 25 rounds of tool work and no
+        // closing word. The final round is tools-off with an explicit
+        // instruction to summarize what is done and what remains.
+        noTools = true;
+        messages.push({ role: 'user', content: zh
+          ? '[系统] 工具调用轮次即将用完，这是最后一轮：不要再尝试调用工具（工具已关闭），直接用文字总结——已经完成了什么、还差什么、下一步需要什么。'
+          : '[System] This is the final round — tools are now off. Do not attempt any tool call. Summarize in plain text: what is done, what remains, and what you need next.' });
+      }
+      // Queue for a provider slot first (v0.15.5): the finally
+      // around this round is the backstop release; the explicit
+      // release after the stream is read keeps tool execution
+      // (and approval waits) from holding provider capacity.
+      releaseSlot = await acquireProviderSlot(baseUrl, signal);
+      let res = yield* fetchRound();
+      /* Semantic fallback chain (v0.19.2): three ORTHOGONAL strips,
+       * each firing at most once and each re-examining the CURRENT
+       * response, so none can swallow another — a tools-400 retry
+       * that comes back vision-shaped still gets its image strip,
+       * and vice versa. Order: stream_options (field-level, cheapest
+       * diagnosis), tools (capability of the model), vision (payload
+       * shape). The generic coded throw below only sees a response
+       * no strip claimed. */
+      for (;;) {
+        if (res.ok) break;
+        if (useUsage) {
+          const peek = await res.clone().text().catch(() => '');
+          if (/stream_options|include_usage/.test(peek)) { useUsage = false; res = yield* fetchRound(); continue; }
+        }
+        if (res.status === 400 && !noTools && !forcedNoTools) {
+          // tools-400 (item 150): this request DID carry tools and
+          // the upstream says the model does not support them.
+          // Degrade THIS run to forced no-tools — same shape as a
+          // pre-check forceNoTools — announce it, and resend the
+          // round once. Only this exact 400 shape qualifies; every
+          // other 400 falls through to the coded throw. Later rounds
+          // send no tools (forcedNoTools persists), so the strip
+          // cannot fire twice.
+          const peek = await res.clone().text().catch(() => '');
+          if (TOOLS_UNSUPPORTED_RE.test(extractUpstreamMessage(peek))) {
+            forcedNoTools = true;
+            noTools = true;
+            yield { type: 'notice', key: 'noToolsDegraded' };
+            res = yield* fetchRound();
+            continue;
+          }
+        }
+        if (!visionBlocked && (visionActive || pendingImageMsgs.length)) {
+          // The provider rejected a request carrying image blocks
+          // (v0.15.1 generalization of the old round-0 attachment
+          // fallback): this model cannot take images — strip them,
+          // splice the explicit degradation note in their place, and
+          // retry the round in pure text. The files stay in the
+          // workspace either way.
+          stripImagesAfterRejection();
+          res = yield* fetchRound();
+          continue;
+        }
+        break;
+      }
+      if (!res.ok || !res.body) {
+        const bodyText = res.ok ? '' : await res.text().catch(() => '');
+        throw providerHttpError(res.status, bodyText);
+      }
+      const calls = new Map();
+      let lastSlotKey = null; // providers may omit tool_call.index
+      let lastUsage = null;
+      let content = '';
+      let reasoning = '';
+      // Round diagnostics (v0.15.7, item 117): WHY a round ended is
+      // part of the result, not a rumor. finish_reason used to be
+      // dropped on the floor, and a provider error object arriving
+      // INSIDE the stream (a data chunk carrying { error }, or a
+      // bare JSON error body on a 200 response) was parsed as
+      // "no choices" and silently skipped — the round then ended
+      // with no content and the user was told "empty reply" while
+      // the real cause (quota, context limit, filter) evaporated.
+      let finishReason = null;
+      let streamError = null;
+      let sawDone = false;
+      // Small/local models often skip the structured tool_calls channel
+      // and print the call as text instead. Buffering is per LINE: a
+      // line whose start could still become a text call (JSON shape, or
+      // a tool-name prefix like `run_shell{`) is held until the round
+      // ends and parseTextToolCall decides; prose lines stream through
+      // the moment they are classified. (The name-prefix form used to
+      // flush instantly and leak raw JSON into the chat.)
+      let segBuf = '';
+      let mode = 'classify'; // classify | flow | hold
+      function* drain() {
+        for (;;) {
+          if (!segBuf || mode === 'hold') return;
+          if (mode === 'classify') {
+            const probe = segBuf.trimStart();
+            if (!probe) {
+              const nl = segBuf.indexOf('\n');
+              if (nl < 0) return;
+              yield { type: 'token', text: segBuf.slice(0, nl + 1) }; segBuf = segBuf.slice(nl + 1); continue;
+            }
+            if (!couldBeTextCall(probe)) { mode = 'flow'; continue; }
+            if (segBuf.includes('\n') || segBuf.length > 64000) { mode = 'hold'; return; }
+            return; // still ambiguous — wait for more of the line
+          }
+          // flow: stream up to and including the next newline, then the
+          // following line needs classifying again.
+          const nl = segBuf.indexOf('\n');
+          if (nl < 0) { yield { type: 'token', text: segBuf }; segBuf = ''; return; }
+          yield { type: 'token', text: segBuf.slice(0, nl + 1) }; segBuf = segBuf.slice(nl + 1); mode = 'classify';
+        }
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      // Mid-stream idle guard: a provider that opens the stream and then
+      // goes silent (crashed model process, wedged proxy) must not pin
+      // the turn forever — 120s without a single chunk ends it loudly.
+      const IDLE_MS = 120000;
+      for (;;) {
+        let idleTimer = null;
+        let step;
+        try {
+          step = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) => { idleTimer = setTimeout(() => reject(codedError('errProviderStream')), IDLE_MS); }),
+          ]);
+        } catch (e) {
+          try { await reader.cancel(); } catch { /* already gone */ }
+          throw e;
+        } finally { clearTimeout(idleTimer); }
+        const { done, value } = step;
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) {
+            // A 200 response carrying a bare JSON error body (some
+            // providers answer errors without the SSE framing):
+            // the line is the error object itself.
+            if (line.startsWith('{') && !sawDone) {
+              try { const j = JSON.parse(line); if (j && j.error && !streamError) streamError = j.error; } catch { /* not json */ }
+            }
+            continue;
+          }
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') { sawDone = true; break; }
+          let json; try { json = JSON.parse(data); } catch { continue; }
+          if (json.error && !sawDone && !streamError) streamError = json.error;
+          if (json.usage) lastUsage = json.usage;
+          if (json.choices?.[0]?.finish_reason) finishReason = json.choices[0].finish_reason;
+          const delta = json.choices?.[0]?.delta || {};
+          // Thinking models (DeepSeek-R, Qwen3, …) stream their chain of
+          // thought in a separate field. Forward it as its own event so
+          // the UI can fold it away — and so a model that ONLY thinks
+          // out loud is not mistaken for a silent one.
+          const rText = delta.reasoning_content || delta.reasoning || '';
+          if (rText) { reasoning += rText; yield { type: 'reasoning', text: rText }; }
+          if (delta.content) {
+            // Content ALWAYS passes through the holdback buffer, even
+            // when structured tool calls are also streaming: some
+            // providers (DeepSeek notably) print the same call as text
+            // alongside the structured one, and raw-streaming content
+            // whenever a call slot existed leaked that print into the
+            // chat (v0.10.1 fix). Round-end reconciliation below decides
+            // what the held text really was.
+            content += delta.content;
+            segBuf += delta.content;
+            yield* drain();
+          }
+          for (const tc of delta.tool_calls || []) {
+            // Some providers omit index: fall back to the slot currently
+            // streaming instead of merging every call into one undefined
+            // key (audit fix).
+            const key = tc.index != null ? tc.index : (lastSlotKey ?? 0);
+            lastSlotKey = key;
+            const slot = calls.get(key) || { name: '', args: '' };
+            if (tc.function?.name) slot.name = tc.function.name;
+            if (tc.function?.arguments) slot.args += tc.function.arguments;
+            calls.set(key, slot);
+          }
+        }
+      }
+      // The provider stream is fully read: nothing is in flight
+      // any more. Release the slot BEFORE tool execution — tools
+      // and approval waits must never hold provider capacity (the
+      // round's finally remains the backstop for thrown paths).
+      if (releaseSlot) { releaseSlot(); releaseSlot = null; }
+      if (lastUsage) yield { type: 'usage', usage: lastUsage };
+      if (streamError) {
+        // The provider said no MID-STREAM (v0.15.7, item 117):
+        // that is a failed round, not an empty one. The stable
+        // code lets the client localize; the upstream's own words
+        // ride in `detail` for the server log + audit, so the real
+        // cause (quota / context length / filter) survives.
+        const e = new Error('errProviderStream');
+        e.code = 'errProviderStream';
+        e.detail = String(streamError.message || streamError.code || streamError.type || 'stream error').slice(0, 300);
         throw e;
-      } finally { clearTimeout(idleTimer); }
-      const { done, value } = step;
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (data === '[DONE]') break;
-        let json; try { json = JSON.parse(data); } catch { continue; }
-        if (json.usage) lastUsage = json.usage;
-        const delta = json.choices?.[0]?.delta || {};
-        // Thinking models (DeepSeek-R, Qwen3, …) stream their chain of
-        // thought in a separate field. Forward it as its own event so
-        // the UI can fold it away — and so a model that ONLY thinks
-        // out loud is not mistaken for a silent one.
-        const rText = delta.reasoning_content || delta.reasoning || '';
-        if (rText) { reasoning += rText; yield { type: 'reasoning', text: rText }; }
-        if (delta.content) {
-          // Content ALWAYS passes through the holdback buffer, even
-          // when structured tool calls are also streaming: some
-          // providers (DeepSeek notably) print the same call as text
-          // alongside the structured one, and raw-streaming content
-          // whenever a call slot existed leaked that print into the
-          // chat (v0.10.1 fix). Round-end reconciliation below decides
-          // what the held text really was.
-          content += delta.content;
-          segBuf += delta.content;
-          yield* drain();
-        }
-        for (const tc of delta.tool_calls || []) {
-          // Some providers omit index: fall back to the slot currently
-          // streaming instead of merging every call into one undefined
-          // key (audit fix).
-          const key = tc.index != null ? tc.index : (lastSlotKey ?? 0);
-          lastSlotKey = key;
-          const slot = calls.get(key) || { name: '', args: '' };
-          if (tc.function?.name) slot.name = tc.function.name;
-          if (tc.function?.arguments) slot.args += tc.function.arguments;
-          calls.set(key, slot);
-        }
       }
-    }
-    if (lastUsage) yield { type: 'usage', usage: lastUsage };
-    if (!calls.size) {
-      // No structured calls: was the text itself a tool call in disguise?
-      let call = parseTextToolCall(content);
-      if (!call) {
-        // The strict forms missed it — try the held tail loosely (a
-        // call followed by trailing prose in the same held segment).
-        const loose = extractLooseTextCall(segBuf);
-        if (loose) {
-          call = loose;
-          const rest = (segBuf.slice(0, loose.start) + segBuf.slice(loose.end)).trim();
-          segBuf = '';
+      if (forcedNoTools && calls.size) {
+        // Forced no-tools guard (v0.19.2): the provider ignored the
+        // absence of a tools surface and returned structured calls
+        // anyway. They are NEVER executed and never surfaced as tool
+        // events — the round proceeds on content alone, and empty
+        // content takes the existing empty-reply path below.
+        calls.clear();
+      }
+      if (!calls.size) {
+        // No structured calls: was the text itself a tool call in
+        // disguise? Under noTools (forced or final round) a text
+        // call is never upgraded either — it stays prose, matching
+        // the reconciliation rule (found && !noTools) below.
+        let call = noTools ? null : parseTextToolCall(content);
+        if (!call && !noTools) {
+          // The strict forms missed it — try the held tail loosely (a
+          // call followed by trailing prose in the same held segment).
+          const loose = extractLooseTextCall(segBuf);
+          if (loose) {
+            call = loose;
+            const rest = (segBuf.slice(0, loose.start) + segBuf.slice(loose.end)).trim();
+            segBuf = '';
+            if (rest) yield { type: 'token', text: rest };
+          }
+        }
+        if (call) {
+          messages.push({ role: 'assistant', content: null,
+            tool_calls: [{ id: 'call_0', type: 'function', function: { name: call.name, arguments: JSON.stringify(call.args) } }] });
+          const result = yield { type: 'tool', name: call.name, args: call.args };
+          pushToolResult('call_0', result);
+          continue;
+        }
+        if (segBuf) yield { type: 'token', text: segBuf };
+        else if (!content && reasoning) yield { type: 'token', text: reasoning };
+        else if (!content) {
+          // A literally empty round (v0.15.7, item 117): report
+          // the diagnosed cause on the diagnostics channel so the
+          // server can log/audit it and answer with the REAL
+          // reason (truncated by the output limit, filtered, or
+          // a silent no-output) instead of one generic sentence.
+          const cause = finishReason === 'length' ? 'length'
+            : (finishReason === 'content_filter' || finishReason === 'safety') ? 'filtered'
+            : 'no_output';
+          yield { type: 'empty', cause, finishReason: finishReason || null, usage: lastUsage || null };
+        }
+        return;
+      }
+      // Round-end reconciliation for the held tail: it is prose, a
+      // duplicate print of a structured call (drop it), or an extra
+      // text-only call (execute it alongside). It never reaches the
+      // chat as raw call text, and the stored context keeps prose only.
+      let storedContent = content;
+      if (segBuf) {
+        const flushedProse = content.slice(0, content.length - segBuf.length);
+        let found = null;
+        const strict = parseTextToolCall(segBuf);
+        if (strict) found = { ...strict, start: 0, end: segBuf.length };
+        else found = extractLooseTextCall(segBuf);
+        if (found && !noTools) {
+          const rest = (segBuf.slice(0, found.start) + segBuf.slice(found.end)).trim();
+          const dup = [...calls.values()].some((c) => {
+            if (c.name !== found.name) return false;
+            try { return canonical(JSON.parse(c.args || '{}')) === canonical(found.args); } catch { return false; }
+          });
+          if (!dup) calls.set('text_' + calls.size, { name: found.name, args: JSON.stringify(found.args) });
           if (rest) yield { type: 'token', text: rest };
+          storedContent = (flushedProse + (rest ? '\n' + rest : '')).trim();
+        } else if (!(noTools && found)) {
+          yield { type: 'token', text: segBuf };
         }
+        segBuf = '';
       }
-      if (call) {
-        messages.push({ role: 'assistant', content: null,
-          tool_calls: [{ id: 'call_0', type: 'function', function: { name: call.name, arguments: JSON.stringify(call.args) } }] });
-        const result = yield { type: 'tool', name: call.name, args: call.args };
-        messages.push({ role: 'tool', tool_call_id: 'call_0', content: String(result).slice(0, 16000) });
-        continue;
+      messages.push({ role: 'assistant', content: storedContent || null,
+        tool_calls: [...calls.values()].map((c, i) => ({ id: 'call_' + i, type: 'function', function: { name: c.name, arguments: c.args || '{}' } })) });
+      let idx = 0;
+      for (const c of calls.values()) {
+        let args = {};
+        let invalidArgs = false;
+        try { args = JSON.parse(c.args || '{}'); } catch { invalidArgs = true; }
+        const result = yield { type: 'tool', name: c.name, args, invalidArgs };
+        pushToolResult('call_' + idx++, result);
       }
-      if (segBuf) yield { type: 'token', text: segBuf };
-      else if (!content && reasoning) yield { type: 'token', text: reasoning };
-      return;
-    }
-    // Round-end reconciliation for the held tail: it is prose, a
-    // duplicate print of a structured call (drop it), or an extra
-    // text-only call (execute it alongside). It never reaches the
-    // chat as raw call text, and the stored context keeps prose only.
-    let storedContent = content;
-    if (segBuf) {
-      const flushedProse = content.slice(0, content.length - segBuf.length);
-      let found = null;
-      const strict = parseTextToolCall(segBuf);
-      if (strict) found = { ...strict, start: 0, end: segBuf.length };
-      else found = extractLooseTextCall(segBuf);
-      if (found) {
-        const rest = (segBuf.slice(0, found.start) + segBuf.slice(found.end)).trim();
-        const dup = [...calls.values()].some((c) => {
-          if (c.name !== found.name) return false;
-          try { return canonical(JSON.parse(c.args || '{}')) === canonical(found.args); } catch { return false; }
-        });
-        if (!dup) calls.set('text_' + calls.size, { name: found.name, args: JSON.stringify(found.args) });
-        if (rest) yield { type: 'token', text: rest };
-        storedContent = (flushedProse + (rest ? '\n' + rest : '')).trim();
-      } else {
-        yield { type: 'token', text: segBuf };
-      }
-      segBuf = '';
-    }
-    messages.push({ role: 'assistant', content: storedContent || null,
-      tool_calls: [...calls.values()].map((c, i) => ({ id: 'call_' + i, type: 'function', function: { name: c.name, arguments: c.args || '{}' } })) });
-    let idx = 0;
-    for (const c of calls.values()) {
-      let args = {};
-      let invalidArgs = false;
-      try { args = JSON.parse(c.args || '{}'); } catch { invalidArgs = true; }
-      const result = yield { type: 'tool', name: c.name, args, invalidArgs };
-      messages.push({ role: 'tool', tool_call_id: 'call_' + idx++, content: String(result).slice(0, 16000) });
+    } finally {
+      if (releaseSlot) { try { releaseSlot(); } catch { /* already released */ } releaseSlot = null; }
     }
   }
 }
@@ -454,13 +991,53 @@ async function* openaiRun({ bot, history, userText, provider, lang, workspaceTre
 /* ------------- claude-cli: your locally logged-in Claude ------------- */
 // Shells out to the `claude` CLI in print mode. No tool loop in this
 // starter driver — the CLI runs its own tools under its own permissions.
-function claudeCliRun({ bot, history, userText, signal }) {
+//
+// Confinement (v0.14 batch 4, audit P1-10): the CLI used to run with
+// the SERVER's working directory and the server's FULL environment
+// (vault master key included), so any member chatting with a
+// claude-cli bot could drive host-level file/shell access through
+// the CLI's own tools. Now:
+//   - cwd is the bot's own workspace (the server passes it in);
+//   - the environment is the sandbox whitelist (tools.js sandboxEnv)
+//     — PATH/HOME/locale only, never server secrets. HOME stays so
+//     the operator's local CLI login keeps working.
+//   - the engine itself is owner-gated at the server (bot create /
+//     update / chat all refuse it for non-site-owner bots with
+//     errClaudeOwnerOnly) — see server.js claudeEngineAllowed.
+// Residual, stated plainly: the CLI's own tools still run as the
+// server OS user with the workspace as cwd — a determined prompt can
+// ask it to walk out of the workspace. That is why the engine is
+// owner-only; it is a power tool for the operator's own bots, not a
+// sandbox.
+function claudeCliRun({ bot, history, userText, signal, workspace, images, memoryNote }) {
   return (async function* () {
     const transcript = history.map((h) => `${h.role}: ${h.content}`).join('\n');
-    const prompt = `${bot.persona || ''}\n\nConversation so far:\n${transcript}\n\nuser: ${userText}`;
+    // Attachments (v0.15.1): the CLI gets no image blocks through
+    // this driver — it gets the saved file PATHS, which its own
+    // Read tool can open as images. Memory rides as text, same as
+    // every other engine.
+    const imgNote = Array.isArray(images) && images.length
+      ? `\n\n[The user attached image file(s), saved in the workspace: ${images.map((im) => im.rel || im.name || 'uploads/').join(', ')}. Open them with your Read tool if you need to see them.]`
+      : '';
+    const memNote = memoryNote ? `\n\n${memoryNote}` : '';
+    const prompt = `${bot.persona || ''}${memNote}\n\nConversation so far:\n${transcript}\n\nuser: ${userText}${imgNote}`;
     const out = await new Promise((resolve, reject) => {
-      execFile('claude', ['-p', prompt, '--output-format', 'text'], { timeout: 120_000, maxBuffer: 4 * 1024 * 1024, signal },
-        (err, stdout, stderr) => (err ? reject(new Error('claude CLI failed: ' + (stderr || err.message))) : resolve(stdout)));
+      execFile('claude', ['-p', prompt, '--output-format', 'text'], {
+        timeout: 120_000, maxBuffer: 4 * 1024 * 1024, signal,
+        ...(workspace ? { cwd: workspace } : {}),
+        env: sandboxEnv(),
+      },
+        (err, stdout, stderr) => {
+          if (!err) { resolve(stdout); return; }
+          // Coded like every other engine failure (v0.19.2, FIX-12):
+          // the full stderr no longer rides the message — only its
+          // tail (<=200 chars) survives, as `detail`.
+          const e = new Error('errClaudeCli');
+          e.code = 'errClaudeCli';
+          const tail = String(stderr || err.message || '').slice(-200);
+          if (tail) e.detail = tail;
+          reject(e);
+        });
     });
     yield { type: 'token', text: String(out).trim() };
   })();
@@ -482,7 +1059,10 @@ export const ENGINES = {
     available: async () => true,
     run: openaiRun,
   },
-  'claude-cli': { label: 'Claude CLI (local login)', available: checkClaude, run: claudeCliRun },
+  // ownerOnly (v0.14 batch 4): the server refuses this engine for
+  // bots whose owner is not a site owner, and the client annotates
+  // it in the engine picker (i18n key engineClaudeRisk).
+  'claude-cli': { label: 'Claude CLI (local login)', available: checkClaude, run: claudeCliRun, ownerOnly: true },
 };
 
 export function getEngine(name) {
@@ -491,7 +1071,7 @@ export function getEngine(name) {
 
 export async function engineStatus() {
   const out = [];
-  for (const [id, e] of Object.entries(ENGINES)) out.push({ id, label: e.label, available: await e.available() });
+  for (const [id, e] of Object.entries(ENGINES)) out.push({ id, label: e.label, available: await e.available(), ...(e.ownerOnly ? { ownerOnly: true } : {}) });
   return out;
 }
 

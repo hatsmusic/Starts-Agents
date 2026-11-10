@@ -42,7 +42,10 @@ test('packages exclude secrets and carry unix permissions', () => {
   fs.writeFileSync(path.join(ws, 'id_rsa'), 'PRIVATE\n');
   fs.writeFileSync(path.join(ws, 'app.js'), 'console.log(1)\n');
   const pkg = tools.buildPackage(ctx, 'demo');
-  assert.deepEqual(pkg.excluded.sort(), ['.env', 'id_rsa']);
+  // v0.14 batch 4: link.txt is the symlink to an outside file planted
+  // by the search test above — skipped links are now NAMED in the
+  // excluded list instead of vanishing silently.
+  assert.deepEqual(pkg.excluded.sort(), ['.env', 'id_rsa', 'link.txt']);
   const zip = fs.readFileSync(path.join(dir, 'packages', 'b1', pkg.file));
   // central header: version-made-by high byte 3 (Unix), ext attrs mode
   const cen = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
@@ -64,7 +67,9 @@ test('team files round-trip hostile personas losslessly', () => {
 
 test('audit log redacts secret-shaped strings', () => {
   store.audit({ kind: 'tool', tool: 'run_shell', args: 'curl -H "Authorization: Bearer abcdef12345" -d api_key=sk-live-12345678' });
-  const log = fs.readFileSync(path.join(dir, 'audit.log'), 'utf8');
+  // v0.14 batch 5a: the audit log lives in app.db now — read it back
+  // through the store instead of the old JSONL file.
+  const log = JSON.stringify(store.readAudit(50));
   assert.doesNotMatch(log, /abcdef12345|sk-live-12345678/);
   assert.match(log, /•••/);
 });

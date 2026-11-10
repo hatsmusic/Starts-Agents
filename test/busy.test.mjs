@@ -61,7 +61,9 @@ test('busy 409 carries live run status; stop frees the slot for a resend', async
     assert.ok(botId, 'bot id in create response');
 
     // Turn 1: "run …" parks on an approval (echo engine + run_shell).
-    const chat1 = await post(`/api/bots/${botId}/chat`, { text: 'run echo hi' });
+    // v0.14.2 (item 51): plain `echo hi` is provably read-only now and
+    // auto-passes — parking needs a write-tendency command (redirect).
+    const chat1 = await post(`/api/bots/${botId}/chat`, { text: 'run echo hi > out.txt' });
     assert.equal(chat1.status, 200);
     const reader1 = chat1.body.getReader();
     const seen = await readUntil(reader1, (b) => b.includes('event: approval'));

@@ -5,12 +5,24 @@
   },
   "license": "MIT",
   "name": "starts-agents",
+  "files": [
+    "src",
+    "public",
+    "docs",
+    "scripts",
+    "test",
+    "teams",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    ".env.example"
+  ],
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check src/server.js && node --check src/auth.js && node --check src/tools.js && node --check src/engines.js && node --check src/store.js && node --check public/app.js"
+    "vault:rotate": "node scripts/rotate-vault.mjs",
+    "check": "node --check src/server.js && node --check src/auth.js && node --check src/tools.js && node --check src/engines.js && node --check src/store.js && node --check src/db.js && node --check src/log.js && node --check src/vault.js && node --check src/modules.js && node --check src/sandbox-env.js && node --check src/ratelimit.js && node --check src/context.js && node --check src/memory.js && node --check src/trust.js && node --check src/risk.js && node --check src/mcp.js && node --check src/server-i18n.js && node --check src/avatars.js && node --check src/approvals.js && node --check src/sitelogin.js && node --check src/totp.js && node --check src/oauth-apps.js && node --check src/config.js && node --check src/shell-summary.js && node --check src/i18n-slice.js && node --check src/scrub.js && node --check src/monitor.js && node --check src/browser-viewer.js && node --check src/browser-box.js && node --check src/presets.js && node --check src/providers-catalog.js && node --check src/local-models.js && node --check src/icon.js && node --check src/team.js && node --check src/zip.js && node --check scripts/rotate-vault.mjs && node --check public/app.js && node --check public/i18n.js && node --check public/ui-utils.js"
   },
   "type": "module",
-  "version": "0.12.1"
+  "version": "0.20.0"
 }

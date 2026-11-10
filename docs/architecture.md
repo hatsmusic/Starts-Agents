@@ -76,10 +76,12 @@ another person (or another model) to recreate the crew.
 
 ## Data
 
-`data/state.json` (roster + transcripts + providers), `data/auth.json`
-(accounts + sessions), `data/projects/<botId>/` (each bot's workspace —
-the only place its file tools may touch), `data/packages/<botId>/`
-(built zips), `data/tasks/`, `data/usage.json`, `data/runs.json`,
-`data/audit.log`. Delete `data/` to start over (accounts included).
+`data/app.db` — one SQLite database (node:sqlite, WAL) holding the
+roster, transcripts, providers, grants, usage, run history,
+accounts, sessions, codes and the audit log; `data/backups/` holds
+its automatic snapshots, `data/projects/<botId>/` is each bot's
+workspace (the only place its file tools may touch),
+`data/packages/<botId>/` holds built zips, `data/tasks/` per-bot
+task lists. Delete `data/` to start over (accounts included).
 The master key and share secret live OUTSIDE `data/` — see
 SECURITY.md before moving or restoring anything.
